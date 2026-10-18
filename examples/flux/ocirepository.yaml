@@ -1,0 +1,20 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: go-cluster-backup
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: oci://ghcr.io/vi-latyshev/charts/go-cluster-backup
+  ref:
+    # An exact version pin, never a moving tag: the chart version is the image
+    # tag, and a moving tag would make the deployed configuration un-reviewable.
+    tag: "1.0.0"
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  # Optional: verify the chart's signature before Flux ever renders it.
+  # spec.verify:
+  #   provider: cosign
+  #   secretRef:
+  #     name: cosign-public-key

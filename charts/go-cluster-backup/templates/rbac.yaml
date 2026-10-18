@@ -1,0 +1,185 @@
+{{- if .Values.rbac.create }}
+{{- $fullname := include "go-cluster-backup.fullname" . -}}
+{{- $saName := include "go-cluster-backup.serviceAccountName" . -}}
+{{- $namespace := .Release.Namespace -}}
+{{/*
+Cluster-wide list (not get) for the label-driven discovery: every pod, claim
+and volume is listed and selected by labels, across all namespaces. Secrets and
+ConfigMaps are never cluster-wide — see the namespaced Roles below.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "persistentvolumes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $namespace }}
+---
+{{/*
+In the release namespace: `get` and `list` on pods, and on Jobs, for the two
+things the tool does there — proving the lease holder's pod terminated, and
+reading the previous Job of its own CronJob when a run failed before the tool
+started — plus `list` on Events, which the previous-run report reads by
+`involvedObject.uid` to explain why that Job failed before the tool ran. A
+missing grant degrades to a visible message, never a failed run.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+  # Only list: the previous-run report narrows the list with a field selector on
+  # the failed Job's uid, so it never fetches an Event by name.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $namespace }}
+---
+{{/*
+The catalog ConfigMap is the one object the tool writes: get and patch on
+exactly that object, nothing else in the namespace. `patch`, not `update` — the
+tool writes a JSON merge patch of `data` alone, so the reconciler's annotations
+survive, and RBAC maps PATCH to its own verb.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-catalog
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "patch"]
+    resourceNames: ["{{ include "go-cluster-backup.catalogName" . }}"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-catalog
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-catalog
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $namespace }}
+{{- with .Values.rbac.secretNames }}
+---
+{{/*
+The credential Secrets the configuration's templates resolve, by exact name and
+only in the release namespace.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-secrets
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "go-cluster-backup.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames:
+      {{- toYaml . | nindent 6 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-secrets
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "go-cluster-backup.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-secrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $namespace }}
+{{- end }}
+---
+{{/*
+Namespace-wide read of Secrets and ConfigMaps for the namespaces a workload
+actually runs in — the discovery resolves credentials there. This ClusterRole is
+bound to nothing until a namespace is listed in rbac.workloadNamespaces, so the
+grant is always an explicit, per-namespace decision. Never cluster-wide.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-workload-access
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get"]
+{{- range .Values.rbac.workloadNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-workload-access
+  namespace: {{ . }}
+  labels:
+    {{- include "go-cluster-backup.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}-workload-access
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $namespace }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,272 @@
+# Default values for go-cluster-backup.
+#
+# Everything a deployment states about *what* is backed up lives in the tool's
+# own configuration document (`config` below, passed with `--set-file`); this
+# file states only how the CronJobs run it.
+
+# -- Image repository of the go-cluster-backup image.
+image:
+  repository: ghcr.io/vi-latyshev/go-cluster-backup
+  # -- Image tag. Empty means the chart's appVersion, so chart and image
+  # versions never drift.
+  tag: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for the image above.
+imagePullSecrets: []
+
+# -- REQUIRED. The tool's YAML configuration document, as a string:
+# `--set-file config=backup.yaml`. It is rendered verbatim into a ConfigMap and
+# mounted at /etc/go-cluster-backup/config.yaml; it is never passed through
+# `tpl`, because its `{{ }}` are the tool's own template syntax. The chart
+# fails to render when this is empty.
+config: ""
+
+# -- Override the chart name used in object names.
+nameOverride: ""
+# -- Override the full object-name prefix. Every generated object name derives
+# from this, so a consumer binding a NetworkPolicy or a RoleBinding to a
+# generated name must keep it stable.
+fullnameOverride: ""
+
+# -- Value of the app.kubernetes.io/component label on every object and on
+# every CronJob pod template.
+component: backup
+
+# -- Extra labels added to every object and to every CronJob pod template.
+labels: {}
+
+# ── Scheduled run ─────────────────────────────────────────────────────────
+# -- Cron schedule of the scheduled run.
+schedule: "0 3 * * *"
+# -- IANA time zone of the schedule. Empty omits the field (the cluster's UTC).
+timeZone: ""
+# -- Suspend the scheduled CronJob. Left out of the manifest when empty, so a
+# pause applied to the live object is not reset by an upgrade. The manual and
+# restore CronJobs are always suspended.
+suspend: ""
+# -- Seconds a scheduled Job may live before Kubernetes kills it. The chart
+# refuses to render when this exceeds the config's run.lease_hard_bound: the
+# lease takeover assumes a writer cannot outlive that bound.
+activeDeadlineSeconds: 8400
+# -- Retries of a failed scheduled Job.
+backoffLimit: 1
+# -- podFailurePolicy of the scheduled Job, rendered as is. Its onExitCodes
+# rule must name the writer container (`backup`).
+podFailurePolicy:
+  rules:
+    - action: Count
+      onPodConditions:
+        # `status` is required by the Kubernetes 1.31 schema; it became
+        # optional later, so stating it keeps the chart valid on both.
+        - type: DisruptionTarget
+          status: "True"
+    - action: FailJob
+      onExitCodes:
+        operator: In
+        values: [1, 2]
+        containerName: backup
+# -- Completed Jobs kept by each CronJob.
+successfulJobsHistoryLimit: 1
+# -- Failed Jobs kept by each CronJob.
+failedJobsHistoryLimit: 3
+# -- concurrencyPolicy of every CronJob.
+concurrencyPolicy: Forbid
+
+# ── Manual run ────────────────────────────────────────────────────────────
+manual:
+  # -- Render the manual-run CronJob `<fullname>-manual`. It never fires on its
+  # own: an operator starts one Job from it by hand.
+  enabled: true
+
+# ── Restore ───────────────────────────────────────────────────────────────
+restore:
+  # -- Render the restore CronJob `<fullname>-restore` (always suspended).
+  enabled: true
+  # -- Args of the restore container. The default is inert: a read-only
+  # preflight of the configuration. A real restore is a deliberate change of
+  # this list (restore fetch/apply/verify with an explicit run and artifact).
+  args:
+    - validate
+    - --preflight
+    - --config
+    - /etc/go-cluster-backup/config.yaml
+  # -- Seconds a restore Job may live before Kubernetes kills it.
+  activeDeadlineSeconds: 3600
+  # -- Size limit of the restore pod's spool (the config's restore.spool_dir,
+  # mounted at /spool).
+  spoolSize: 8Gi
+  # -- Resources of the restore container.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+      ephemeral-storage: 4Gi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+      ephemeral-storage: 9Gi
+
+# ── Optional staging initContainer ────────────────────────────────────────
+# Runs `go-cluster-backup stage` before the writer container, to snapshot state
+# that only exists on the node (see the k3s_state source). It needs the
+# hostPaths that state lives on, added through extraVolumes, and typically a
+# root securityContext — a namespace that admits it, not `restricted`.
+stage:
+  # -- Render the `stage` initContainer on the writer pod.
+  enabled: false
+  # -- securityContext of the stage initContainer. It reads host paths owned by
+  # root, so it defaults to root without capabilities.
+  securityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+    runAsGroup: 0
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  # -- Resources of the stage initContainer.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  # -- Extra volumeMounts of the stage initContainer, on top of the shared
+  # ones. Pair them with extraVolumes.
+  volumeMounts: []
+
+# ── Service account ───────────────────────────────────────────────────────
+serviceAccount:
+  # -- Create a ServiceAccount for the CronJobs.
+  create: true
+  # -- Name of the ServiceAccount. Empty uses the fullname when create is true,
+  # `default` otherwise.
+  name: ""
+  # -- Annotations of the ServiceAccount.
+  annotations: {}
+
+# ── RBAC ──────────────────────────────────────────────────────────────────
+rbac:
+  # -- Create the ServiceAccount's RBAC.
+  create: true
+  # -- Namespaces whose Secrets and ConfigMaps the tool may read, through one
+  # RoleBinding each onto the `<fullname>-workload-access` ClusterRole. That
+  # ClusterRole is not bound to anything when this list is empty.
+  workloadNamespaces: []
+  # -- Names of Secrets in the release namespace the tool may get (the
+  # credentials its configuration's templates resolve).
+  secretNames: []
+
+# ── Catalog ───────────────────────────────────────────────────────────────
+catalog:
+  # -- Create the catalog ConfigMap the tool writes its run index into. It is
+  # created without `data` and annotated `helm.sh/resource-policy: keep`, so an
+  # uninstall never takes the run history with it. Set to false when the
+  # ConfigMap is managed by the consumer's own manifests.
+  create: true
+  # -- Name of the catalog ConfigMap. Empty uses `<fullname>-catalog`, and the
+  # chart refuses to render when the config names a different one.
+  name: ""
+
+# ── Pod shape ─────────────────────────────────────────────────────────────
+# -- Secrets mounted read-only into every container, for the credential files
+# the configuration references.
+secretMounts: []
+# - secretName: cluster-backup-s3
+#   mountPath: /run/secrets/s3
+#   optional: false
+
+# -- Extra volumes of every pod — the writer, the restore Job and the
+# config-gate hook Job alike (the hostPaths the stage initContainer reads, for
+# example).
+extraVolumes: []
+# -- Extra volumeMounts of every container that runs the tool, the stage
+# initContainer included.
+extraVolumeMounts: []
+# -- Extra environment variables of every container that runs the tool, the
+# stage initContainer and the config-gate hook included. Each entry must use
+# valueFrom (configMapKeyRef or secretKeyRef); an inline `value` fails the
+# render, because a deployment setting belongs in the configuration document.
+extraEnv: []
+
+# -- Size limits of the emptyDir volumes the tool works in.
+volumes:
+  # -- Spool: one post-processor artifact at a time (the config's run.spool_dir).
+  spool: 4Gi
+  # -- Scratch: the working directory a plugin writes temporary files into.
+  scratch: 512Mi
+  # -- Temp: the process temp directory.
+  tmp: 64Mi
+  # -- Discovered: a tmpfs the discovery writes resolved credentials into.
+  discovered: 16Mi
+
+# -- pod securityContext of every pod.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- container securityContext of the writer and restore containers. A
+# deployment whose storage root is only readable by root overrides this.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -- Resources of the writer container.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+    ephemeral-storage: 1Gi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+    ephemeral-storage: 5Gi
+
+# -- Extra labels of every CronJob pod template.
+podLabels: {}
+# -- Annotations of every CronJob pod template.
+podAnnotations: {}
+# -- priorityClassName of every pod. A silently skipped backup is worse than a
+# delayed dev pod, so a production deployment should raise this.
+priorityClassName: ""
+# -- nodeSelector of every pod.
+nodeSelector: {}
+# -- Tolerations of every pod.
+tolerations: []
+# -- Affinity of every pod.
+affinity: {}
+
+# ── Config-gate hook ──────────────────────────────────────────────────────
+# A pre-install/pre-upgrade Job that runs `go-cluster-backup validate` against
+# the *new* configuration. It is offline: the tool's validate resolves secret
+# references without reading them, so the hook needs no secret mount. A failure
+# aborts the install or upgrade, so a bad configuration never reaches the
+# CronJobs.
+hooks:
+  # -- Render the config-gate hook Job.
+  enabled: true
+  # -- backoffLimit of the hook Job.
+  backoffLimit: 0
+  # -- ttlSecondsAfterFinished of the hook Job.
+  ttlSecondsAfterFinished: 600
+  # -- Resources of the hook container.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi

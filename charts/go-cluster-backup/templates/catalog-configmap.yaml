@@ -1,0 +1,12 @@
+{{- if .Values.catalog.create }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "go-cluster-backup.catalogName" . }}
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+  annotations:
+    # The tool owns everything under `data`; helm must never prune it away with
+    # the release, or the whole run history goes with it.
+    helm.sh/resource-policy: keep
+{{- end }}

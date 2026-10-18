@@ -1,0 +1,25 @@
+apiVersion: v2
+name: go-cluster-backup
+description: |
+  Scheduled Kubernetes cluster backups. Renders go-cluster-backup as CronJobs
+  (scheduled, manual, restore), the configuration ConfigMap the tool reads, the
+  catalog ConfigMap it writes, and the least-privilege RBAC its discovery,
+  catalog and previous-run inspection need.
+type: application
+# Placeholders: the release job passes the tag computed from the commits to
+# `helm package --version --app-version`, so a published chart carries the
+# release version. A checkout therefore renders chart 0.0.0 running image
+# master, and the chart pins the image tag to appVersion.
+version: 0.0.0
+appVersion: "master"
+kubeVersion: ">=1.31.0-0"
+home: https://github.com/vi-latyshev/go-cluster-backup
+sources:
+  - https://github.com/vi-latyshev/go-cluster-backup
+keywords:
+  - backup
+  - kubernetes
+  - cronjob
+  - postgres
+  - redis
+  - sqlite

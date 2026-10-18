@@ -1,0 +1,10 @@
+{{- include "go-cluster-backup.validateInput" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "go-cluster-backup.fullname" . }}-config
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+{{ .Values.config | indent 4 }}

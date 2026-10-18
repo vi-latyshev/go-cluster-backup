@@ -1,0 +1,172 @@
+# go-cluster-backup — the service's defaults.
+#
+# This document is embedded into the binary and merged UNDER a deployment's
+# configuration file, before any byte of that file reaches a plugin:
+#
+#   - objects merge key by key, recursively; a scalar or a list the file
+#     carries replaces the default whole;
+#   - `name[]` fills the elements of the list `name` the file declares, element
+#     by element, and never creates the list or an element of it;
+#   - nothing here creates an optional section, an instance or a list element
+#     the file does not declare — a nested object of a present parent it does;
+#   - null is refused, in this document and in the file; switching something off
+#     is written as an off-value (false, 0, an empty list, an empty template);
+#   - a field its plugin marks required:"true", and every secret reference, is
+#     the site's to state: a default for one is an error at startup.
+#
+# Every config field is one of two things — required, or defaulted here — and
+# the check at startup, `doctor` and a test per distribution prove it.
+#
+# `backup config defaults` prints this document as it is; `backup config
+# effective --config FILE` prints a configuration with every defaulted value
+# marked. Values that are a stored format (a key layout, a run id layout, a
+# manifest key) must never change once runs exist.
+
+# ── Engine sections: the same keys as a configuration file ────────────────
+run:
+  id_layout: "20060102T150405Z" # stored format: never change once runs exist
+  finish_allowance: 2m
+  min_verified_storages: 1
+  degraded_exit_code: 0
+  failed_exit_code: 1
+  storage_parallelism: 1
+  unclassified_error: transient
+  notifier_failure_is_fatal: false
+  retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
+  # A running dump reports its bytes so far this often; 0 reports none.
+  progress_interval: 15s
+  # How long a scheduled run waits for the writer lease a live run holds before
+  # it gives up loudly. Long enough for a normal run to finish; a dead holder is
+  # taken over at once (its termination is proven, not timed), a paused one is
+  # ended by Kubernetes' activeDeadlineSeconds and the next night recovers.
+  lease_wait: 15m
+  # How often a scheduled run waiting for the lease asks again.
+  lease_poll: 1s
+  # The environment variables the deployment fills with this process's identity
+  # (downward API: metadata.name and metadata.uid). The lease records them so a
+  # catalog can prove the holder terminated.
+  holder_namespace_env: BACKUP_POD_NAMESPACE
+  holder_pod_env: BACKUP_POD_NAME
+  holder_uid_env: BACKUP_POD_UID
+
+layout: # stored format: never change once runs exist
+  run_prefix: "runs/{{ .Run.ID }}"
+  artifact_key: "{{ .Artifact.Group }}/{{ .Artifact.Name }}{{ .Artifact.Ext }}"
+  manifest_key: manifest.json
+  # A manual run's id is the scheduled one plus this suffix, so a survey tells a
+  # run's kind from its key alone — a manual run killed before it wrote a
+  # manifest is still identifiable, and never mistaken for a scheduled one.
+  manual_id_suffix: "-manual"
+
+stage:
+  degraded_exit_code: 0
+  failed_exit_code: 1
+
+restore:
+  unclassified_error: transient
+  retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
+
+# ── Instance envelopes: fields the engine reads on every instance of a kind ──
+instance:
+  source:
+    artifact: {importance: required}
+
+# ── Plugin configs: the `config:` of every instance of that kind/type, ─────
+# wherever it is declared — a declared instance, a retention inside a storage,
+# a source inside a discovery rule.
+plugins:
+  discovery/kubernetes_labels:
+    api_host_env: KUBERNETES_SERVICE_HOST
+    api_port_env: KUBERNETES_SERVICE_PORT
+    token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    request_timeout: 30s
+    list_page_size: 500
+    undeclared_volumes: {name: undeclared}
+    pods[]:
+      phase: Running
+      # 0 is the explicit way to say "an empty result is fine": a rule that may
+      # match nothing says so once, here, instead of in every rule.
+      min_matches: 0
+      artifact: {importance: required}
+    volumes[]:
+      phase: Bound
+      min_matches: 0
+      artifact: {importance: required}
+
+  catalog/kubernetes_configmap:
+    lease_key_suffix: ".lease" # stored format: another process reads the same claim
+    api_host_env: KUBERNETES_SERVICE_HOST
+    api_port_env: KUBERNETES_SERVICE_PORT
+    token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    request_timeout: 30s
+    key: catalog.json
+    max_runs: 60
+    max_history_bytes: 900KB # under the 1 MiB ConfigMap object limit
+
+  notifier/webhook:
+    method: POST
+    headers: {}
+    # The message texts and the payload are the site's: what a receiver is told
+    # belongs to the deployment, not to the service.
+    body_format: yaml
+    timeout: 10s
+    success_status: [200, 201, 202, 204]
+    max_response_bytes: 512
+
+  processor/zstd:
+    concurrency: 1
+
+  processor/age:
+    # recipients only: a secret reference is never defaulted, so identities is
+    # the site's to state — an explicit [] where no private key is mounted.
+    recipients: [] # one of the two lists must be non-empty
+
+  retention/gfs:
+    timezone: UTC
+    min_keep: 1
+
+  retention/keep_last:
+    min_keep: 1
+
+  source/postgres:
+    format: custom
+    compression: none # the pipeline compresses; pg_dump must not
+    connect_attempts: 6
+    connect_interval: 5s
+    exclude_databases: []
+
+  source/redis:
+    connect_attempts: 6
+    connect_interval: 5s
+
+  source/sqlite:
+    busy_timeout: 10s
+    integrity_check: quick
+
+  source/files:
+    ignore_vanished: true # skipped entries are counted in the run report
+
+  source/k3s_state:
+    busy_timeout: 10s
+    integrity_check: quick
+    timeout: 2m
+
+  storage/local:
+    page_size: 1000
+
+  storage/yandex_disk:
+    api_url: https://cloud-api.yandex.net/v1/disk
+    prune_keep_depth: 1 # never prune the first key segment (runs/)
+    request_timeout: 30s
+    commit_poll_interval: 5s
+    commit_poll_timeout: 2m
+
+  storage/s3:
+    storage_class: STANDARD
+    request_checksum: when_required
+    part_bytes: 16MiB
+    max_request_bytes: 5GiB
+    max_object_bytes: 5TiB
+    request_timeout: 5m

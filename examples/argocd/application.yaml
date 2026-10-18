@@ -1,0 +1,113 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: go-cluster-backup
+  namespace: argocd
+spec:
+  project: default
+  destination:
+    server: https://kubernetes.default.svc
+    # The destination namespace must be the namespace the configuration's
+    # catalog section names: the chart creates the catalog ConfigMap there.
+    namespace: backup
+  source:
+    # A Helm chart from an OCI registry: Argo CD pulls it as a Helm chart.
+    repoURL: ghcr.io/vi-latyshev/charts
+    chart: go-cluster-backup
+    targetRevision: 1.0.0
+    helm:
+      # The `config` below is byte-identical to examples/config/minimal.yaml;
+      # a test in test/chart asserts the equality, so the two cannot drift.
+      values: |
+        # The config's run.lease_hard_bound is 4200s, and the chart refuses to
+        # render a Job deadline above it.
+        activeDeadlineSeconds: 4200
+        catalog:
+          name: go-cluster-backup-catalog
+        secretMounts:
+          - secretName: cluster-backup-s3
+            mountPath: /run/secrets/s3
+        rbac:
+          secretNames:
+            - cluster-backup-s3
+        config: |
+          # A minimal deployment: discover Postgres pods by label, dump each instance,
+          # compress it, upload it to one S3-compatible endpoint, keep the last few runs.
+          #
+          # Everything this file omits is a default in the service's own document
+          # (`go-cluster-backup config defaults`). The labels here are the deployment's
+          # own; `backup.example/` is a placeholder, not a name this project reserves.
+          version: 1
+
+          run:
+            spool_dir: /spool
+            spool_reserve_bytes: 1GiB
+            max_artifact_bytes: 3GiB
+            deadline: 60m
+            lease_hard_bound: 4200s
+
+          discoveries:
+            workloads:
+              type: kubernetes_labels
+              config:
+                # A tmpfs the envFile function writes resolved secrets into.
+                secrets_path: /run/discovered
+                exclude: {label: backup.example/ignore, value: "true"}
+                undeclared_volumes: {importance: best_effort}
+                pods:
+                  # A pod that declares its engine: every database of the instance is
+                  # dumped, each as its own artifact, and the volumes the pod mounts are
+                  # covered by those dumps.
+                  - name: postgres
+                    selector: "backup.example/engine=postgres"
+                    covers_volumes: true
+                    artifact:
+                      group: databases
+                      name: '{{ .Namespace }}/{{ label "backup.example/instance" }}'
+                      importance: required
+                      sensitivity: plain
+                    pipeline: [compress]
+                    source:
+                      type: postgres
+                      config:
+                        address: '{{ label "backup.example/instance" }}.{{ .Namespace }}.svc.cluster.local:{{ port 0 0 }}'
+                        database: '{{ envValue 0 "POSTGRES_DB" }}'
+                        username: '{{ envValue 0 "POSTGRES_USER" }}'
+                        password: {file: '{{ envFile 0 "POSTGRES_PASSWORD" }}'}
+                        all_databases: true
+                volumes: []
+
+          processors:
+            compress:
+              type: zstd
+              config: {level: better, window_bytes: 8MiB, decode_window_bytes: 16MiB}
+
+          storages:
+            primary:
+              type: s3
+              retention:
+                scheduled: {type: keep_last, config: {count: 7, count_incomplete: true}}
+                # A manual run (the chart's <fullname>-manual CronJob) is refused on a
+                # storage with no `manual` partition, so both kinds are stated.
+                manual: {type: keep_last, config: {count: 3, count_incomplete: true}}
+              max_total_bytes: 50GB
+              time_budget: 30m
+              config:
+                endpoint: https://s3.example.com
+                region: us-east-1
+                bucket: cluster-backup
+                prefix: cluster-backup
+                access_key_id: {file: /run/secrets/s3/access-key-id}
+                secret_access_key: {file: /run/secrets/s3/secret-access-key}
+                addressing: path
+
+          catalog:
+            type: kubernetes_configmap
+            config:
+              namespace: backup
+              name: go-cluster-backup-catalog
+  # The chart creates no Namespace of its own, so the Application creates the
+  # destination one. Outside `helm.values`: this is Argo CD's own field.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

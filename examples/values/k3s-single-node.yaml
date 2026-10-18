@@ -1,0 +1,92 @@
+# Values for examples/config/k3s-single-node.yaml — one node, the k3s datastore
+# snapshotted by the stage initContainer and file volumes discovered by label.
+#
+# This deployment reads hostPaths owned by root. No Pod Security Standard
+# below `privileged` admits a hostPath volume — `baseline` rejects it just as
+# `restricted` does — so the namespace must be labelled
+# `pod-security.kubernetes.io/enforce=privileged`, or be exempted from
+# enforcement. The default values do pass `restricted`; this file is what
+# changes that.
+#
+#   helm install backup oci://ghcr.io/vi-latyshev/charts/go-cluster-backup \
+#     --namespace backup --create-namespace \
+#     -f examples/values/k3s-single-node.yaml \
+#     --set-file config=examples/config/k3s-single-node.yaml
+
+# The config's run.lease_hard_bound is 6000s.
+activeDeadlineSeconds: 6000
+
+catalog:
+  # Matches catalog.config.name in examples/config/k3s-single-node.yaml.
+  name: go-cluster-backup-catalog
+
+secretMounts:
+  - secretName: cluster-backup-s3
+    mountPath: /run/secrets/s3
+
+rbac:
+  secretNames:
+    - cluster-backup-s3
+
+# The node's own state lives on the control-plane node.
+nodeSelector:
+  node-role.kubernetes.io/control-plane: "true"
+
+# The datastore directory is 0700 root:root, so both the stage initContainer and
+# the writer read it as root — without capabilities, and with the root
+# filesystem still read-only.
+podSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+stage:
+  enabled: true
+  volumeMounts:
+    # Not read-only: an SQLite reader opens -shm/-wal beside state.db.
+    - name: k3s-db
+      mountPath: /k3s-db
+    - name: k3s-token
+      mountPath: /k3s-token
+      readOnly: true
+    # /staged is not listed here: it comes from extraVolumeMounts below, which
+    # the stage container now shares with every other container.
+
+extraVolumes:
+  - name: k3s-db
+    hostPath:
+      path: /var/lib/rancher/k3s/server/db
+      type: Directory
+  - name: k3s-token
+    hostPath:
+      path: /var/lib/rancher/k3s/server/token
+      type: File
+  # What the stage initContainer produces and the writer's staged source reads.
+  - name: staged
+    emptyDir: {}
+  # The local provisioner's storage root: a volume's directory is resolved from
+  # its PersistentVolume and opened as is.
+  - name: k3s-storage
+    hostPath:
+      path: /var/lib/rancher/k3s/storage
+      type: Directory
+
+extraVolumeMounts:
+  - name: staged
+    mountPath: /staged
+  - name: k3s-storage
+    mountPath: /var/lib/rancher/k3s/storage
+    readOnly: true

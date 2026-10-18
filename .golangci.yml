@@ -1,0 +1,24 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    # The repository bans //nolint outright, and `make lint` enforces the ban
+    # with a grep: golangci-lint v2.14.0's nolintlint has no option to forbid a
+    # directive, only to constrain one. These are its strictest settings, so a
+    # directive that ever slipped past the grep would still have to be specific
+    # and carry an explanation.
+    - nolintlint
+  settings:
+    nolintlint:
+      allow-unused: false
+      require-specific: true
+      require-explanation: true
+
+formatters:
+  enable:
+    - gofmt

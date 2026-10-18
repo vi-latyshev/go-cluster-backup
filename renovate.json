@@ -1,0 +1,64 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests",
+    "docker:pinDigests"
+  ],
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "timezone": "UTC",
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
+  "semanticCommitScope": "deps",
+  "packageRules": [
+    {
+      "description": "Default: a dependency outside the image releases nothing.",
+      "semanticCommitType": "chore",
+      "matchPackageNames": [
+        "*"
+      ]
+    },
+    {
+      "description": "The Go module is compiled into the binary, so its updates release a patch.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "go.mod"
+      ],
+      "semanticCommitType": "fix",
+      "groupName": "go modules"
+    },
+    {
+      "description": "A base image update changes the shipped image, so it releases a patch.",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "semanticCommitType": "fix",
+      "groupName": "container images"
+    },
+    {
+      "description": "The lint, vulnerability and chart tools never reach the binary.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "tools/**"
+      ],
+      "semanticCommitType": "chore",
+      "groupName": "go tools"
+    },
+    {
+      "description": "Pinned workflow actions are CI only.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "semanticCommitType": "chore",
+      "groupName": "github actions"
+    }
+  ]
+}

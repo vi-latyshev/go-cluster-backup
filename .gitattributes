@@ -1,0 +1,9 @@
+# Normalise line endings: this repository is Go, YAML and shell only.
+* text=auto eol=lf
+
+# Generated checksums: a lock file, not a source to review line by line.
+go.sum -diff
+
+# Archives are binary.
+*.tgz binary
+*.tar.gz binary
