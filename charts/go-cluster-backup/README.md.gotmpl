@@ -77,6 +77,24 @@ profile. Two things move a deployment out of it:
 - A storage root readable only by root needs `securityContext.runAsUser: 0` and
   `securityContext.runAsNonRoot: false`. That alone still passes `baseline`.
 
+### Where a node hostPath goes
+
+A hostPath holding node state or secrets reaches one pod, never all of them:
+
+- `writer.volumes` / `writer.volumeMounts` — the scheduled and manual writer
+  pods only. The `stage` initContainer runs inside them, so its own
+  `stage.volumeMounts` may reference `writer.volumes`.
+- `restore.volumes` / `restore.volumeMounts` — the restore pod only, for a
+  `files` restore that reads a PersistentVolume root.
+- `extraVolumes` / `extraVolumeMounts` reach **every** pod that runs the tool —
+  the writer, the restore Job and the config-gate hook Job alike — so only an
+  innocuous shared volume (a coverage directory, a CA bundle) belongs there.
+
+The writer's `securityContext` is the writer container's alone. The restore and
+hook containers carry `restore.securityContext` and `hooks.securityContext`,
+which default to the same restricted non-root shape, so a root writer never
+makes a restore or a config gate run as root.
+
 ## Restores
 
 The restore CronJob is suspended and its default args are inert (`validate

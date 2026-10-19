@@ -82,6 +82,24 @@ profile. Two things move a deployment out of it:
 - A storage root readable only by root needs `securityContext.runAsUser: 0` and
   `securityContext.runAsNonRoot: false`. That alone still passes `baseline`.
 
+### Where a node hostPath goes
+
+A hostPath holding node state or secrets reaches one pod, never all of them:
+
+- `writer.volumes` / `writer.volumeMounts` — the scheduled and manual writer
+  pods only. The `stage` initContainer runs inside them, so its own
+  `stage.volumeMounts` may reference `writer.volumes`.
+- `restore.volumes` / `restore.volumeMounts` — the restore pod only, for a
+  `files` restore that reads a PersistentVolume root.
+- `extraVolumes` / `extraVolumeMounts` reach **every** pod that runs the tool —
+  the writer, the restore Job and the config-gate hook Job alike — so only an
+  innocuous shared volume (a coverage directory, a CA bundle) belongs there.
+
+The writer's `securityContext` is the writer container's alone. The restore and
+hook containers carry `restore.securityContext` and `hooks.securityContext`,
+which default to the same restricted non-root shape, so a root writer never
+makes a restore or a config gate run as root.
+
 ## Restores
 
 The restore CronJob is suspended and its default args are inert (`validate
@@ -121,10 +139,16 @@ kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <nam
 | restore.activeDeadlineSeconds | int | `3600` | Seconds a restore Job may live before Kubernetes kills it. |
 | restore.spoolSize | string | `"8Gi"` | Size limit of the restore pod's spool (the config's restore.spool_dir, mounted at /spool). |
 | restore.resources | object | `{"limits":{"cpu":"1","ephemeral-storage":"9Gi","memory":"512Mi"},"requests":{"cpu":"100m","ephemeral-storage":"4Gi","memory":"256Mi"}}` | Resources of the restore container. |
+| restore.podSecurityContext | object | `{}` | pod securityContext of the restore pod. Empty inherits the top-level `podSecurityContext`; a non-empty value is a FULL replacement, never a merge, so a `fsGroup`-only override drops the `seccompProfile` and the `restricted` Pod Security Standard then rejects the pod — state the complete context:   podSecurityContext:     runAsNonRoot: true     runAsUser: 1000     runAsGroup: 1000     fsGroup: 1000     fsGroupChangePolicy: OnRootMismatch     seccompProfile: {type: RuntimeDefault} Set it when the restore pod's fsGroup must differ from the writer's: a root writer leaves the pod fsGroup at 0, and a non-root restore could then not write its spool. |
+| restore.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000}` | container securityContext of the restore container, independent from the writer's `securityContext`: a root writer does not make the restore run as root. The default passes the `restricted` Pod Security Standard; a files restore reading a root-owned volume root sets `runAsUser`/`runAsGroup` 0 and `runAsNonRoot` false here. |
+| restore.volumes | list | `[]` | Volumes only the restore pod declares, on top of the shared ones. A files restore's PersistentVolume root belongs here, never in `extraVolumes`, which reaches the hook pod too. |
+| restore.volumeMounts | list | `[]` | VolumeMounts only the restore container mounts, on top of the shared ones. Pair them with `restore.volumes`. |
+| writer.volumes | list | `[]` | Volumes only the writer pods declare, on top of the shared ones. A node hostPath holding node state or secrets — the k3s datastore, a VPN database — belongs here, never in `extraVolumes`, which reaches the restore and hook pods too. |
+| writer.volumeMounts | list | `[]` | VolumeMounts only the writer container mounts, on top of the shared ones. Pair them with `writer.volumes`; the restore container never sees them. |
 | stage.enabled | bool | `false` | Render the `stage` initContainer on the writer pod. |
 | stage.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":0,"runAsNonRoot":false,"runAsUser":0}` | securityContext of the stage initContainer. It reads host paths owned by root, so it defaults to root without capabilities. |
 | stage.resources | object | `{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"50m","memory":"128Mi"}}` | Resources of the stage initContainer. |
-| stage.volumeMounts | list | `[]` | Extra volumeMounts of the stage initContainer, on top of the shared ones. Pair them with extraVolumes. |
+| stage.volumeMounts | list | `[]` | Extra volumeMounts of the stage initContainer, on top of the shared ones. Pair them with writer.volumes, which the stage container's pod declares. |
 | serviceAccount.create | bool | `true` | Create a ServiceAccount for the CronJobs. |
 | serviceAccount.name | string | `""` | Name of the ServiceAccount. Empty uses the fullname when create is true, `default` otherwise. |
 | serviceAccount.annotations | object | `{}` | Annotations of the ServiceAccount. |
@@ -134,16 +158,16 @@ kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <nam
 | catalog.create | bool | `true` | Create the catalog ConfigMap the tool writes its run index into. It is created without `data` and annotated `helm.sh/resource-policy: keep`, so an uninstall never takes the run history with it. Set to false when the ConfigMap is managed by the consumer's own manifests. |
 | catalog.name | string | `""` | Name of the catalog ConfigMap. Empty uses `<fullname>-catalog`, and the chart refuses to render when the config names a different one. |
 | secretMounts | list | `[]` | Secrets mounted read-only into every container, for the credential files the configuration references. |
-| extraVolumes | list | `[]` | Extra volumes of every pod — the writer, the restore Job and the config-gate hook Job alike (the hostPaths the stage initContainer reads, for example). |
-| extraVolumeMounts | list | `[]` | Extra volumeMounts of every container that runs the tool, the stage initContainer included. |
+| extraVolumes | list | `[]` | Extra volumes of every pod — the writer, the restore Job and the config-gate hook Job alike. Only an innocuous shared volume belongs here (a coverage directory, a CA bundle); a node hostPath holding state or secrets goes in `writer.volumes` or `restore.volumes`, which one pod alone declares. |
+| extraVolumeMounts | list | `[]` | Extra volumeMounts of every container that runs the tool, the stage initContainer and the config-gate hook included. Pair them with `extraVolumes`. |
 | extraEnv | list | `[]` | Extra environment variables of every container that runs the tool, the stage initContainer and the config-gate hook included. Each entry must use valueFrom (configMapKeyRef or secretKeyRef); an inline `value` fails the render, because a deployment setting belongs in the configuration document. |
 | volumes | object | `{"discovered":"16Mi","scratch":"512Mi","spool":"4Gi","tmp":"64Mi"}` | Size limits of the emptyDir volumes the tool works in. |
 | volumes.spool | string | `"4Gi"` | Spool: one post-processor artifact at a time (the config's run.spool_dir). |
 | volumes.scratch | string | `"512Mi"` | Scratch: the working directory a plugin writes temporary files into. |
 | volumes.tmp | string | `"64Mi"` | Temp: the process temp directory. |
 | volumes.discovered | string | `"16Mi"` | Discovered: a tmpfs the discovery writes resolved credentials into. |
-| podSecurityContext | object | `{"fsGroup":1000,"fsGroupChangePolicy":"OnRootMismatch","runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000,"seccompProfile":{"type":"RuntimeDefault"}}` | pod securityContext of every pod. |
-| securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000}` | container securityContext of the writer and restore containers. A deployment whose storage root is only readable by root overrides this. |
+| podSecurityContext | object | `{"fsGroup":1000,"fsGroupChangePolicy":"OnRootMismatch","runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000,"seccompProfile":{"type":"RuntimeDefault"}}` | pod securityContext of the writer pods, and the default the restore pod inherits while `restore.podSecurityContext` is empty. The config-gate hook pod carries its own (`hooks.podSecurityContext`) and never inherits this one, so a root writer does not make the hook pod root. |
+| securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000}` | container securityContext of the writer container. A deployment whose storage root is only readable by root overrides this; the restore and hook containers carry their own (`restore.securityContext`, `hooks.securityContext`) and never inherit it. |
 | resources | object | `{"limits":{"cpu":"1","ephemeral-storage":"5Gi","memory":"512Mi"},"requests":{"cpu":"100m","ephemeral-storage":"1Gi","memory":"256Mi"}}` | Resources of the writer container. |
 | podLabels | object | `{}` | Extra labels of every CronJob pod template. |
 | podAnnotations | object | `{}` | Annotations of every CronJob pod template. |
@@ -155,3 +179,5 @@ kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <nam
 | hooks.backoffLimit | int | `0` | backoffLimit of the hook Job. |
 | hooks.ttlSecondsAfterFinished | int | `600` | ttlSecondsAfterFinished of the hook Job. |
 | hooks.resources | object | `{"limits":{"cpu":"100m","memory":"128Mi"},"requests":{"cpu":"10m","memory":"32Mi"}}` | Resources of the hook container. |
+| hooks.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000}` | container securityContext of the hook container, independent from the writer's `securityContext`. The offline check reads no node path, so it must never run as root; the default passes the `restricted` Pod Security Standard. |
+| hooks.podSecurityContext | object | `{"fsGroup":1000,"fsGroupChangePolicy":"OnRootMismatch","runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000,"seccompProfile":{"type":"RuntimeDefault"}}` | pod securityContext of the hook pod. Independent from the top-level `podSecurityContext`: the hook reads no node path, so a root writer must not make its pod root. The default passes the `restricted` Pod Security Standard. |

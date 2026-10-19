@@ -992,6 +992,357 @@ func podSpecs(t *testing.T, docs []map[string]any) []map[string]any {
 	return specs
 }
 
+// isolationValues gives the writer, the restore and the shared extras each a
+// distinct hostPath volume, plus the scheduling a deployment sets once for every
+// pod, and turns on the stage initContainer.
+func isolationValues(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "isolation.yaml")
+	body := `securityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+podSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+priorityClassName: high
+nodeSelector:
+  kubernetes.io/hostname: node-a
+tolerations:
+  - key: dedicated
+    operator: Exists
+    effect: NoSchedule
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: role
+              operator: In
+              values: [backup]
+writer:
+  volumes:
+    - name: writer-node
+      hostPath:
+        path: /node/writer
+        type: Directory
+  volumeMounts:
+    - name: writer-node
+      mountPath: /writer-node
+restore:
+  volumes:
+    - name: restore-node
+      hostPath:
+        path: /node/restore
+        type: Directory
+  volumeMounts:
+    - name: restore-node
+      mountPath: /restore-node
+stage:
+  enabled: true
+  volumeMounts:
+    - name: writer-node
+      mountPath: /stage-writer
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing the isolation values: %v", err)
+	}
+	return path
+}
+
+// renderIsolation renders the minimal example with the isolation values and the
+// shared extras (the coverage volume and GOCOVERDIR, reused rather than
+// duplicated).
+func renderIsolation(t *testing.T) []map[string]any {
+	t.Helper()
+	root := repoRoot(t)
+	manifest, err := render(t,
+		"-f", filepath.Join(root, "examples", "values", "minimal.yaml"),
+		"-f", isolationValues(t),
+		"-f", extrasValues(t),
+		"--set-file", "config="+filepath.Join(root, "examples", "config", "minimal.yaml"),
+	)
+	if err != nil {
+		t.Fatalf("rendering the chart with the isolation values: %v", err)
+	}
+	return documents(t, manifest)
+}
+
+func volumeNames(t *testing.T, pod map[string]any) []string {
+	t.Helper()
+	var out []string
+	for _, raw := range asList(pod["volumes"]) {
+		volume, _ := raw.(map[string]any)
+		if n, _ := volume["name"].(string); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func containerMountPaths(t *testing.T, container map[string]any) []string {
+	t.Helper()
+	var out []string
+	for _, raw := range asList(container["volumeMounts"]) {
+		mount, _ := raw.(map[string]any)
+		if path, _ := mount["mountPath"].(string); path != "" {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+func containerByName(t *testing.T, pod map[string]any, field, containerName string) map[string]any {
+	t.Helper()
+	for _, raw := range asList(pod[field]) {
+		container, _ := raw.(map[string]any)
+		if container["name"] == containerName {
+			return container
+		}
+	}
+	t.Fatalf("the pod has no %s container named %q", field, containerName)
+	return nil
+}
+
+func writerPod(t *testing.T, docs []map[string]any, name string) map[string]any {
+	t.Helper()
+	return at(t, find(t, docs, "CronJob", name), "spec", "jobTemplate", "spec", "template", "spec")
+}
+
+// TestWriterRestoreHookMountsAreIsolated: a node hostPath holding state or
+// secrets must reach one pod alone. `writer.*` lands in the writer pods,
+// `restore.*` in the restore pod, and only the innocuous shared extras reach
+// every pod — a node path left in `extraVolumes` leaks into the restore and
+// config-gate hook pods.
+func TestWriterRestoreHookMountsAreIsolated(t *testing.T) {
+	docs := renderIsolation(t)
+	writerPods := map[string]map[string]any{
+		"the scheduled writer pod": writerPod(t, docs, fullname),
+		"the manual writer pod":    writerPod(t, docs, fullname+"-manual"),
+	}
+	restorePod := at(t, find(t, docs, "CronJob", fullname+"-restore"), "spec", "jobTemplate", "spec", "template", "spec")
+	hookPod := at(t, find(t, docs, "Job", fullname+"-validate"), "spec", "template", "spec")
+
+	for what, pod := range writerPods {
+		volumes := volumeNames(t, pod)
+		if !contains(volumes, "writer-node") {
+			t.Errorf("%s declares %v, want writer.volumes", what, volumes)
+		}
+		if !contains(volumes, "cover") {
+			t.Errorf("%s declares %v, want the shared extra volume", what, volumes)
+		}
+		if contains(volumes, "restore-node") {
+			t.Errorf("%s declares a restore.* volume: %v", what, volumes)
+		}
+		mounts := containerMountPaths(t, containerByName(t, pod, "containers", "backup"))
+		if !contains(mounts, "/writer-node") || !contains(mounts, "/gocover") {
+			t.Errorf("%s mounts %v on its writer container, want /writer-node and /gocover", what, mounts)
+		}
+		if contains(mounts, "/restore-node") {
+			t.Errorf("%s mounts a restore.* path on its writer container: %v", what, mounts)
+		}
+		// The stage initContainer shares the writer pod, so it may reference
+		// writer.volumes through its own volumeMounts — and only through them.
+		stage := containerMountPaths(t, containerByName(t, pod, "initContainers", "stage"))
+		if !contains(stage, "/stage-writer") || !contains(stage, "/gocover") {
+			t.Errorf("%s mounts %v on its stage container, want /stage-writer (a writer.volume) and /gocover", what, stage)
+		}
+		if contains(stage, "/writer-node") {
+			t.Errorf("%s mounts the writer container's own writer.volumeMounts on the stage container: %v", what, stage)
+		}
+	}
+
+	restoreVolumes := volumeNames(t, restorePod)
+	if !contains(restoreVolumes, "restore-node") || !contains(restoreVolumes, "cover") {
+		t.Errorf("the restore pod declares %v, want restore.volumes and the shared extra volume", restoreVolumes)
+	}
+	if contains(restoreVolumes, "writer-node") {
+		t.Errorf("the restore pod declares a writer.* volume: %v", restoreVolumes)
+	}
+	restoreMounts := containerMountPaths(t, containerByName(t, restorePod, "containers", "restore"))
+	if !contains(restoreMounts, "/restore-node") || !contains(restoreMounts, "/gocover") {
+		t.Errorf("the restore container mounts %v, want /restore-node and /gocover", restoreMounts)
+	}
+	if contains(restoreMounts, "/writer-node") {
+		t.Errorf("the restore container mounts a writer.* path: %v", restoreMounts)
+	}
+
+	hookVolumes := volumeNames(t, hookPod)
+	if !contains(hookVolumes, "cover") {
+		t.Errorf("the hook pod declares %v, want the shared extra volume", hookVolumes)
+	}
+	hookMounts := containerMountPaths(t, firstContainer(t, hookPod))
+	if !contains(hookMounts, "/gocover") {
+		t.Errorf("the hook container mounts %v, want the shared /gocover", hookMounts)
+	}
+	for _, leaked := range []string{"writer-node", "restore-node"} {
+		if contains(hookVolumes, leaked) {
+			t.Errorf("the hook pod declares the node volume %q; a node hostPath stays in writer.*/restore.*", leaked)
+		}
+	}
+	for _, leaked := range []string{"/writer-node", "/restore-node"} {
+		if contains(hookMounts, leaked) {
+			t.Errorf("the hook container mounts %q; a node hostPath stays in writer.*/restore.*", leaked)
+		}
+	}
+}
+
+// TestRestoreAndHookDoNotInheritTheWritersSecurityContext: the writer runs as
+// root in this fixture; the restore and hook containers carry their own
+// restricted non-root securityContext, so a root writer never makes them root.
+// The hook pod also carries the shared scheduling, which it used to drop.
+func TestRestoreAndHookDoNotInheritTheWritersSecurityContext(t *testing.T) {
+	docs := renderIsolation(t)
+
+	writer := containerByName(t, writerPod(t, docs, fullname), "containers", "backup")
+	if sc, _ := writer["securityContext"].(map[string]any); sc["runAsUser"] != 0 || sc["runAsNonRoot"] != false {
+		t.Fatalf("the writer container securityContext is %v, want the root top-level one this test contrasts against", sc)
+	}
+
+	for _, tc := range []struct {
+		what      string
+		container map[string]any
+	}{
+		{"the restore container", containerByName(t, at(t, find(t, docs, "CronJob", fullname+"-restore"), "spec", "jobTemplate", "spec", "template", "spec"), "containers", "restore")},
+		{"the hook container", firstContainer(t, at(t, find(t, docs, "Job", fullname+"-validate"), "spec", "template", "spec"))},
+	} {
+		sc, _ := tc.container["securityContext"].(map[string]any)
+		if sc["runAsNonRoot"] != true || sc["runAsUser"] != 1000 || sc["runAsGroup"] != 1000 {
+			t.Errorf("%s securityContext is %v, want the restricted non-root default, independent from the writer's", tc.what, sc)
+		}
+		if sc["allowPrivilegeEscalation"] != false || sc["readOnlyRootFilesystem"] != true {
+			t.Errorf("%s securityContext is %v, want allowPrivilegeEscalation=false and readOnlyRootFilesystem=true", tc.what, sc)
+		}
+	}
+
+	hookPod := at(t, find(t, docs, "Job", fullname+"-validate"), "spec", "template", "spec")
+	for _, field := range []string{"nodeSelector", "tolerations", "affinity"} {
+		if _, ok := hookPod[field]; !ok {
+			t.Errorf("the hook pod has no %s, want the shared scheduling every pod carries", field)
+		}
+	}
+	if got, _ := hookPod["priorityClassName"].(string); got != "high" {
+		t.Errorf("the hook pod priorityClassName is %q, want the shared %q", got, "high")
+	}
+}
+
+func podSecurityContext(t *testing.T, pod map[string]any) map[string]any {
+	t.Helper()
+	sc, ok := pod["securityContext"].(map[string]any)
+	if !ok {
+		t.Fatalf("the pod declares no pod-level securityContext")
+	}
+	return sc
+}
+
+// TestPodSecurityContextContract pins the pod-level half of the isolation, which
+// the container tests do not reach. The writer pod carries the top-level
+// `podSecurityContext` (root in this fixture); the config-gate hook pod carries
+// its own restricted non-root one and never inherits the writer's; the restore
+// pod inherits the top-level one while `restore.podSecurityContext` is empty,
+// and a non-empty value replaces it wholesale.
+func TestPodSecurityContextContract(t *testing.T) {
+	docs := renderIsolation(t)
+
+	writerPodContext := podSecurityContext(t, writerPod(t, docs, fullname))
+	if writerPodContext["runAsUser"] != 0 || writerPodContext["fsGroup"] != 0 {
+		t.Fatalf("the writer pod podSecurityContext is %v, want the root top-level one this test contrasts against", writerPodContext)
+	}
+
+	hookPodContext := podSecurityContext(t, at(t, find(t, docs, "Job", fullname+"-validate"), "spec", "template", "spec"))
+	if hookPodContext["runAsNonRoot"] != true || hookPodContext["runAsUser"] != 1000 || hookPodContext["runAsGroup"] != 1000 {
+		t.Errorf("the hook pod podSecurityContext is %v, want the restricted non-root default, independent from the writer's root one", hookPodContext)
+	}
+	if seccomp, _ := hookPodContext["seccompProfile"].(map[string]any); seccomp["type"] != "RuntimeDefault" {
+		t.Errorf("the hook pod seccompProfile is %v, want RuntimeDefault", hookPodContext["seccompProfile"])
+	}
+
+	restorePodContext := podSecurityContext(t, at(t, find(t, docs, "CronJob", fullname+"-restore"), "spec", "jobTemplate", "spec", "template", "spec"))
+	if got, want := mustJSON(t, restorePodContext), mustJSON(t, writerPodContext); got != want {
+		t.Errorf("the restore pod podSecurityContext is %s, want the top-level one inherited while restore.podSecurityContext is empty (%s)", got, want)
+	}
+
+	// A non-empty restore.podSecurityContext replaces the inherited one whole.
+	root := repoRoot(t)
+	override := filepath.Join(t.TempDir(), "restore-context.yaml")
+	body := `restore:
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 2000
+    runAsGroup: 2000
+    fsGroup: 2000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile: {type: RuntimeDefault}
+`
+	if err := os.WriteFile(override, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing the restore pod context override: %v", err)
+	}
+	manifest, err := render(t,
+		"-f", filepath.Join(root, "examples", "values", "minimal.yaml"),
+		"-f", isolationValues(t),
+		"-f", extrasValues(t),
+		"-f", override,
+		"--set-file", "config="+filepath.Join(root, "examples", "config", "minimal.yaml"),
+	)
+	if err != nil {
+		t.Fatalf("rendering with the restore pod context override: %v", err)
+	}
+	restorePodContext = podSecurityContext(t, at(t, find(t, documents(t, manifest), "CronJob", fullname+"-restore"), "spec", "jobTemplate", "spec", "template", "spec"))
+	if restorePodContext["runAsUser"] != 2000 || restorePodContext["fsGroup"] != 2000 {
+		t.Errorf("the restore pod podSecurityContext is %v, want the full override (runAsUser 2000, fsGroup 2000), not the inherited top-level one", restorePodContext)
+	}
+}
+
+// TestHookPodContextContractIsNotVacuous mutates the hook template to
+// reintroduce the inheritance the contract above forbids, and proves the
+// assertion fails on it: a contract that also passes on the bug it exists to
+// catch proves nothing.
+func TestHookPodContextContractIsNotVacuous(t *testing.T) {
+	root := repoRoot(t)
+	mutated := filepath.Join(t.TempDir(), "chart")
+	if err := os.CopyFS(mutated, os.DirFS(filepath.Join(root, chartPath))); err != nil {
+		t.Fatalf("copying the chart: %v", err)
+	}
+	hookPath := filepath.Join(mutated, "templates", "hook-validate.yaml")
+	data, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("reading the hook template: %v", err)
+	}
+	// The line the chart carried before the fix: the hook pod read the writer's
+	// top-level context. (A `default`-based mutation would be a no-op, because
+	// `hooks.podSecurityContext` is non-empty and `default` then returns it.)
+	const inherited = "{{- toYaml .Values.podSecurityContext | nindent 8 }}"
+	patched := strings.Replace(string(data), "{{- toYaml .Values.hooks.podSecurityContext | nindent 8 }}", inherited, 1)
+	if patched == string(data) {
+		t.Fatal("the hook pod securityContext line changed; update this mutation so the contract stays proven")
+	}
+	if err := os.WriteFile(hookPath, []byte(patched), 0o600); err != nil {
+		t.Fatalf("writing the mutated hook template: %v", err)
+	}
+	manifest, err := runHelm(t, root, "template", releaseName, mutated,
+		"-f", filepath.Join(root, "examples", "values", "minimal.yaml"),
+		"-f", isolationValues(t),
+		"-f", extrasValues(t),
+		"--set-file", "config="+filepath.Join(root, "examples", "config", "minimal.yaml"),
+	)
+	if err != nil {
+		t.Fatalf("rendering the mutated chart: %v", err)
+	}
+	hookPodContext := podSecurityContext(t, at(t, find(t, documents(t, manifest), "Job", fullname+"-validate"), "spec", "template", "spec"))
+	if hookPodContext["runAsNonRoot"] == true && hookPodContext["runAsUser"] == 1000 {
+		t.Fatalf("the mutated hook pod inherited the top-level root context yet still looks non-root, so the contract would pass on it: %v", hookPodContext)
+	}
+}
+
 func asList(v any) []any {
 	list, _ := v.([]any)
 	return list

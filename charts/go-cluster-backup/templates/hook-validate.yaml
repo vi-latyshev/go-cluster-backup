@@ -44,12 +44,27 @@ spec:
       restartPolicy: Never
       # Offline: the check talks to no API server.
       automountServiceAccountToken: false
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.hooks.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: validate
           image: {{ include "go-cluster-backup.image" . }}
@@ -57,7 +72,7 @@ spec:
           terminationMessagePolicy: FallbackToLogsOnError
           args: ["validate", "--config", {{ include "go-cluster-backup.configPath" . | quote }}]
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- toYaml .Values.hooks.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.hooks.resources | nindent 12 }}
           {{- with .Values.extraEnv }}

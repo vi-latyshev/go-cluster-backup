@@ -107,12 +107,62 @@ restore:
       cpu: "1"
       memory: 512Mi
       ephemeral-storage: 9Gi
+  # -- pod securityContext of the restore pod. Empty inherits the top-level
+  # `podSecurityContext`; a non-empty value is a FULL replacement, never a merge,
+  # so a `fsGroup`-only override drops the `seccompProfile` and the `restricted`
+  # Pod Security Standard then rejects the pod — state the complete context:
+  #   podSecurityContext:
+  #     runAsNonRoot: true
+  #     runAsUser: 1000
+  #     runAsGroup: 1000
+  #     fsGroup: 1000
+  #     fsGroupChangePolicy: OnRootMismatch
+  #     seccompProfile: {type: RuntimeDefault}
+  # Set it when the restore pod's fsGroup must differ from the writer's: a root
+  # writer leaves the pod fsGroup at 0, and a non-root restore could then not
+  # write its spool.
+  podSecurityContext: {}
+  # -- container securityContext of the restore container, independent from the
+  # writer's `securityContext`: a root writer does not make the restore run as
+  # root. The default passes the `restricted` Pod Security Standard; a files
+  # restore reading a root-owned volume root sets `runAsUser`/`runAsGroup` 0 and
+  # `runAsNonRoot` false here.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  # -- Volumes only the restore pod declares, on top of the shared ones. A files
+  # restore's PersistentVolume root belongs here, never in `extraVolumes`, which
+  # reaches the hook pod too.
+  volumes: []
+  # -- VolumeMounts only the restore container mounts, on top of the shared ones.
+  # Pair them with `restore.volumes`.
+  volumeMounts: []
+
+# ── Writer pod ────────────────────────────────────────────────────────────
+# The writer pods are the scheduled and manual CronJobs. The stage
+# initContainer runs inside them, so its volumeMounts may reference
+# `writer.volumes`.
+writer:
+  # -- Volumes only the writer pods declare, on top of the shared ones. A node
+  # hostPath holding node state or secrets — the k3s datastore, a VPN database —
+  # belongs here, never in `extraVolumes`, which reaches the restore and hook
+  # pods too.
+  volumes: []
+  # -- VolumeMounts only the writer container mounts, on top of the shared ones.
+  # Pair them with `writer.volumes`; the restore container never sees them.
+  volumeMounts: []
 
 # ── Optional staging initContainer ────────────────────────────────────────
 # Runs `go-cluster-backup stage` before the writer container, to snapshot state
 # that only exists on the node (see the k3s_state source). It needs the
-# hostPaths that state lives on, added through extraVolumes, and typically a
-# root securityContext — a namespace that admits it, not `restricted`.
+# hostPaths that state lives on, declared in writer.volumes and mounted through
+# its own volumeMounts, and typically a root securityContext — a namespace that
+# admits it, not `restricted`.
 stage:
   # -- Render the `stage` initContainer on the writer pod.
   enabled: false
@@ -135,7 +185,8 @@ stage:
       cpu: 500m
       memory: 512Mi
   # -- Extra volumeMounts of the stage initContainer, on top of the shared
-  # ones. Pair them with extraVolumes.
+  # ones. Pair them with writer.volumes, which the stage container's pod
+  # declares.
   volumeMounts: []
 
 # ── Service account ───────────────────────────────────────────────────────
@@ -180,11 +231,13 @@ secretMounts: []
 #   optional: false
 
 # -- Extra volumes of every pod — the writer, the restore Job and the
-# config-gate hook Job alike (the hostPaths the stage initContainer reads, for
-# example).
+# config-gate hook Job alike. Only an innocuous shared volume belongs here (a
+# coverage directory, a CA bundle); a node hostPath holding state or secrets
+# goes in `writer.volumes` or `restore.volumes`, which one pod alone declares.
 extraVolumes: []
 # -- Extra volumeMounts of every container that runs the tool, the stage
-# initContainer included.
+# initContainer and the config-gate hook included. Pair them with
+# `extraVolumes`.
 extraVolumeMounts: []
 # -- Extra environment variables of every container that runs the tool, the
 # stage initContainer and the config-gate hook included. Each entry must use
@@ -203,7 +256,10 @@ volumes:
   # -- Discovered: a tmpfs the discovery writes resolved credentials into.
   discovered: 16Mi
 
-# -- pod securityContext of every pod.
+# -- pod securityContext of the writer pods, and the default the restore pod
+# inherits while `restore.podSecurityContext` is empty. The config-gate hook pod
+# carries its own (`hooks.podSecurityContext`) and never inherits this one, so a
+# root writer does not make the hook pod root.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -213,8 +269,10 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
-# -- container securityContext of the writer and restore containers. A
-# deployment whose storage root is only readable by root overrides this.
+# -- container securityContext of the writer container. A deployment whose
+# storage root is only readable by root overrides this; the restore and hook
+# containers carry their own (`restore.securityContext`, `hooks.securityContext`)
+# and never inherit it.
 securityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -270,3 +328,27 @@ hooks:
     limits:
       cpu: 100m
       memory: 128Mi
+  # -- container securityContext of the hook container, independent from the
+  # writer's `securityContext`. The offline check reads no node path, so it must
+  # never run as root; the default passes the `restricted` Pod Security
+  # Standard.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  # -- pod securityContext of the hook pod. Independent from the top-level
+  # `podSecurityContext`: the hook reads no node path, so a root writer must not
+  # make its pod root. The default passes the `restricted` Pod Security
+  # Standard.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
