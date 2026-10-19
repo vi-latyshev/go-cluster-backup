@@ -166,20 +166,23 @@ func TestK3sState(t *testing.T) {
 
 	files := writeFiles(t, map[string]string{
 		"config.yaml": e.k3sConfig(ns, catalogName(k3sFullname)),
-		"values.yaml": e.baseValues(ns, k3sFullname,
-			[]string{
-				"  - {name: staged, emptyDir: {}}",
-				"  - {name: k3s-db, hostPath: {path: /var/lib/rancher/k3s/server/db, type: Directory}}",
-				"  - {name: k3s-token, hostPath: {path: /var/lib/rancher/k3s/server/token, type: File}}",
-			},
-			[]string{"  - {name: staged, mountPath: /staged}"},
-		) + `
+		"values.yaml": e.baseValues(ns, k3sFullname, nil, nil) + `
+# The node mounts are writer-only: the restore and hook pods must not carry
+# them. /gocover stays on the shared extras, so the writer, stage, restore and
+# hook containers all write coverage.
+writer:
+  volumes:
+    - {name: staged, emptyDir: {}}
+    - {name: k3s-db, hostPath: {path: /var/lib/rancher/k3s/server/db, type: Directory}}
+    - {name: k3s-token, hostPath: {path: /var/lib/rancher/k3s/server/token, type: File}}
+  volumeMounts:
+    - {name: staged, mountPath: /staged}
 stage:
   enabled: true
   volumeMounts:
-    # /staged and /gocover reach the stage container through extraVolumeMounts
-    # already; repeating one here would mount the same path twice and the
-    # kubelet would refuse the pod.
+    # /staged comes from writer.volumes; repeating /gocover here would mount the
+    # same path twice and the kubelet would refuse the pod.
+    - {name: staged, mountPath: /staged}
     - {name: k3s-db, mountPath: /k3s-db}
     - {name: k3s-token, mountPath: /k3s-token, readOnly: true}
 `,

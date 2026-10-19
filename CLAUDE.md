@@ -90,6 +90,11 @@ Release.
   yourself). A consumer binds to these names.
 - **Every container sets `terminationMessagePolicy: FallbackToLogsOnError`**, so
   a pre-run failure carries its last log lines into the previous-run report.
+- **A node hostPath reaches one pod, never all of them**: `writer.volumes`/
+  `writer.volumeMounts` for the writer pods (the `stage` initContainer shares
+  the pod), `restore.volumes`/`restore.volumeMounts` for the restore pod;
+  `extraVolumes`/`extraVolumeMounts` reach every pod, the config-gate hook
+  included, so only an innocuous shared volume belongs there.
 - **Changing `values.yaml` means running `make docs`** — the chart README is
   generated from the value comments, and CI fails on drift.
 - The chart's own long form is `charts/go-cluster-backup/README.md`; the release

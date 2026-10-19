@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -65,6 +66,33 @@ func tree(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return root
+}
+
+// unlockTree registers a cleanup that makes a tree a restore left read-only
+// deletable again: WalkDir visits a directory before it reads it, so giving
+// every directory owner write+execute there lets t.TempDir's RemoveAll unlink
+// its children. It must be registered before the restore — a restore that fails
+// halfway still runs cleanups — and a path that never appeared is skipped.
+func unlockTree(t *testing.T, root string) {
+	t.Helper()
+	t.Cleanup(func() { unlockTreeNow(root) })
+}
+
+// unlockTreeNow walks root and gives every directory owner write+execute and
+// every regular file owner write, tolerating a root that does not exist.
+func unlockTreeNow(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		switch {
+		case d.IsDir():
+			_ = os.Chmod(path, 0o700)
+		case d.Type().IsRegular():
+			_ = os.Chmod(path, 0o600)
+		}
+		return nil
+	})
 }
 
 func TestGeneralConformance(t *testing.T) {
@@ -186,7 +214,7 @@ func TestDumpFailsOnAnUnreadableFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("x"), 0o000); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	unlockTree(t, root)
 	if os.Getuid() == 0 {
 		t.Skip("root reads anything; the permission failure cannot be provoked")
 	}
@@ -1037,7 +1065,7 @@ func TestApplyRefusesARootItCannotOpen(t *testing.T) {
 	if err := os.Chmod(root, 0o300); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+	unlockTree(t, root)
 	s, err := build(t, config(root, true))
 	if err != nil {
 		t.Fatal(err)
@@ -1064,7 +1092,7 @@ func TestApplyFailsWritingAFileWhereTheDirectoryRefusesIt(t *testing.T) {
 	if err := os.Chmod(ro, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+	unlockTree(t, root)
 	s, err := build(t, config(root, true))
 	if err != nil {
 		t.Fatal(err)
@@ -1131,7 +1159,7 @@ func TestApplyRestoresAReadOnlyDirectoryTree(t *testing.T) {
 		{Name: "locked/", Typeflag: tar.TypeDir, Mode: 0o555},
 		{Name: "locked/file.txt", Typeflag: tar.TypeReg, Mode: 0o444},
 	}, []string{"", "content"})
-	t.Cleanup(func() { _ = os.Chmod(filepath.Join(root, "locked"), 0o755) })
+	unlockTree(t, root)
 	if _, err := s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
 		Mode: source.ApplyInPlace, Label: "l", Options: jsontext.Value(applyOptions),
 	}, bytes.NewReader(archive)); err != nil {
@@ -1275,7 +1303,7 @@ func TestApplyFailsOnADirectoryUnderAnUnwritableParent(t *testing.T) {
 	if err := os.Mkdir(ro, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+	unlockTree(t, root)
 	if err := applyInPlace(t, root, []tar.Header{{Name: "ro/newdir/", Typeflag: tar.TypeDir, Mode: 0o755}}, []string{""}); err == nil {
 		t.Fatal("a directory was created under an unwritable parent")
 	}
@@ -1326,7 +1354,7 @@ func TestApplyFailsReplacingAFileInAnUnwritableDirectory(t *testing.T) {
 	if err := os.Chmod(ro, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o700) })
+	unlockTree(t, root)
 	if err := applyInPlace(t, root, []tar.Header{{Name: "ro/old", Typeflag: tar.TypeReg, Mode: 0o644}}, []string{"new"}); err == nil {
 		t.Fatal("a file was replaced in an unwritable directory")
 	}
@@ -1433,10 +1461,7 @@ func TestApplyRestoresNestedReadOnlyDirectories(t *testing.T) {
 		{Name: "a/b/", Typeflag: tar.TypeDir, Mode: 0o500},
 		{Name: "a/b/f.txt", Typeflag: tar.TypeReg, Mode: 0o444},
 	}, []string{"", "", "x"})
-	t.Cleanup(func() {
-		_ = os.Chmod(filepath.Join(root, "a", "b"), 0o700)
-		_ = os.Chmod(filepath.Join(root, "a"), 0o700)
-	})
+	unlockTree(t, root)
 	if _, err := s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
 		Mode: source.ApplyInPlace, Label: "l", Options: jsontext.Value(applyOptions),
 	}, bytes.NewReader(archive)); err != nil {
@@ -1456,5 +1481,36 @@ func TestApplyRestoresNestedReadOnlyDirectories(t *testing.T) {
 		if info.Mode().Perm() != want.mode {
 			t.Fatalf("%s mode = %o, want %o", want.path, info.Mode().Perm(), want.mode)
 		}
+	}
+}
+
+// TestAReadOnlyTreeIsUndeletableUntilUnlocked is the leak the walk cleanup
+// exists for: a restore leaves a 0555 directory holding a file, and RemoveAll —
+// what t.TempDir runs — cannot unlink the child until the directory is writable
+// again. Root deletes through any mode, so the failure cannot be provoked there.
+func TestAReadOnlyTreeIsUndeletableUntilUnlocked(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root deletes through any directory mode; the failure cannot be provoked")
+	}
+	root := t.TempDir()
+	unlockTree(t, root)
+	locked := filepath.Join(root, "locked")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "file.txt"), []byte("x"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(locked); err == nil {
+		t.Fatal("a 0555 directory was deleted without being unlocked; the leak cannot be observed")
+	}
+	// A path the tree never held is skipped, not fatal.
+	unlockTreeNow(filepath.Join(root, "never-created"))
+	unlockTreeNow(root)
+	if err := os.RemoveAll(locked); err != nil {
+		t.Fatalf("an unlocked read-only tree still refused deletion: %v", err)
 	}
 }

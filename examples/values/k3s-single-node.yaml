@@ -1,9 +1,11 @@
 # Values for examples/config/k3s-single-node.yaml — one node, the k3s datastore
 # snapshotted by the stage initContainer and file volumes discovered by label.
 #
-# This deployment reads hostPaths owned by root. No Pod Security Standard
-# below `privileged` admits a hostPath volume — `baseline` rejects it just as
-# `restricted` does — so the namespace must be labelled
+# This deployment reads hostPaths owned by root, declared under `writer` and
+# `restore` so the writer and restore pods alone carry them — the config-gate
+# hook never mounts the node's datastore or its server token. No Pod Security
+# Standard below `privileged` admits a hostPath volume — `baseline` rejects it
+# just as `restricted` does — so the namespace must be labelled
 # `pod-security.kubernetes.io/enforce=privileged`, or be exempted from
 # enforcement. The default values do pass `restricted`; this file is what
 # changes that.
@@ -44,6 +46,8 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
+# The writer container alone: the restore and hook containers carry their own
+# securityContext and never inherit this root one.
 securityContext:
   runAsNonRoot: false
   runAsUser: 0
@@ -53,40 +57,74 @@ securityContext:
   capabilities:
     drop: ["ALL"]
 
+# The node hostPaths live here, so the writer pod alone declares them: the
+# restore and hook pods never see the k3s datastore or the server token.
+writer:
+  volumes:
+    - name: k3s-db
+      hostPath:
+        path: /var/lib/rancher/k3s/server/db
+        type: Directory
+    - name: k3s-token
+      hostPath:
+        path: /var/lib/rancher/k3s/server/token
+        type: File
+    # What the stage initContainer produces and the writer's staged source reads.
+    - name: staged
+      emptyDir: {}
+    # The local provisioner's storage root: a volume's directory is resolved
+    # from its PersistentVolume and opened as is.
+    - name: k3s-storage
+      hostPath:
+        path: /var/lib/rancher/k3s/storage
+        type: Directory
+  volumeMounts:
+    - name: staged
+      mountPath: /staged
+    - name: k3s-storage
+      mountPath: /var/lib/rancher/k3s/storage
+      readOnly: true
+
 stage:
   enabled: true
   volumeMounts:
+    # /staged comes from writer.volumes, which the writer pod declares; the
+    # stage container mounts it explicitly.
+    - name: staged
+      mountPath: /staged
     # Not read-only: an SQLite reader opens -shm/-wal beside state.db.
     - name: k3s-db
       mountPath: /k3s-db
     - name: k3s-token
       mountPath: /k3s-token
       readOnly: true
-    # /staged is not listed here: it comes from extraVolumeMounts below, which
-    # the stage container now shares with every other container.
 
-extraVolumes:
-  - name: k3s-db
-    hostPath:
-      path: /var/lib/rancher/k3s/server/db
-      type: Directory
-  - name: k3s-token
-    hostPath:
-      path: /var/lib/rancher/k3s/server/token
-      type: File
-  # What the stage initContainer produces and the writer's staged source reads.
-  - name: staged
-    emptyDir: {}
-  # The local provisioner's storage root: a volume's directory is resolved from
-  # its PersistentVolume and opened as is.
-  - name: k3s-storage
-    hostPath:
-      path: /var/lib/rancher/k3s/storage
-      type: Directory
-
-extraVolumeMounts:
-  - name: staged
-    mountPath: /staged
-  - name: k3s-storage
-    mountPath: /var/lib/rancher/k3s/storage
-    readOnly: true
+restore:
+  # A files restore reads the PersistentVolume root, which the local provisioner
+  # owns as root, so the restore pod runs as root here too — its own security
+  # context, not the writer's.
+  podSecurityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+    runAsGroup: 0
+    fsGroup: 0
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    runAsNonRoot: false
+    runAsUser: 0
+    runAsGroup: 0
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  volumes:
+    - name: k3s-storage
+      hostPath:
+        path: /var/lib/rancher/k3s/storage
+        type: Directory
+  volumeMounts:
+    - name: k3s-storage
+      mountPath: /var/lib/rancher/k3s/storage
+      readOnly: true

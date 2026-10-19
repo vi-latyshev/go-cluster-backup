@@ -131,28 +131,35 @@ Shared volumes of a pod. Takes a dict: `root` is the root context and
 {{- end }}
 {{- end -}}
 
-{{/* The pod-level fields every writer, restore and hook pod shares. Takes the root context. */}}
+{{/*
+The pod-level fields every writer, restore and hook pod shares. Takes a dict:
+`root` is the root context and `podSecurityContext` the pod's securityContext,
+empty falling back to the top-level one (a root writer's pod shape is not forced
+on the restore pod).
+*/}}
 {{- define "go-cluster-backup.podSpecCommon" -}}
+{{- $root := .root -}}
+{{- $podSecurityContext := default $root.Values.podSecurityContext .podSecurityContext -}}
 restartPolicy: Never
-serviceAccountName: {{ include "go-cluster-backup.serviceAccountName" . }}
-{{- with .Values.priorityClassName }}
+serviceAccountName: {{ include "go-cluster-backup.serviceAccountName" $root }}
+{{- with $root.Values.priorityClassName }}
 priorityClassName: {{ . }}
 {{- end }}
-{{- with .Values.imagePullSecrets }}
+{{- with $root.Values.imagePullSecrets }}
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 securityContext:
-  {{- toYaml .Values.podSecurityContext | nindent 2 }}
-{{- with .Values.nodeSelector }}
+  {{- toYaml $podSecurityContext | nindent 2 }}
+{{- with $root.Values.nodeSelector }}
 nodeSelector:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .Values.tolerations }}
+{{- with $root.Values.tolerations }}
 tolerations:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .Values.affinity }}
+{{- with $root.Values.affinity }}
 affinity:
   {{- toYaml . | nindent 2 }}
 {{- end }}
@@ -175,7 +182,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- include "go-cluster-backup.podSpecCommon" $root | nindent 2 }}
+  {{- include "go-cluster-backup.podSpecCommon" (dict "root" $root) | nindent 2 }}
   {{- if $root.Values.stage.enabled }}
   initContainers:
     - name: stage
@@ -232,8 +239,14 @@ spec:
         {{- with $root.Values.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- with $root.Values.writer.volumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
   volumes:
     {{- include "go-cluster-backup.sharedVolumes" (dict "root" $root) | nindent 4 }}
+    {{- with $root.Values.writer.volumes }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 {{- end -}}
 
 {{/*
@@ -255,7 +268,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- include "go-cluster-backup.podSpecCommon" $root | nindent 2 }}
+  {{- include "go-cluster-backup.podSpecCommon" (dict "root" $root "podSecurityContext" $root.Values.restore.podSecurityContext) | nindent 2 }}
   containers:
     - name: restore
       image: {{ include "go-cluster-backup.image" $root }}
@@ -268,7 +281,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        {{- toYaml $root.Values.securityContext | nindent 8 }}
+        {{- toYaml $root.Values.restore.securityContext | nindent 8 }}
       resources:
         {{- toYaml $root.Values.restore.resources | nindent 8 }}
       volumeMounts:
@@ -276,8 +289,14 @@ spec:
         {{- with $root.Values.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- with $root.Values.restore.volumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
   volumes:
     {{- include "go-cluster-backup.sharedVolumes" (dict "root" $root "spoolSize" $root.Values.restore.spoolSize) | nindent 4 }}
+    {{- with $root.Values.restore.volumes }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 {{- end -}}
 
 {{/*
