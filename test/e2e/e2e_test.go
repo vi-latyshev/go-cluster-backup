@@ -146,23 +146,30 @@ func setup() (*Env, error) {
 	}
 	e.Kubeconfig = kubeconfig
 
-	// Every image is pulled once into the local daemon and loaded into the node
-	// together. Four in-cluster pulls cost minutes of registry latency per run
-	// and fail on a throttled registry; one import is seconds and offline.
-	// The dependencies come from a registry; the image under test is built
-	// locally and must not be pulled.
-	for _, image := range dependencyImages {
-		if out, err := e.exec("", "docker", "pull", "-q", image); err != nil {
-			return nil, fmt.Errorf("docker pull %s: %w\n%s", image, err, out)
+	// Every image is loaded once into the cluster's own containerd. Four
+	// in-cluster pulls cost minutes of registry latency per run and fail on a
+	// throttled registry; one load is seconds and offline. The dependencies come
+	// from a registry and are pulled by their pinned digest, then re-tagged: a
+	// digest is not a reference the pods can ask for. The image under test is
+	// built locally and must not be pulled.
+	for i, pin := range dependencyPins {
+		if out, err := e.exec("", "docker", "pull", "-q", pin); err != nil {
+			return nil, fmt.Errorf("docker pull %s: %w\n%s", pin, err, out)
+		}
+		if out, err := e.exec("", "docker", "tag", pin, dependencyImages[i]); err != nil {
+			return nil, fmt.Errorf("docker tag %s %s: %w\n%s", pin, dependencyImages[i], err, out)
 		}
 	}
-	if out, err := e.k3d(append([]string{"image", "import"}, append(dependencyImages, "-c", e.Cluster)...)...); err != nil {
-		return nil, fmt.Errorf("k3d image import (dependencies): %w\n%s", err, out)
+	images := append([]string{e.Image}, dependencyImages...)
+	if err := e.loadImages(images...); err != nil {
+		return nil, err
 	}
-	// The image under test is imported on its own: a locally built image mixed
-	// with registry references in one import is silently dropped.
-	if out, err := e.k3d("image", "import", e.Image, "-c", e.Cluster); err != nil {
-		return nil, fmt.Errorf("k3d image import %s: %w\n%s", e.Image, err, out)
+	// The load is confirmed against the store the kubelet reads: a load that
+	// returns zero and leaves nothing behind is the failure this suite already
+	// met once, and a run without its images fails minutes later with a
+	// different, misleading error.
+	if err := e.verifyImported(images...); err != nil {
+		return nil, err
 	}
 	if out, err := e.exec("", "kubectl", "get", "nodes"); err != nil {
 		return nil, fmt.Errorf("cluster not reachable: %w\n%s", err, out)
@@ -217,6 +224,128 @@ const coverNodeDir = "/var/lib/gocover"
 
 func (e *Env) k3d(args ...string) (string, error) {
 	return e.exec("", "k3d", args...)
+}
+
+// loadImages copies images from the local docker daemon into every node's
+// containerd. `k3d image import` is not used: it runs
+// `ctr image import --all-platforms`, which fails on a multi-arch index whose
+// non-host blobs `docker save` never wrote, and k3d reports success anyway.
+// Saving and importing by hand keeps the exit status, and importing without
+// --all-platforms takes the one platform the node runs.
+func (e *Env) loadImages(refs ...string) error {
+	nodes, err := e.nodeContainers()
+	if err != nil {
+		return err
+	}
+	// One private directory per setup: a fixed name would be shared with a
+	// concurrent run in the same scratch and clobbered mid-import.
+	dir, err := os.MkdirTemp("", "gcb-e2e-images")
+	if err != nil {
+		return fmt.Errorf("create image dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	// One file, rewritten per image: each is imported into every node before the
+	// next save overwrites it, so only one tarball is ever on disk.
+	tar := filepath.Join(dir, "image.tar")
+	for _, ref := range refs {
+		if out, err := e.exec("", "docker", "save", "-o", tar, ref); err != nil {
+			return fmt.Errorf("docker save %s: %w\n%s", ref, err, out)
+		}
+		for _, node := range nodes {
+			if err := importInto(tar, node); err != nil {
+				return fmt.Errorf("load %s into %s: %w", ref, node, err)
+			}
+		}
+	}
+	return nil
+}
+
+// importInto streams a saved image tarball into one node's containerd.
+func importInto(tar, node string) error {
+	f, err := os.Open(tar)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	var buf bytes.Buffer
+	cmd := exec.CommandContext(ctx, "docker", "exec", "-i", node, "ctr", "-n", "k8s.io", "images", "import", "-")
+	cmd.Stdin = f
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w\n%s", err, buf.String())
+	}
+	return nil
+}
+
+// nodeContainers names the cluster's server and agent containers: the nodes that
+// run a containerd the kubelet reads.
+func (e *Env) nodeContainers() ([]string, error) {
+	var nodes []string
+	for _, role := range []string{"server", "agent"} {
+		out, err := e.exec("", "docker", "ps",
+			"--filter", "label=k3d.cluster="+e.Cluster,
+			"--filter", "label=k3d.role="+role,
+			"--format", "{{.Names}}")
+		if err != nil {
+			return nil, fmt.Errorf("list %s nodes: %w\n%s", role, err, out)
+		}
+		nodes = append(nodes, strings.Fields(out)...)
+	}
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("cluster %s has no node containers", e.Cluster)
+	}
+	return nodes, nil
+}
+
+// verifyImported fails when a ref is missing from a node's containerd.
+func (e *Env) verifyImported(refs ...string) error {
+	nodes, err := e.nodeContainers()
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		out, err := e.exec("", "docker", "exec", node, "ctr", "-n", "k8s.io", "images", "ls", "-q")
+		if err != nil {
+			return fmt.Errorf("list images in %s: %w\n%s", node, err, out)
+		}
+		have := map[string]bool{}
+		for _, name := range strings.Fields(out) {
+			have[name] = true
+		}
+		for _, ref := range refs {
+			if !have[containerdRef(ref)] {
+				return fmt.Errorf("%s is not in %s: containerd has no %s", ref, node, containerdRef(ref))
+			}
+		}
+	}
+	return nil
+}
+
+// containerdRef is the name containerd stores a docker reference under. It
+// applies the same defaults the runtime does: an absent tag means latest, a
+// bare name is a Docker Hub library image, and a first component that names a
+// registry (a dot, a colon, or localhost) is left alone.
+func containerdRef(ref string) string {
+	if strings.Contains(ref, "@") {
+		return ref // a digest reference is stored as written
+	}
+	name, tag := splitImage(ref)
+	host, rest, qualified := strings.Cut(name, "/")
+	switch {
+	case !qualified:
+		return "docker.io/library/" + name + ":" + tag
+	case host == "docker.io":
+		if strings.Contains(rest, "/") {
+			return name + ":" + tag
+		}
+		return "docker.io/library/" + rest + ":" + tag
+	case strings.ContainsAny(host, ".:") || host == "localhost":
+		return name + ":" + tag
+	default:
+		return "docker.io/" + name + ":" + tag
+	}
 }
 
 // exec runs a command with this cluster's kubeconfig alone in KUBECONFIG. It is
