@@ -14,15 +14,39 @@ import (
 // bytes run on every CI architecture. MinIO is gone from the public registries
 // (Docker Hub removed it, quay.io requires a login), so the S3 endpoint is
 // SeaweedFS — a real S3 server, not a mock.
+//
+// A pin is a registry digest. The load path carries a tag, not a digest, so
+// each pin is pulled by digest and re-tagged with pinnedTag before the cluster
+// ever sees it.
 const (
-	imagePostgres   = "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
-	imageRedis      = "redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0"
-	imageSeaweedFS  = "chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d"
-	imageEchoServer = "mendhak/http-https-echo@sha256:a265f55c86cb3baead76fdf379dc8e9e6440ed121874e101e60b833e05bce8d4"
+	pinPostgres   = "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
+	pinRedis      = "redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0"
+	pinSeaweedFS  = "chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d"
+	pinEchoServer = "mendhak/http-https-echo@sha256:a265f55c86cb3baead76fdf379dc8e9e6440ed121874e101e60b833e05bce8d4"
 )
 
-// dependencyImages is everything the cluster needs besides the image under test.
-var dependencyImages = []string{imagePostgres, imageRedis, imageSeaweedFS, imageEchoServer}
+// pinnedTag is the tag a pin is loaded under: the repository plus the first 12
+// hex of its digest, e.g. postgres@sha256:77f5… becomes postgres:e2e-77f585114c32.
+// It is derived, never hand-written, so a pin and its tag cannot drift.
+func pinnedTag(ref string) string {
+	repo, digest := splitImage(ref)
+	return repo + ":e2e-" + strings.TrimPrefix(digest, "sha256:")[:12]
+}
+
+// The tags the pods reference, one per pin.
+var (
+	imagePostgres   = pinnedTag(pinPostgres)
+	imageRedis      = pinnedTag(pinRedis)
+	imageSeaweedFS  = pinnedTag(pinSeaweedFS)
+	imageEchoServer = pinnedTag(pinEchoServer)
+)
+
+// dependencyPins are the registry digests; dependencyImages are the tags the
+// cluster runs them under. The two are index-aligned.
+var (
+	dependencyPins   = []string{pinPostgres, pinRedis, pinSeaweedFS, pinEchoServer}
+	dependencyImages = []string{imagePostgres, imageRedis, imageSeaweedFS, imageEchoServer}
+)
 
 const (
 	secretS3    = "gcb-s3"
@@ -128,6 +152,7 @@ spec:
       containers:
         - name: postgres
           image: %[2]s
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 5432}]
           env:
             - {name: POSTGRES_DB, value: %[3]s}
@@ -162,6 +187,7 @@ spec:
       containers:
         - name: redis
           image: %[5]s
+          imagePullPolicy: IfNotPresent
           command: ["redis-server", "--requirepass", "$(REDIS_PASSWORD)"]
           ports: [{containerPort: 6379}]
           env:
@@ -191,6 +217,7 @@ spec:
       containers:
         - name: echo
           image: %[7]s
+          imagePullPolicy: IfNotPresent
           ports: [{containerPort: 8080}]
           env:
             - {name: HTTP_PORT, value: "8080"}
@@ -223,6 +250,7 @@ spec:
       containers:
         - name: seaweedfs
           image: %[2]s
+          imagePullPolicy: IfNotPresent
           args: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-master.port=9333", "-volume.port=8080"]
           ports:
             - {name: s3, containerPort: 8333}
@@ -277,6 +305,55 @@ func (e *Env) createBucket(t *testing.T, ns string) {
 		out, _ := e.exec("", "kubectl", "exec", "-n", ns, "deploy/seaweedfs", "--", "sh", "-c", cmd)
 		return strings.Contains(out, "created bucket") || strings.Contains(out, "already exists"), out
 	})
+}
+
+// --- image references -----------------------------------------------------
+
+// TestPinnedTagDerivation pins the derived-tag rule. The pod specs, the load and
+// the containerd check agree only while a pin and its tag stay in step, and the
+// pin is a digest no reader can re-derive by eye.
+func TestPinnedTagDerivation(t *testing.T) {
+	want := map[string]string{
+		pinPostgres:   "postgres:e2e-77f585114c32",
+		pinRedis:      "redis:e2e-3811787313eb",
+		pinSeaweedFS:  "chrislusf/seaweedfs:e2e-4e61d15fd359",
+		pinEchoServer: "mendhak/http-https-echo:e2e-a265f55c86cb",
+	}
+	for pin, tag := range want {
+		if got := pinnedTag(pin); got != tag {
+			t.Errorf("pinnedTag(%q) = %q, want %q", pin, got, tag)
+		}
+	}
+	if len(dependencyPins) != len(dependencyImages) {
+		t.Fatalf("dependencyPins and dependencyImages differ in length: %d and %d", len(dependencyPins), len(dependencyImages))
+	}
+	for i, pin := range dependencyPins {
+		if dependencyImages[i] != pinnedTag(pin) {
+			t.Errorf("dependencyImages[%d] = %q, not the tag of %q", i, dependencyImages[i], pin)
+		}
+	}
+}
+
+// TestContainerdRef pins the normalisation the containerd check relies on.
+func TestContainerdRef(t *testing.T) {
+	cases := map[string]string{
+		"postgres":                             "docker.io/library/postgres:latest",
+		"postgres:16":                          "docker.io/library/postgres:16",
+		"postgres:e2e-77f585114c32":            "docker.io/library/postgres:e2e-77f585114c32",
+		"go-cluster-backup:e2e":                "docker.io/library/go-cluster-backup:e2e",
+		"chrislusf/seaweedfs:e2e-4e61d15fd359": "docker.io/chrislusf/seaweedfs:e2e-4e61d15fd359",
+		"docker.io/go-cluster-backup:e2e":      "docker.io/library/go-cluster-backup:e2e",
+		"docker.io/chrislusf/seaweedfs:e2e-x":  "docker.io/chrislusf/seaweedfs:e2e-x",
+		"ghcr.io/x/y:1":                        "ghcr.io/x/y:1",
+		"registry.example.com/ns/img:tag":      "registry.example.com/ns/img:tag",
+		"localhost/gcb:e2e":                    "localhost/gcb:e2e",
+		"localhost:5000/img:tag":               "localhost:5000/img:tag",
+	}
+	for ref, want := range cases {
+		if got := containerdRef(ref); got != want {
+			t.Errorf("containerdRef(%q) = %q, want %q", ref, got, want)
+		}
+	}
 }
 
 // --- the tool's configuration --------------------------------------------

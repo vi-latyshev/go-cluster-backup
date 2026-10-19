@@ -42,8 +42,9 @@ k3d cluster create "$GCB_E2E_CLUSTER" --image rancher/k3s:v1.37.1-k3s1 --wait \
   --volume "$GCB_E2E_COVERDIR:/var/lib/gocover@server:*"
 ```
 
-(the `--volume` only when `GCB_E2E_COVERDIR` is set), then
-`k3d image import "$GCB_E2E_IMAGE" -c "$GCB_E2E_CLUSTER"`.
+(the `--volume` only when `GCB_E2E_COVERDIR` is set). The suite then loads
+`$GCB_E2E_IMAGE` and the four dependency images into the node's containerd
+itself — see *Images* below.
 
 Point `GCB_E2E_COVERDIR` at a directory the docker daemon can share (`$TMPDIR`
 is fine on Docker Desktop); the suite creates it and chmods it `0777`, because
@@ -62,6 +63,26 @@ per namespace: Postgres 18, Redis, SeaweedFS (S3) and an HTTP echo receiver, all
 pinned by multi-arch digest. MinIO is gone from the public registries (Docker
 Hub removed it, quay.io requires a login), so the S3 endpoint is SeaweedFS — a
 real S3 server, not a mock.
+
+## Images
+
+Every dependency is pinned by the digest of its multi-arch index, so the same
+bytes run on every CI architecture. The pin is what is pulled; each is then
+loaded under a tag derived from that same digest — `postgres@sha256:77f5…`
+becomes `postgres:e2e-77f585114c32` — and that tag is what the pod specs name,
+with `imagePullPolicy: IfNotPresent`, so nothing is pulled from the internet
+inside the cluster.
+
+The load is the suite's own `docker save` piped into the node's
+`ctr images import`, not `k3d image import`. Two things go wrong in k3d's
+`image import`: its image lookup cannot resolve a digest-only reference against
+a clean daemon, and its tools mode imports with `--all-platforms`, which fails
+on a multi-arch index whose non-host blobs `docker save` never wrote — while
+k3d reports success regardless, so the failure is swallowed and surfaces
+minutes later as an `ImagePullBackOff`. (A pod can be given a digest reference;
+the tag is only what the load path can carry.) After the load the suite confirms
+every ref is in the node's containerd, so a dropped image fails at setup with
+its name.
 
 ## Scenarios
 
@@ -114,9 +135,8 @@ go test -count=1 -timeout=20m ./test/e2e/...
 - **k3d** v5.9.0 (any v5.x works). **k3s** `rancher/k3s:v1.37.1-k3s1`.
 - **image**: `docker build -t go-cluster-backup:e2e --build-arg COVER=1 .`, where
   `COVER=1` builds with `-cover -covermode=atomic`. The suite pulls the four
-  dependency images and imports all five with `k3d image import` itself; the
-  image under test is imported on its own, because a locally built image mixed
-  with registry references in one import is silently dropped.
+  dependency images by digest, re-tags each and loads all five into the node's
+  containerd itself (see *Images*), then verifies each ref is present.
 - **coverage**: `GCB_E2E_COVERDIR` is a host directory bind-mounted into the
   node at `/var/lib/gocover`; the pods write there directly, so nothing is
   copied out. `make e2e` then runs
