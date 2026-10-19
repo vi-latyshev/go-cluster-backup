@@ -1,0 +1,126 @@
+# A single-node k3s deployment: the same shape as minimal.yaml, plus the node's
+# own state. A privileged init container runs `stage`, which snapshots the k3s
+# sqlite datastore and the server token into one sealed artifact; the run then
+# reads that artifact back, discovers file volumes by label, and uploads
+# everything to one S3-compatible endpoint.
+version: 1
+
+run:
+  spool_dir: /spool
+  spool_reserve_bytes: 1GiB
+  max_artifact_bytes: 3GiB
+  deadline: 90m
+  lease_hard_bound: 6000s
+
+# What the init container produces: the k3s datastore, the integrity check and
+# the server token, sealed before they leave the node.
+stage:
+  dir: /staged
+  sources:
+    host_state:
+      type: k3s_state
+      artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: secret}
+      pipeline: [seal]
+      config: {datastore: /k3s-db/state.db, token: {file: /k3s-token}, scratch_dir: /scratch, integrity_check: quick}
+
+discoveries:
+  workloads:
+    type: kubernetes_labels
+    config:
+      secrets_path: /run/discovered
+      exclude: {label: backup.example/ignore, value: "true"}
+      undeclared_volumes: {importance: best_effort}
+      pods: []
+      volumes:
+        # A claim that declares itself as a file volume: the source reads the
+        # volume the claim is bound to, at the path its PersistentVolume reports.
+        - name: files
+          selector: "backup.example/engine=files"
+          artifact:
+            group: volumes
+            name: "{{ .Namespace }}/{{ .Name }}"
+            importance: required
+            sensitivity: plain
+          pipeline: [compress, seal]
+          source:
+            type: files
+            config:
+              root: "{{ volumePath }}"
+
+sources:
+  # The run side reads what the init container staged.
+  control_plane:
+    type: staged
+    artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: secret}
+    pipeline: []
+    config: {dir: /staged, name: k3s-state}
+
+processors:
+  compress:
+    type: zstd
+    config: {level: better, window_bytes: 8MiB, decode_window_bytes: 16MiB}
+  seal:
+    type: age
+    # An example recipient from the age documentation; a deployment states its own.
+    config: {recipients: ["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"], identities: []}
+
+storages:
+  primary:
+    type: s3
+    retention:
+      scheduled: {type: keep_last, config: {count: 7, count_incomplete: true}}
+      # A manual run (the chart's <fullname>-manual CronJob) is refused on a
+      # storage with no `manual` partition, so both kinds are stated.
+      manual: {type: keep_last, config: {count: 3, count_incomplete: true}}
+    max_total_bytes: 50GB
+    time_budget: 30m
+    config:
+      endpoint: https://s3.example.com
+      region: us-east-1
+      bucket: cluster-backup
+      prefix: cluster-backup
+      access_key_id: {file: /run/secrets/s3/access-key-id}
+      secret_access_key: {file: /run/secrets/s3/secret-access-key}
+      addressing: path
+
+catalog:
+  type: kubernetes_configmap
+  config:
+    namespace: backup
+    name: go-cluster-backup-catalog
+
+notifiers:
+  ops:
+    type: webhook
+    config:
+      url: https://notify.example.com/backup
+      method: POST
+      headers: {Content-Type: application/json}
+      body_format: yaml
+      timeout: 10s
+      success_status: [200, 202]
+      max_response_bytes: 512
+      events:
+        run_started: |
+          🚀 Backup started
+          📦 {{ .Run.RunID }}
+          {{ if .Run.Previous.Unfinished }}
+          ⚠️ Previous run did not report
+          {{ end }}
+          {{ with .Run.Previous.Failure }}
+          ⚠️ Previous run failed before it reported: {{ .Reason }}
+          {{ range .Containers }}{{ if .Terminated }}✗ {{ .Container }}: {{ .Terminated.Reason }} (exit {{ .Terminated.ExitCode }}) {{ clip 160 .Terminated.Message }}
+          {{ else if .Waiting }}✗ {{ .Container }}: {{ .Waiting }}
+          {{ end }}{{ end }}
+          {{ end }}
+          {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}
+          {{ end }}
+        run_finished: |
+          {{ pick .Run.Outcome "delivered" "✅ Backup completed" "degraded" "⚠️ Backup DEGRADED" "failed" "❌ Backup FAILED" }}
+          📦 {{ .Run.RunID }}
+      payload: |
+        title: {{ json .Title }}
+        lines:
+        {{ range .Lines }}
+          - {text: {{ json .Text }}, mono: {{ json .Code }}}
+        {{ end }}

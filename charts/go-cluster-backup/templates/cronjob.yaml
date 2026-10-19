@@ -1,0 +1,48 @@
+{{/*
+The writer CronJobs, from one template: `<fullname>` runs on the schedule,
+`<fullname>-manual` never fires and is started by hand. They differ only by
+name, suspend, the dummy schedule, backoffLimit, the podFailurePolicy and the
+`--kind` arg — everything else is the shared writer pod.
+*/}}
+{{- $fullname := include "go-cluster-backup.fullname" . -}}
+{{- $configPath := include "go-cluster-backup.configPath" . -}}
+{{- $jobs := list (dict "name" $fullname "scheduled" true "args" (list "run" "--config" $configPath "--kind" "scheduled")) -}}
+{{- if .Values.manual.enabled -}}
+{{- $jobs = append $jobs (dict "name" (printf "%s-manual" $fullname) "scheduled" false "args" (list "run" "--config" $configPath "--kind" "manual")) -}}
+{{- end -}}
+{{- range $job := $jobs }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $job.name }}
+  labels:
+    {{- include "go-cluster-backup.labels" $ | nindent 4 }}
+spec:
+  schedule: {{ if $job.scheduled }}{{ $.Values.schedule | quote }}{{ else }}"0 0 1 1 *"{{ end }}
+  {{- with $.Values.timeZone }}
+  timeZone: {{ . | quote }}
+  {{- end }}
+  {{- if $job.scheduled }}
+  {{- with $.Values.suspend }}
+  suspend: {{ . }}
+  {{- end }}
+  {{- else }}
+  suspend: true
+  {{- end }}
+  concurrencyPolicy: {{ $.Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ $.Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $.Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ if $job.scheduled }}{{ $.Values.backoffLimit }}{{ else }}0{{ end }}
+      activeDeadlineSeconds: {{ $.Values.activeDeadlineSeconds }}
+      {{- if $job.scheduled }}
+      {{- with $.Values.podFailurePolicy }}
+      podFailurePolicy:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- end }}
+      template:
+        {{- include "go-cluster-backup.writerPodTemplate" (dict "root" $ "args" $job.args) | nindent 8 }}
+{{- end }}

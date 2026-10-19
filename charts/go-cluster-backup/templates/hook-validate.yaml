@@ -1,0 +1,81 @@
+{{- if .Values.hooks.enabled }}
+{{/*
+The config gate: a pre-install/pre-upgrade Job that runs `go-cluster-backup
+validate` against the *new* configuration, before any CronJob is touched. The
+check is offline — validate resolves secret references without reading them —
+so this pod mounts the configuration and nothing else. A failure aborts the
+install or upgrade, so a bad configuration never reaches a CronJob.
+
+The ConfigMap is a hook of its own, at a lower weight, because the release's
+own ConfigMap is applied after the pre-install hooks have run.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "go-cluster-backup.fullname" . }}-validate
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+data:
+  config.yaml: |
+{{ .Values.config | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "go-cluster-backup.fullname" . }}-validate
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.hooks.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.hooks.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "go-cluster-backup.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      # Offline: the check talks to no API server.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: validate
+          image: {{ include "go-cluster-backup.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          terminationMessagePolicy: FallbackToLogsOnError
+          args: ["validate", "--config", {{ include "go-cluster-backup.configPath" . | quote }}]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.hooks.resources | nindent 12 }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/go-cluster-backup
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "go-cluster-backup.fullname" . }}-validate
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

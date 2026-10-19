@@ -1,0 +1,91 @@
+{{ template "chart.deprecationWarning" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.homepageLine" . }}
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+## What it installs
+
+| Object | Name | Notes |
+|---|---|---|
+| CronJob | `<fullname>` | the scheduled run, `schedule` (default `0 3 * * *`) |
+| CronJob | `<fullname>-manual` | never scheduled; start one Job from it by hand |
+| CronJob | `<fullname>-restore` | never scheduled; its args come from `restore.args` |
+| ConfigMap | `<fullname>-config` | the configuration, mounted at `/etc/go-cluster-backup/config.yaml` |
+| ConfigMap | `catalog.name` (default `<fullname>-catalog`) | the run index the tool writes; no `data`, annotated `helm.sh/resource-policy: keep` |
+| ServiceAccount | `<fullname>` | |
+| ClusterRole + binding | `<fullname>` | `list` on pods, PVCs and PVs |
+| Role + binding | `<fullname>` | `get`/`list` on pods and Jobs, `list` on Events, in the release namespace (lease liveness and the previous-run report) |
+| Role + binding | `<fullname>-catalog` | `get`/`patch` on the catalog ConfigMap alone |
+| Role + binding | `<fullname>-secrets` | `get` on the Secrets in `rbac.secretNames` |
+| ClusterRole | `<fullname>-workload-access` | `get` on Secrets and ConfigMaps; **not bound** until a namespace is listed in `rbac.workloadNamespaces` |
+| Job (hook) | `<fullname>-validate` | `pre-install,pre-upgrade` config gate |
+
+`<fullname>` is the release name plus the chart name unless `fullnameOverride`
+says otherwise. Bind your NetworkPolicies and RoleBindings to these names; they
+change only when `fullnameOverride` changes.
+
+## Install
+
+The chart is published to GHCR as an OCI artifact:
+
+```console
+helm install backup oci://ghcr.io/vi-latyshev/charts/go-cluster-backup \
+  --namespace backup --create-namespace \
+  --set-file config=backup.yaml
+```
+
+Without `--version`, Helm installs the newest release; pin the version taken
+from the [latest release](https://github.com/vi-latyshev/go-cluster-backup/releases/latest).
+
+`config` is required and carries the tool's own YAML configuration document —
+the same file `go-cluster-backup validate --config` reads. It is mounted
+verbatim, so its own template syntax is never expanded by Helm. Install into
+the namespace the configuration's `catalog.config.namespace`
+names, because the catalog ConfigMap is created in the release namespace.
+
+A pre-install/pre-upgrade hook Job runs `go-cluster-backup validate` against the
+new configuration before anything else is applied. It is offline — a secret
+reference is resolved, never read — so it needs no secret mount. When it fails,
+the install or upgrade aborts, and with Flux's `upgrade.remediation.strategy:
+rollback` the previous release stays in place.
+
+## Example values and manifests
+
+- `examples/values/minimal.yaml` with `examples/config/minimal.yaml`
+- `examples/values/k3s-single-node.yaml` with `examples/config/k3s-single-node.yaml`
+- `examples/flux/` — OCIRepository + HelmRelease (version-pinned, rollback on failure)
+- `examples/argocd/application.yaml` — the same chart as an Argo CD Application
+
+## Pod Security
+
+The default values pass the `restricted` Pod Security Standard: non-root, no
+capabilities, a read-only root filesystem and a `RuntimeDefault` seccomp
+profile. Two things move a deployment out of it:
+
+- `stage.enabled: true` reads host paths owned by root and runs as root (the
+  `k3s-single-node` example). No standard below `privileged` admits a hostPath
+  volume — `baseline` rejects it just as `restricted` does — so that deployment
+  needs a namespace labelled
+  `pod-security.kubernetes.io/enforce=privileged`, or exempted from enforcement.
+- A storage root readable only by root needs `securityContext.runAsUser: 0` and
+  `securityContext.runAsNonRoot: false`. That alone still passes `baseline`.
+
+## Restores
+
+The restore CronJob is suspended and its default args are inert (`validate
+--preflight`). A restore is a deliberate change of `restore.args` — a `restore
+fetch`, `restore apply` or `restore verify` invocation with an explicit run and
+artifact — followed by one hand-started Job:
+
+```console
+kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <namespace>
+```
+
+{{ template "chart.valuesSection" . }}

@@ -1,0 +1,21 @@
+# Binaries and build output.
+/go-cluster-backup
+/dist/
+*.test
+*.out
+coverage.out
+coverage-e2e/
+
+# Local environment and secrets.
+.env
+.env.*
+*.local
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/
+
+# vi-kit is local tooling; its files are never committed.
+.vi-kit/
+.claude/

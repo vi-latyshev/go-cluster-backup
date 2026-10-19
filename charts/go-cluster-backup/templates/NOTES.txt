@@ -1,0 +1,73 @@
+{{ .Chart.Name }} {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) is installed in namespace {{ .Release.Namespace }}.
+
+Object names are derived from the release fullname `{{ include "go-cluster-backup.fullname" . }}`:
+
+  CronJob/{{ include "go-cluster-backup.fullname" . }}          the scheduled run ({{ .Values.schedule }}{{ with .Values.timeZone }} {{ . }}{{ end }})
+{{- if .Values.manual.enabled }}
+  CronJob/{{ include "go-cluster-backup.fullname" . }}-manual   the manual run (never scheduled)
+{{- end }}
+{{- if .Values.restore.enabled }}
+  CronJob/{{ include "go-cluster-backup.fullname" . }}-restore  the restore run (never scheduled)
+{{- end }}
+  ConfigMap/{{ include "go-cluster-backup.fullname" . }}-config the configuration the tool reads
+{{- if .Values.catalog.create }}
+  ConfigMap/{{ include "go-cluster-backup.catalogName" . }} the run index the tool writes (kept on uninstall)
+{{- end }}
+  ServiceAccount/{{ include "go-cluster-backup.serviceAccountName" . }}
+
+Bind a NetworkPolicy or a RoleBinding to those names, not to the release name:
+they change only when fullnameOverride changes.
+
+Start a run by hand:
+
+  kubectl create job --from=cronjob/{{ include "go-cluster-backup.fullname" . }}-manual {{ include "go-cluster-backup.fullname" . }}-manual-$(date +%s) -n {{ .Release.Namespace }}
+
+{{- if .Values.restore.enabled }}
+
+A restore is a deliberate change: set `restore.args` to the `restore fetch`,
+`restore apply` or `restore verify` invocation you mean (an explicit run and
+artifact), upgrade, then start one Job from the restore CronJob:
+
+  kubectl create job --from=cronjob/{{ include "go-cluster-backup.fullname" . }}-restore {{ include "go-cluster-backup.fullname" . }}-restore-$(date +%s) -n {{ .Release.Namespace }}
+{{- end }}
+
+{{- if and .Values.restore.enabled (eq (toString (first .Values.restore.args)) "validate") (has "--preflight" .Values.restore.args) }}
+
+Check the deployment before the first nightly run. The restore CronJob's
+configured args are exactly that check — an offline `validate --preflight` of
+the configuration — so one Job from it runs it:
+
+  job={{ include "go-cluster-backup.fullname" . }}-preflight-$(date +%s)
+  kubectl create job --from=cronjob/{{ include "go-cluster-backup.fullname" . }}-restore "$job" -n {{ .Release.Namespace }}
+  kubectl logs -n {{ .Release.Namespace }} -l job-name="$job" --tail=-1
+{{- else }}
+
+Check the deployment before the first nightly run. Nothing the chart runs is
+that check: the restore CronJob is either disabled or configured with args that
+are not a preflight, and a Job made from it would do whatever those args say —
+up to `restore apply`. The Job below is the check on its own: the restore pod
+with `validate --preflight` forced in place of its args — the same image,
+service account, secret mounts, work volumes and scheduling, and nothing that
+writes.
+
+  job={{ include "go-cluster-backup.fullname" . }}-preflight-$(date +%s)
+  kubectl -n {{ .Release.Namespace }} apply -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $job
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+{{ include "go-cluster-backup.restorePodTemplate" (dict "root" . "args" (list "validate" "--preflight" "--config" (include "go-cluster-backup.configPath" .))) | indent 4 }}
+EOF
+  kubectl logs -n {{ .Release.Namespace }} -l job-name="$job" --tail=-1
+{{- end }}
+
+{{- if .Values.catalog.create }}
+
+The catalog ConfigMap carries `helm.sh/resource-policy: keep` and no `data`:
+never declare `data` for it in your own manifests, or you will fight the tool
+for the run index.
+{{- end }}

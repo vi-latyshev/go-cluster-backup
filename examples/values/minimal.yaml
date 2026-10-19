@@ -1,0 +1,29 @@
+# Values for examples/config/minimal.yaml — one S3-compatible storage, Postgres
+# discovered by label, nothing read from the node.
+#
+# Install into the namespace the configuration's catalog section names (the
+# example config says `backup`), because the catalog ConfigMap the chart creates
+# lives in the release namespace:
+#
+#   helm install backup oci://ghcr.io/vi-latyshev/charts/go-cluster-backup \
+#     --namespace backup --create-namespace \
+#     -f examples/values/minimal.yaml \
+#     --set-file config=examples/config/minimal.yaml
+
+# The config's run.lease_hard_bound is 4200s, and the chart refuses to render a
+# Job deadline above it.
+activeDeadlineSeconds: 4200
+
+catalog:
+  # Matches catalog.config.name in examples/config/minimal.yaml.
+  name: go-cluster-backup-catalog
+
+# The credential files the config's s3 storage and Postgres rules resolve.
+secretMounts:
+  - secretName: cluster-backup-s3
+    mountPath: /run/secrets/s3
+
+rbac:
+  # The same Secret, for the API-level reads the discovery makes.
+  secretNames:
+    - cluster-backup-s3

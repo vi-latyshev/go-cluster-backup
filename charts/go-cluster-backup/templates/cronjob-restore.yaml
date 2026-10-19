@@ -1,0 +1,26 @@
+{{- if .Values.restore.enabled }}
+{{/*
+The restore CronJob. It never fires on a schedule: an operator starts one Job
+from it by hand (`kubectl create job --from=cronjob/<fullname>-restore`). Its
+args come straight from the values, with no shell wrapper and no request
+ConfigMap — a restore is a deliberate change of `restore.args`.
+*/}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "go-cluster-backup.fullname" . }}-restore
+  labels:
+    {{- include "go-cluster-backup.labels" . | nindent 4 }}
+spec:
+  suspend: true
+  schedule: "0 0 1 1 *"
+  concurrencyPolicy: {{ .Values.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.restore.activeDeadlineSeconds }}
+      template:
+        {{- include "go-cluster-backup.restorePodTemplate" (dict "root" . "args" .Values.restore.args) | nindent 8 }}
+{{- end }}

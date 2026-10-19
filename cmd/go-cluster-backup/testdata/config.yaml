@@ -1,0 +1,319 @@
+# A complete generic-distribution configuration: every field of every instance
+# is present, so the strict decoder accepts this file as it stands, and a test
+# validates it — this file is the reference shape, not a deployment. The paths
+# under /run/secrets do not exist here on purpose: `validate` never reads a
+# secret file. One file may carry several sections; a deployment usually splits
+# a run config and a stage config into two.
+#
+# The discovery is the reference of an opt-out coverage: a workload declares its
+# engine on its own pod template, a claim declares itself as a file volume, the
+# marker takes an object out, and the last rule accounts for every claim no rule
+# claimed. The labels are this file's own — a deployment names its own.
+version: 1
+
+run:
+  id_layout: "20060102T150405Z"
+  spool_dir: /backup/spool
+  spool_reserve_bytes: 1GiB
+  max_artifact_bytes: 3GiB
+  # The deadline sits above the sum of every storage's time_budget plus
+  # production time and the finishing allowance: the budgets are per storage per
+  # run and the uploads run one storage at a time (storage_parallelism: 1), so
+  # they add up against the same wall clock.
+  deadline: 120m
+  finish_allowance: 2m
+  lease_wait: 15m
+  lease_poll: 1s
+  lease_hard_bound: 8400s
+  holder_namespace_env: BACKUP_POD_NAMESPACE
+  holder_pod_env: BACKUP_POD_NAME
+  holder_uid_env: BACKUP_POD_UID
+  min_verified_storages: 1
+  degraded_exit_code: 0
+  failed_exit_code: 1
+  storage_parallelism: 1
+  unclassified_error: transient
+  notifier_failure_is_fatal: false
+  retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
+
+layout:
+  run_prefix: "runs/{{ .Run.ID }}"
+  artifact_key: "{{ .Artifact.Group }}/{{ .Artifact.Name }}{{ .Artifact.Ext }}"
+  manifest_key: manifest.json
+
+stage:
+  dir: /backup/staged
+  degraded_exit_code: 0
+  failed_exit_code: 1
+  sources:
+    # What the stage produces: the run side reads it back with the staged source
+    # named control_plane below, out of the same directory.
+    host_state:
+      type: sqlite
+      artifact: {group: state, name: host-state, importance: required, sensitivity: secret}
+      pipeline: [seal]
+      config: {path: /host/state.db, scratch_dir: /plain, busy_timeout: 10s, integrity_check: quick}
+
+restore:
+  spool_dir: /restore/spool
+  spool_reserve_bytes: 1GiB
+  storage_order: [primary, exchange]
+  unclassified_error: transient
+  retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
+  apply:
+    postgres: {jobs: 1, no_owner: false, no_acl: false, connect_attempts: 6, connect_interval: 5s}
+    files: {preserve_owner: true, side_by_side_dir: ".restore-{{ .Label }}"}
+    sqlite: {file_mode: "0644", keep_previous: true}
+
+discoveries:
+  workloads:
+    type: kubernetes_labels
+    config:
+      api_host_env: KUBERNETES_SERVICE_HOST
+      api_port_env: KUBERNETES_SERVICE_PORT
+      token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      request_timeout: 30s
+      secrets_path: /tmp/discovered
+      list_page_size: 500
+      exclude: {label: backup.example/ignore, value: "true"}
+      # A volume nobody declared and nobody excluded is one failed artifact
+      # naming it — never a silent absence, and never a green copy of a live
+      # database directory. The setting names it; the artifact's importance is
+      # this file's decision.
+      undeclared_volumes: {importance: required}
+      pods:
+        # A pod that declares its engine: the engine dumps every database of
+        # the instance (all_databases), each as its own artifact, and the
+        # volumes this pod mounts are covered by those dumps — they need no
+        # file copy of their own. The instance identity is the artifact name,
+        # so the engine can suffix a unit without ever reading this template
+        # per database.
+        - name: postgres
+          selector: "backup.example/engine=postgres"
+          covers_volumes: true
+          min_matches: 0
+          artifact:
+            group: databases
+            name: '{{ .Namespace }}/{{ label "backup.example/instance" }}'
+            importance: required
+            sensitivity: plain
+          pipeline: [compress]
+          source:
+            type: postgres
+            config:
+              address: '{{ label "backup.example/instance" }}.{{ .Namespace }}.svc.cluster.local:{{ port 0 0 }}'
+              database: '{{ envValue 0 "POSTGRES_DB" }}'
+              username: '{{ envValue 0 "POSTGRES_USER" }}'
+              password: {file: '{{ envFile 0 "POSTGRES_PASSWORD" }}'}
+              format: custom
+              compression: none
+              connect_attempts: 6
+              connect_interval: 5s
+              all_databases: true
+              exclude_databases: ["postgres"]
+      volumes:
+        # A claim that declares itself as a plain file volume: the source reads
+        # the volume the claim is bound to, at the path its PersistentVolume
+        # reports, never a mount made for this pod.
+        - name: volumes
+          selector: "backup.example/engine=files"
+          min_matches: 0
+          artifact:
+            group: volumes
+            name: "{{ .Namespace }}/{{ .Name }}"
+            importance: required
+            sensitivity: plain
+          pipeline: [compress]
+          source:
+            type: files
+            config:
+              root: "{{ volumePath }}"
+              ignore_vanished: true
+
+sources:
+  app_database:
+    type: postgres
+    artifact: {group: databases, name: app/postgres, importance: required, sensitivity: plain}
+    pipeline: [compress]
+    config:
+      address: postgres.example.svc.cluster.local:5432
+      database: app
+      username: app
+      password: {file: /run/secrets/postgres/password}
+      format: custom
+      compression: none
+      connect_attempts: 6
+      connect_interval: 5s
+      all_databases: false
+      exclude_databases: []
+  search_cache:
+    type: redis
+    artifact: {group: caches, name: search, importance: best_effort, sensitivity: plain}
+    pipeline: [compress]
+    config:
+      address: redis.example.svc.cluster.local:6379
+      password: {file: /run/secrets/redis/password}
+      scratch_dir: /backup/scratch
+      connect_attempts: 6
+      connect_interval: 5s
+  uploads:
+    type: files
+    artifact: {group: volumes, name: uploads, importance: best_effort, sensitivity: plain}
+    pipeline: [compress]
+    config: {root: /volumes/example/uploads, ignore_vanished: true}
+  vpn_peers:
+    type: sqlite
+    artifact: {group: vpn, name: wireguard, importance: required, sensitivity: secret}
+    pipeline: [compress, seal]
+    config: {path: /vpn-config/wireguard.db, scratch_dir: /backup/scratch, busy_timeout: 10s, integrity_check: quick}
+  node_state:
+    type: k3s_state
+    artifact: {group: control-plane, name: k3s-datastore, importance: required, sensitivity: secret}
+    pipeline: [seal]
+    config: {datastore: /k3s-db/state.db, token: {file: /k3s-token}, scratch_dir: /plain, busy_timeout: 10s, integrity_check: quick, timeout: 2m}
+  control_plane:
+    type: staged
+    artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: secret}
+    pipeline: []
+    config: {dir: /backup/staged, name: k3s-state}
+
+processors:
+  compress:
+    type: zstd
+    config: {level: better, concurrency: 1, window_bytes: 64MiB, decode_window_bytes: 128MiB}
+  seal:
+    type: age
+    config:
+      recipients: ["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"]
+      identities: []
+
+
+storages:
+  primary:
+    type: yandex_disk
+    # Retention is keyed by run kind: the scheduled partition never sees a manual
+    # run and vice versa, so a manual run never takes a GFS slot. max_total_bytes
+    # is the storage's own cap over every kind, checked by the engine.
+    retention:
+      scheduled: {type: gfs, config: {daily: 7, weekly: 4, monthly: 0, timezone: UTC, min_keep: 1, count_incomplete: true}}
+      manual: {type: keep_last, config: {count: 5, min_keep: 1, count_incomplete: true}}
+    max_total_bytes: 14GB
+    time_budget: 30m
+    config:
+      api_url: https://cloud-api.yandex.net/v1/disk
+      token: {file: /run/secrets/yandex/token}
+      root: "app:/example-backup"
+      permanent_delete: true
+      prune_keep_depth: 1
+      request_timeout: 30s
+      commit_poll_interval: 5s
+      commit_poll_timeout: 2m
+  secondary:
+    type: s3
+    retention:
+      scheduled: {type: keep_last, config: {count: 3, min_keep: 1, count_incomplete: true}}
+      manual: {type: keep_last, config: {count: 3, min_keep: 1, count_incomplete: true}}
+    max_total_bytes: 14GB
+    time_budget: 30m
+    config:
+      endpoint: https://s3.example.net
+      region: ru-central-1
+      bucket: bucket-example
+      prefix: cluster-backup
+      access_key_id: {file: /run/secrets/s3/access-key-id}
+      secret_access_key: {file: /run/secrets/s3/secret-access-key}
+      addressing: path
+      storage_class: STANDARD
+      request_checksum: when_required
+      part_bytes: 16MiB
+      max_request_bytes: 5GiB
+      max_object_bytes: 5TiB
+      request_timeout: 5m
+  exchange:
+    type: local
+    # No `manual` partition: a manual run is refused on this storage.
+    retention:
+      scheduled: {type: keep_last, config: {count: 3, min_keep: 1, count_incomplete: true}}
+    max_total_bytes: 14GB
+    time_budget: 10m
+    config: {root: /backup/exchange, page_size: 1000}
+
+
+catalog:
+  type: kubernetes_configmap
+  config:
+    api_host_env: KUBERNETES_SERVICE_HOST
+    api_port_env: KUBERNETES_SERVICE_PORT
+    token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    request_timeout: 30s
+    namespace: backup
+    name: backup-catalog
+    key: catalog.json
+    lease_key_suffix: ".lease"
+    max_runs: 60
+    max_history_bytes: 900KB
+
+notifiers:
+  ops:
+    type: webhook
+    config:
+      url: https://notify.example.com/backup
+      method: POST
+      headers: {Content-Type: application/json}
+      body_format: yaml
+      timeout: 10s
+      success_status: [200, 202]
+      max_response_bytes: 512
+      # The message of every event this receiver takes, as plain text: the first
+      # line rendered is the title, a line that renders empty is dropped — an
+      # action-only line needs no trim marker — and a pair of backticks marks
+      # the monospace part of a line. An event with no entry here is not
+      # subscribed and is skipped without a request.
+      events:
+        run_started: |
+          🚀 Backup started
+          📦 {{ .Run.RunID }}
+          {{ if .Run.Previous.Unfinished }}
+          ⚠️ Previous run did not report
+          🕐 Last success: {{ date .Run.Previous.LastGoodAt }}
+          {{ end }}
+          {{ with .Run.Previous.Failure }}
+          ⚠️ Previous run failed before it reported: {{ .Reason }}
+          {{ range .Containers }}{{ if .Terminated }}✗ {{ .Container }}: {{ .Terminated.Reason }} (exit {{ .Terminated.ExitCode }}) {{ clip 160 .Terminated.Message }}
+          {{ else if .Waiting }}✗ {{ .Container }}: {{ .Waiting }}
+          {{ end }}{{ end }}
+          {{ end }}
+          {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}
+          {{ end }}
+        # The finished message is the report: one line per artifact — with what
+        # its source left out or padded, when it left anything, so a tree that
+        # changed under the read is visible where the operator looks — one line
+        # per storage, and one line per object the run deliberately did not back
+        # up.
+        run_finished: |
+          {{ pick .Run.Outcome "delivered" "✅ Backup completed" "degraded" "⚠️ Backup DEGRADED" "failed" "❌ Backup FAILED" }}
+          📦 {{ .Run.RunID }}
+          ⏱ Duration: `{{ duration .Run.Duration }}`
+          {{ range .Run.Artifacts }}
+          {{ pick .Outcome "ok" "✓" "failed" "✗" }} {{ .Artifact.Name }}: `{{ bytes .Bytes }} in {{ duration .Duration }}`
+          {{ if or .Stats.SkippedEntries .Stats.PaddedFiles }}{{ .Stats.SkippedEntries }} left out, {{ .Stats.PaddedFiles }} padded
+          {{ end }}
+          {{ end }}
+          {{ range .Run.Storages }}
+          {{ pick .Outcome "verified" "☁️" "failed" "⚠️" "skipped" "⚠️" }} {{ .Storage }}: `{{ .Outcome }}, {{ bytes .Bytes }}, kept {{ .Kept }}, deleted {{ len .Deleted }}`
+          {{ end }}
+          {{ range .Run.Excluded }}{{ if eq .Kind "ignored" }}
+          🚫 ignored {{ .Name }}: {{ .Reason }}
+          {{ end }}{{ end }}
+      # One body template for every event, in this receiver's own shape: a title
+      # and a list of lines, each line's text and its monospace part. The keys
+      # are the receiver's, so they live here and nowhere in the plugin.
+      payload: |
+        title: {{ json .Title }}
+        thread: backup
+        lines:
+        {{ range .Lines }}
+          - {text: {{ json .Text }}, mono: {{ json .Code }}}
+        {{ end }}
