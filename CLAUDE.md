@@ -317,11 +317,3 @@ then run `make check` once before handing the work over.
 - `examples/config/*.yaml` are validated by the same test, so a shipped example
   never drifts from the schema.
 - The s3 live test stays skipped; the offline suite is the gate.
-
-<!-- vi-kit-begin -->
-
-## Routing
-
-Zone-to-specialist routing for this repository lives in `.vi-kit/routing.yaml`.
-The orchestrator resolves zones from that file; refine it with `vi-kit init` or by hand.
-<!-- vi-kit-end -->
