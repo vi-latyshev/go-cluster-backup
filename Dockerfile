@@ -1,7 +1,7 @@
 # The image ships the generic distribution: every plugin under internal/plugins
 # plus the k3s_state source. The build is multi-platform: the builder runs on the
 # build host's platform and cross-compiles the target.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.2-alpine@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder
 ARG TARGETOS
 ARG TARGETARCH
 # COVER=1 instruments the binary for coverage collection (it writes counters to
@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build,id=go-build-backup \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build $cover -trimpath -ldflags="-s -w" -o /out/go-cluster-backup ./cmd/go-cluster-backup
 
-FROM docker.io/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 # The external clients the source plugins shell out to (postgresql18-client,
 # redis-cli, sqlite3), CA certificates for every HTTPS storage, and tzdata so a

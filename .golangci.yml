@@ -8,7 +8,7 @@ linters:
   enable:
     - errorlint
     # The repository bans //nolint outright, and `make lint` enforces the ban
-    # with a grep: golangci-lint v2.14.0's nolintlint has no option to forbid a
+    # with a grep: golangci-lint v2.15.0's nolintlint has no option to forbid a
     # directive, only to constrain one. These are its strictest settings, so a
     # directive that ever slipped past the grep would still have to be specific
     # and carry an explanation.

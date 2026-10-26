@@ -68,8 +68,8 @@ real S3 server, not a mock.
 
 Every dependency is pinned by the digest of its multi-arch index, so the same
 bytes run on every CI architecture. The pin is what is pulled; each is then
-loaded under a tag derived from that same digest — `postgres@sha256:77f5…`
-becomes `postgres:e2e-77f585114c32` — and that tag is what the pod specs name,
+loaded under a tag derived from that same digest — `postgres@sha256:10a5…`
+becomes `postgres:e2e-10a5c69a8303` — and that tag is what the pod specs name,
 with `imagePullPolicy: IfNotPresent`, so nothing is pulled from the internet
 inside the cluster.
 
