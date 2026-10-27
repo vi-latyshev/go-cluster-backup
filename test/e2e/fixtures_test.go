@@ -19,14 +19,14 @@ import (
 // each pin is pulled by digest and re-tagged with pinnedTag before the cluster
 // ever sees it.
 const (
-	pinPostgres   = "postgres@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873"
-	pinRedis      = "redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0"
-	pinSeaweedFS  = "chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d"
-	pinEchoServer = "mendhak/http-https-echo@sha256:a265f55c86cb3baead76fdf379dc8e9e6440ed121874e101e60b833e05bce8d4"
+	pinPostgres   = "postgres@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5"
+	pinRedis      = "redis@sha256:896f241f438ab6a210cfb24f573b84bea721a4cbe67f1b4fd07eb638b3b02a7b"
+	pinSeaweedFS  = "chrislusf/seaweedfs@sha256:f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8"
+	pinEchoServer = "mendhak/http-https-echo@sha256:c4a81744e620ad3cfbffa97374c9c0e545bb3d132b07ebc7745cce6ddee745a1"
 )
 
 // pinnedTag is the tag a pin is loaded under: the repository plus the first 12
-// hex of its digest, e.g. postgres@sha256:77f5… becomes postgres:e2e-77f585114c32.
+// hex of its digest, e.g. postgres@sha256:10a5… becomes postgres:e2e-10a5c69a8303.
 // It is derived, never hand-written, so a pin and its tag cannot drift.
 func pinnedTag(ref string) string {
 	repo, digest := splitImage(ref)
@@ -314,10 +314,10 @@ func (e *Env) createBucket(t *testing.T, ns string) {
 // pin is a digest no reader can re-derive by eye.
 func TestPinnedTagDerivation(t *testing.T) {
 	want := map[string]string{
-		pinPostgres:   "postgres:e2e-77f585114c32",
-		pinRedis:      "redis:e2e-3811787313eb",
-		pinSeaweedFS:  "chrislusf/seaweedfs:e2e-4e61d15fd359",
-		pinEchoServer: "mendhak/http-https-echo:e2e-a265f55c86cb",
+		pinPostgres:   "postgres:e2e-10a5c69a8303",
+		pinRedis:      "redis:e2e-896f241f438a",
+		pinSeaweedFS:  "chrislusf/seaweedfs:e2e-f7a49e3f3972",
+		pinEchoServer: "mendhak/http-https-echo:e2e-c4a81744e620",
 	}
 	for pin, tag := range want {
 		if got := pinnedTag(pin); got != tag {
@@ -339,9 +339,9 @@ func TestContainerdRef(t *testing.T) {
 	cases := map[string]string{
 		"postgres":                             "docker.io/library/postgres:latest",
 		"postgres:16":                          "docker.io/library/postgres:16",
-		"postgres:e2e-77f585114c32":            "docker.io/library/postgres:e2e-77f585114c32",
+		"postgres:e2e-10a5c69a8303":            "docker.io/library/postgres:e2e-10a5c69a8303",
 		"go-cluster-backup:e2e":                "docker.io/library/go-cluster-backup:e2e",
-		"chrislusf/seaweedfs:e2e-4e61d15fd359": "docker.io/chrislusf/seaweedfs:e2e-4e61d15fd359",
+		"chrislusf/seaweedfs:e2e-f7a49e3f3972": "docker.io/chrislusf/seaweedfs:e2e-f7a49e3f3972",
 		"docker.io/go-cluster-backup:e2e":      "docker.io/library/go-cluster-backup:e2e",
 		"docker.io/chrislusf/seaweedfs:e2e-x":  "docker.io/chrislusf/seaweedfs:e2e-x",
 		"ghcr.io/x/y:1":                        "ghcr.io/x/y:1",

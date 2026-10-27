@@ -43,7 +43,7 @@ E2E_CLUSTER ?= gcb-e2e
 E2E_COVERDIR ?= coverage-e2e
 E2E_IMAGE_NAME = $(if $(E2E_IMAGE),$(E2E_IMAGE),go-cluster-backup:e2e)
 
-# The repository bans `//nolint` outright. golangci-lint v2.14.0's nolintlint
+# The repository bans `//nolint` outright. golangci-lint v2.15.0's nolintlint
 # has no option to forbid a directive (its settings are require-explanation,
 # require-specific, allow-no-explanation and allow-unused), so the ban is this
 # grep; .golangci.yml keeps nolintlint at its strictest as a second line.

@@ -10,15 +10,15 @@ path for a contributor adding a plugin.
 
 ## Tech Stack
 
-- **Language**: Go 1.27.2, one module (`github.com/vi-latyshev/go-cluster-backup`).
+- **Language**: Go 1.27.3, one module (`github.com/vi-latyshev/go-cluster-backup`).
   Lint and vulnerability scanning are pinned as tool dependencies in `tools/go.mod`
   (a separate module, never linked into the binary).
 - **Config**: YAML on disk, converted to JSON in `internal/cli` (one dependency,
   `go.yaml.in/yaml/v3`); the engine and every plugin see JSON bytes only. That
   dependency has exactly one other reader: the webhook notifier, whose
   `body_format: yaml` payload is a document the receiver takes as JSON.
-- **Image**: `docker.io/library/golang:1.27.2-alpine` builder (cross-compiling
-  from the build platform) → `docker.io/library/alpine:3.24.2` runtime with
+- **Image**: `docker.io/library/golang:1.27.3-alpine` builder (cross-compiling
+  from the build platform) → `docker.io/library/alpine:3.24.3` runtime with
   `postgresql18-client`, `redis`, `sqlite`, `tzdata`, `ca-certificates`; the
   binary lands at `/usr/local/bin/go-cluster-backup` and `doctor` runs as the
   last build step.
