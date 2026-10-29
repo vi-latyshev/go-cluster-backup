@@ -47,7 +47,8 @@ jobs:
           key: golangci-lint-${{ runner.os }}-${{ hashFiles('tools/go.sum', '.golangci.yml') }}
           restore-keys: golangci-lint-${{ runner.os }}-
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
-      - run: make vet
+      # No separate `go vet`: golangci-lint's govet runs the same analysers as
+      # part of `make lint` (the `standard` linter set).
       - run: make lint
       - run: make vuln
       - run: make chart

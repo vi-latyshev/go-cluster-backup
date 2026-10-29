@@ -279,8 +279,15 @@ func (m *memMultipart) Get(ctx context.Context, key string, dst io.Writer) error
 	return m.Fake.Get(ctx, key, dst)
 }
 
+// testPartSize is the part size these tests drive: the kit's checks only need
+// two parts to be distinguishable, and a real service's 5 MiB minimum exists for
+// its own SDK, not for the suite. Every place that builds a reference storage
+// takes this one constant — two spellings of it desynchronised the size
+// RunMultipart asserts and the size the storage reports.
+const testPartSize = 64
+
 func TestMultipartSuitePassesTheReference(t *testing.T) {
-	RunMultipart(t, 5<<20, func(*testing.T) storage.Storage { return newMemMultipart(5 << 20) })
+	RunMultipart(t, testPartSize, func(*testing.T) storage.Storage { return newMemMultipart(testPartSize) })
 }
 
 // TestMultipartChecksCatchBrokenStorages: every check must fail an
@@ -332,7 +339,7 @@ func TestMultipartChecksCatchBrokenStorages(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.check+"/"+tc.mode, func(t *testing.T) {
-			s := newMemMultipart(5 << 20)
+			s := newMemMultipart(testPartSize)
 			s.mode = tc.mode
 			for _, c := range MultipartChecks {
 				if c.Name != tc.check {
@@ -356,7 +363,7 @@ func TestMultipartRequiresTheCapability(t *testing.T) {
 	if _, err := multipartOf(only); err == nil {
 		t.Fatal("a storage without the capability was accepted")
 	}
-	if _, err := multipartOf(newMemMultipart(5 << 20)); err != nil {
+	if _, err := multipartOf(newMemMultipart(testPartSize)); err != nil {
 		t.Fatalf("the reference implementation was refused: %v", err)
 	}
 	// Every check must refuse such a storage rather than silently skip it.

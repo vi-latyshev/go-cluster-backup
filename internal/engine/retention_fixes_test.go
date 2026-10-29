@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/human"
@@ -391,44 +392,46 @@ func TestForeignMultipartInventoryMakesOccupancyUnknown(t *testing.T) {
 // follows must still see occupancy as unknown until that deadline — and be
 // admitted with a fresh survey after it.
 func TestQuarantineSurvivesTheSuccessor(t *testing.T) {
-	w := newWorld(t)
-	cfg := manualConfig(t, map[string]any{"alpha": manualStorage(1 << 40)})
-	run := cfg["run"].(map[string]any)
-	run["lease_hard_bound"] = "400ms"
-	run["lease_poll"] = "5ms"
-	run["lease_wait"] = "20ms"
-	e := w.newEngine(t, cfg)
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		cfg := manualConfig(t, map[string]any{"alpha": manualStorage(1 << 40)})
+		run := cfg["run"].(map[string]any)
+		run["lease_hard_bound"] = "400ms"
+		run["lease_poll"] = "5ms"
+		run["lease_wait"] = "20ms"
+		e := w.newEngine(t, cfg)
 
-	// A: killed by the kubelet just now; its accepted uploads may still commit.
-	w.catalog.Hold("A", model.RunKindScheduled, "infrastructure", "backup-a", "uid-a", time.Now())
-	w.catalog.SetTerminated(true, true)
-	// B: a scheduled run takes over and releases.
-	if rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled}); err != nil {
-		t.Fatal(err)
-	} else if rep.Outcome == model.OutcomeFailed {
-		t.Fatalf("the successor failed: %+v", rep.Storages)
-	}
-	if until := w.catalog.QuarantineUntil(); !until.After(time.Now()) {
-		t.Fatalf("the successor's release dropped the quarantine: %v", until)
-	}
-	// C: a manual run inside the dead holder's bound is refused on occupancy it
-	// cannot trust.
-	rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rep.Storages) != 1 || !rep.Storages[0].CapExceeded {
-		t.Fatalf("a manual run inside the quarantine was admitted: %+v", rep.Storages)
-	}
-	// D: after the deadline the run takes its own fresh survey and proceeds.
-	time.Sleep(450 * time.Millisecond)
-	rep, err = e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Outcome != model.OutcomeDelivered {
-		t.Fatalf("a manual run after the quarantine was refused: %+v %+v", rep.Outcome, rep.Storages)
-	}
+		// A: killed by the kubelet just now; its accepted uploads may still commit.
+		w.catalog.Hold("A", model.RunKindScheduled, "infrastructure", "backup-a", "uid-a", time.Now())
+		w.catalog.SetTerminated(true, true)
+		// B: a scheduled run takes over and releases.
+		if rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled}); err != nil {
+			t.Fatal(err)
+		} else if rep.Outcome == model.OutcomeFailed {
+			t.Fatalf("the successor failed: %+v", rep.Storages)
+		}
+		if until := w.catalog.QuarantineUntil(); !until.After(time.Now()) {
+			t.Fatalf("the successor's release dropped the quarantine: %v", until)
+		}
+		// C: a manual run inside the dead holder's bound is refused on occupancy it
+		// cannot trust.
+		rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rep.Storages) != 1 || !rep.Storages[0].CapExceeded {
+			t.Fatalf("a manual run inside the quarantine was admitted: %+v", rep.Storages)
+		}
+		// D: after the deadline the run takes its own fresh survey and proceeds.
+		time.Sleep(450 * time.Millisecond)
+		rep, err = e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Outcome != model.OutcomeDelivered {
+			t.Fatalf("a manual run after the quarantine was refused: %+v %+v", rep.Outcome, rep.Storages)
+		}
+	})
 }
 
 // flakyInventory is the full multipart inventory with a transient failure: the
@@ -511,16 +514,18 @@ func (s *slowListStorage) List(ctx context.Context, req storage.ListRequest) (st
 // decision is made before the first listing; a manual run is refused for the
 // whole run, with no re-survey.
 func TestQuarantineIsDecidedBeforeTheSurvey(t *testing.T) {
-	w := newWorld(t)
-	w.extraStorages["alpha"] = &slowListStorage{Fake: storagetest.NewFake(), delay: 200 * time.Millisecond}
-	e := w.newEngine(t, manualConfig(t, map[string]any{"alpha": manualStorage(1 << 40)}))
-	// The quarantine expires 50ms in; the survey takes 200ms.
-	w.catalog.SetQuarantine(time.Now().Add(50 * time.Millisecond))
-	rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rep.Storages) != 1 || !rep.Storages[0].CapExceeded {
-		t.Fatalf("a survey that crossed the quarantine deadline was treated as known: %+v", rep.Storages)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		w.extraStorages["alpha"] = &slowListStorage{Fake: storagetest.NewFake(), delay: 200 * time.Millisecond}
+		e := w.newEngine(t, manualConfig(t, map[string]any{"alpha": manualStorage(1 << 40)}))
+		// The quarantine expires 50ms in; the survey takes 200ms.
+		w.catalog.SetQuarantine(time.Now().Add(50 * time.Millisecond))
+		rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rep.Storages) != 1 || !rep.Storages[0].CapExceeded {
+			t.Fatalf("a survey that crossed the quarantine deadline was treated as known: %+v", rep.Storages)
+		}
+	})
 }

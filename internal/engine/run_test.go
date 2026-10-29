@@ -1039,3 +1039,43 @@ func (h *countingHandler) count() int {
 	defer h.mu.Unlock()
 	return h.n
 }
+
+// TestProduceFailsWhenTheSpoolDirectoryVanishes: a spool directory that is gone
+// or replaced by a file fails the artifact that needed it, permanently and by
+// name — the run reports it instead of writing somewhere else or retrying a
+// condition that cannot change. The storage's Fault hook does the replacing on
+// the run's first survey, the window between the spool's creation and the first
+// artifact.
+func TestProduceFailsWhenTheSpoolDirectoryVanishes(t *testing.T) {
+	w := newWorld(t)
+	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+	spoolDir := filepath.Join(t.TempDir(), "run-spool")
+	cfg["run"].(map[string]any)["spool_dir"] = spoolDir
+	fake := storagetest.NewFake()
+	fake.Fault = func(op storagetest.Op, _ string, call int) error {
+		if op == storagetest.OpList && call == 1 {
+			_ = os.RemoveAll(spoolDir)
+			_ = os.WriteFile(spoolDir, []byte("x"), 0o600)
+		}
+		return nil
+	}
+	w.storages["primary"] = fake
+	e := w.newEngine(t, cfg)
+
+	rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatalf("a vanished spool must be a reported artifact failure, not a run error: %v", err)
+	}
+	if rep.Outcome != model.OutcomeFailed {
+		t.Fatalf("outcome %q: %+v", rep.Outcome, rep.Artifacts)
+	}
+	if len(rep.Artifacts) != 1 || rep.Artifacts[0].Outcome != model.ArtifactFailed || !strings.Contains(rep.Artifacts[0].Error, "spool") {
+		t.Fatalf("artifact %+v, want a failed artifact naming the spool", rep.Artifacts)
+	}
+	if dumps := w.sources["vpn"].dumpCount(); dumps != 0 {
+		t.Fatalf("the source dumped %d times into a spool it could not write", dumps)
+	}
+	if keys := fake.Keys(); len(keys) != 0 {
+		t.Fatalf("an artifact whose spool failed reached a storage: %v", keys)
+	}
+}

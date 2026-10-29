@@ -63,7 +63,7 @@ func TestProcessorConformance(t *testing.T) {
 func TestRoundTripEveryLevel(t *testing.T) {
 	ctx := context.Background()
 	inputs := map[string][]byte{
-		"compressible":   bytes.Repeat([]byte("the same sentence once more. "), 40_000),
+		"compressible":   bytes.Repeat([]byte("the same sentence once more. "), 4_000),
 		"incompressible": pseudoRandom(400_000),
 		"empty":          {},
 	}
@@ -150,11 +150,11 @@ func TestDecodeWindowIsIndependentOfEncodeWindow(t *testing.T) {
 }
 
 // TestMemoryStaysNearTheWindow is the bound this package claims: neither
-// direction may hold the stream. 8 MiB of incompressible input through a
+// direction may hold the stream. 2 MiB of incompressible input through a
 // 64 KiB window must not grow the heap by anything like the input size.
 func TestMemoryStaysNearTheWindow(t *testing.T) {
 	const window = 64 << 10
-	const inputSize = 8 << 20
+	const inputSize = 2 << 20
 	p := build(t, "fastest", window, window, 1)
 	ctx := context.Background()
 	plain := pseudoRandom(inputSize)

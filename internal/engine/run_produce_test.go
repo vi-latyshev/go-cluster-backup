@@ -91,9 +91,12 @@ func TestProduceSpoolCreateFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The source reports ".dat", so the first artifact's spool file is
-	// "001-g-n.dat"; a directory of that name makes Create fail.
-	if err := os.MkdirAll(filepath.Join(dir, "001-g-n.dat"), 0o755); err != nil {
+	// A spool directory replaced by a regular file makes Create fail: statfs
+	// still answers, and the CreateTemp inside it cannot.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	plan := artifactPlan{instance: "x", srcType: "fake", src: &fakeSource{data: []byte("z")},

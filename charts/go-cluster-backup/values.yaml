@@ -216,7 +216,9 @@ catalog:
   # -- Create the catalog ConfigMap the tool writes its run index into. It is
   # created without `data` and annotated `helm.sh/resource-policy: keep`, so an
   # uninstall never takes the run history with it. Set to false when the
-  # ConfigMap is managed by the consumer's own manifests.
+  # ConfigMap is managed by the consumer's own manifests — such a manifest must
+  # never declare `data` either: every reconcile of it would revert the run
+  # index the tool wrote.
   create: true
   # -- Name of the catalog ConfigMap. Empty uses `<fullname>-catalog`, and the
   # chart refuses to render when the config names a different one.

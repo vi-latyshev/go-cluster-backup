@@ -12,14 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 )
 
 type Spool struct {
 	dir string
-	mu  sync.Mutex
-	seq int
 }
 
 // New prepares a spool directory, creating it when missing.
@@ -51,18 +48,16 @@ type Writer struct {
 	name string
 }
 
-// Create starts a new spool file. The name must be a plain base name: the engine
-// sanitizes artifact names before calling; a separator here is a bug, not input.
-func (s *Spool) Create(name string) (*Writer, error) {
-	if err := checkName(name); err != nil {
-		return nil, err
-	}
-	path := filepath.Join(s.dir, name)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+// Create starts a new spool file. The label names the artifact for a human and
+// becomes the file's prefix; the name itself is chosen by the OS, so it is
+// unique across every process sharing the directory: no other Create can open,
+// truncate or remove this file. It lands 0600, whatever the label says.
+func (s *Spool) Create(label string) (*Writer, error) {
+	f, err := os.CreateTemp(s.dir, sanitize(label)+"-*")
 	if err != nil {
 		return nil, fmt.Errorf("spool: %w", err)
 	}
-	return &Writer{f: f, hash: sha256.New(), name: name}, nil
+	return &Writer{f: f, hash: sha256.New(), name: filepath.Base(f.Name())}, nil
 }
 
 func (w *Writer) Write(p []byte) (int, error) {
@@ -103,18 +98,12 @@ func (s *Spool) Remove(name string) error {
 	return nil
 }
 
-// NextName produces a unique, safe spool file name for one artifact: an index
-// prefix plus a sanitized artifact name.
-func (s *Spool) NextName(artifact string) string {
-	s.mu.Lock()
-	s.seq++
-	seq := s.seq
-	s.mu.Unlock()
-	return fmt.Sprintf("%03d-%s", seq, sanitize(artifact))
-}
-
+// checkName accepts exactly the names that cannot leave the spool directory:
+// one base name, and neither of the two directory aliases. An inner ".." is
+// harmless in a base name — Create can produce one from a label — so rejecting
+// the substring would refuse names the spool itself just wrote.
 func checkName(name string) error {
-	if name == "" || name != filepath.Base(name) || strings.Contains(name, "..") {
+	if name == "" || name == "." || name == ".." || name != filepath.Base(name) {
 		return fmt.Errorf("spool: invalid file name %q", name)
 	}
 	return nil

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
@@ -21,42 +22,46 @@ func budgetConfig(t *testing.T, w *world, budget string) (*Engine, map[string]an
 // inside that storage's own calls — a dump slower than the budget still gets a
 // full upload budget, and the report carries what the storage's calls took.
 func TestStorageBudgetCountsOnlyStorageTime(t *testing.T) {
-	w := newWorld(t)
-	e, _ := budgetConfig(t, w, "1s")
-	w.sources["vpn"].dumpDelay = 1500 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		e, _ := budgetConfig(t, w, "1s")
+		w.sources["vpn"].dumpDelay = 1500 * time.Millisecond
 
-	rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Outcome != model.OutcomeDelivered {
-		t.Fatalf("outcome %s: the dump outlasted the storage budget and cost the upload", rep.Outcome)
-	}
-	got := storageResult(rep, "primary")
-	if got.Outcome != model.StorageVerified {
-		t.Fatalf("storage %+v", got)
-	}
-	if got.Duration.Std() < 0 || got.Duration.Std() > 1500*time.Millisecond {
-		t.Fatalf("the recorded storage duration is %s, which is not the storage's own time", got.Duration)
-	}
-}
-
-// TestStorageBudgetResetsPerRun: the clock lives in the run, not on the Engine,
-// so a second Run in one process starts with the full budget.
-func TestStorageBudgetResetsPerRun(t *testing.T) {
-	w := newWorld(t)
-	e, _ := budgetConfig(t, w, "1s")
-	w.sources["vpn"].dumpDelay = 1200 * time.Millisecond
-
-	for i := range 2 {
 		rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if rep.Outcome != model.OutcomeDelivered {
-			t.Fatalf("run %d: outcome %s — a budget survived from the run before", i+1, rep.Outcome)
+			t.Fatalf("outcome %s: the dump outlasted the storage budget and cost the upload", rep.Outcome)
 		}
-	}
+		got := storageResult(rep, "primary")
+		if got.Outcome != model.StorageVerified {
+			t.Fatalf("storage %+v", got)
+		}
+		if got.Duration.Std() < 0 || got.Duration.Std() > 1500*time.Millisecond {
+			t.Fatalf("the recorded storage duration is %s, which is not the storage's own time", got.Duration)
+		}
+	})
+}
+
+// TestStorageBudgetResetsPerRun: the clock lives in the run, not on the Engine,
+// so a second Run in one process starts with the full budget.
+func TestStorageBudgetResetsPerRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		e, _ := budgetConfig(t, w, "1s")
+		w.sources["vpn"].dumpDelay = 1200 * time.Millisecond
+
+		for i := range 2 {
+			rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep.Outcome != model.OutcomeDelivered {
+				t.Fatalf("run %d: outcome %s — a budget survived from the run before", i+1, rep.Outcome)
+			}
+		}
+	})
 }
 
 // TestStorageBudgetExhaustionIsAnError: the budget the config names is still a

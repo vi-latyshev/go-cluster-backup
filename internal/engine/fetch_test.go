@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
@@ -170,15 +171,16 @@ func TestFetchFallsBackToTheSecondStorage(t *testing.T) {
 func TestFetchRetryDoesNotCorruptDestination(t *testing.T) {
 	w := newWorld(t)
 	f := storagetest.NewFake()
-	faults := 0
 	w.storages["primary"] = f
 	cfg := withRestore(t, baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")}), "primary")
 	e := runOnce(t, w, cfg)
 	runs, _ := e.StoredRuns(context.Background(), StoredRunsRequest{})
 	runID := runs[0].RunID
-	f.Fault = func(op storagetest.Op, key string, call int) error {
-		if op == storagetest.OpGet && faults == 0 {
-			faults++
+	key := runs[0].Report.Artifacts[0].Key
+	f.Fault = func(op storagetest.Op, faultKey string, call int) error {
+		// The manifest read is a Get too: a fault spent on it never reaches the
+		// spool, so the failure is pinned to this artifact's own download.
+		if op == storagetest.OpGet && faultKey == key && call == 1 {
 			return plugin.Transient(errors.New("connection reset"))
 		}
 		return nil
@@ -190,6 +192,15 @@ func TestFetchRetryDoesNotCorruptDestination(t *testing.T) {
 	}
 	if !rep.Verified || out.Len() != int(rep.Bytes) {
 		t.Fatalf("destination holds %d bytes, report %+v", out.Len(), rep)
+	}
+	if n := f.CallCount(storagetest.OpGet, key); n != 2 {
+		t.Fatalf("the artifact download ran %d times, want the failed attempt and its retry", n)
+	}
+	// The failed attempt removed its own spool file: a retry never leaves the
+	// first attempt's bytes behind for the next restore on this directory.
+	spoolDir := cfg["restore"].(map[string]any)["spool_dir"].(string)
+	if entries, err := readDirNames(spoolDir); err != nil || len(entries) != 0 {
+		t.Fatalf("the restore spool holds %v, %v", entries, err)
 	}
 }
 
@@ -784,67 +795,69 @@ func TestApplyClosesTheTargetsItBuilds(t *testing.T) {
 // apply refuses, naming the validated run — it never falls back to an older
 // run whose recorded origin was checked by nobody.
 func TestApplyStaysOnTheRunItValidated(t *testing.T) {
-	w := newWorld(t)
-	target := &fakeRestorer{}
-	w.extraSources["target"] = target
-	cfg := applyConfig(t, w, "target", nil)
-	e := w.newEngine(t, cfg)
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		target := &fakeRestorer{}
+		w.extraSources["target"] = target
+		cfg := applyConfig(t, w, "target", nil)
+		e := w.newEngine(t, cfg)
 
-	w.sources["vpn"].traits.Origin = "test://vpn/older"
-	repOld, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil || repOld.Outcome != model.OutcomeDelivered {
-		t.Fatalf("older run: %+v, %v", repOld, err)
-	}
-	// Run ids have second resolution: let the next second start so the newer
-	// run keeps its own manifest instead of overwriting the older one.
-	time.Sleep(time.Until(repOld.StartedAt.Truncate(time.Second).Add(time.Second)) + 20*time.Millisecond)
-	w.sources["vpn"].traits.Origin = "test://vpn/newest"
-	repNew, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil || repNew.Outcome != model.OutcomeDelivered || repNew.RunID == repOld.RunID {
-		t.Fatalf("newer run: %+v, %v", repNew, err)
-	}
-	// The target matches the NEWEST run's origin: the plan validates it.
-	target.traits.Origin = "test://vpn/newest"
+		w.sources["vpn"].traits.Origin = "test://vpn/older"
+		repOld, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+		if err != nil || repOld.Outcome != model.OutcomeDelivered {
+			t.Fatalf("older run: %+v, %v", repOld, err)
+		}
+		// Run ids have second resolution: let the next second start so the newer
+		// run keeps its own manifest instead of overwriting the older one.
+		time.Sleep(time.Until(repOld.StartedAt.Truncate(time.Second).Add(time.Second)) + 20*time.Millisecond)
+		w.sources["vpn"].traits.Origin = "test://vpn/newest"
+		repNew, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+		if err != nil || repNew.Outcome != model.OutcomeDelivered || repNew.RunID == repOld.RunID {
+			t.Fatalf("newer run: %+v, %v", repNew, err)
+		}
+		// The target matches the NEWEST run's origin: the plan validates it.
+		target.traits.Origin = "test://vpn/newest"
 
-	// The newest run's object is corrupted in place — same length, different
-	// bytes — so the storage listing still matches the manifest (the plan
-	// picks the newest run) while the download's SHA-256 re-check fails. The
-	// older run still holds a verified copy: the fallback a loose fetch would
-	// take, on a run whose recorded origin differs from the target's and was
-	// never validated.
-	ar := artifactByName(repNew, "wireguard")
-	if ar.Key == "" {
-		t.Fatalf("the newer run records no key: %+v", ar)
-	}
-	f := w.storage(t, "primary")
-	var body bytes.Buffer
-	if err := f.Get(context.Background(), ar.Key, &body); err != nil {
-		t.Fatal(err)
-	}
-	corrupted := append([]byte(nil), body.Bytes()...)
-	if len(corrupted) == 0 {
-		t.Fatal("the stored object is empty")
-	}
-	corrupted[0] ^= 0xff
-	if _, err := f.Put(context.Background(), storage.PutRequest{
-		Key: ar.Key, Size: int64(len(corrupted)), SHA256: model.SHA256Hex(corrupted),
-	}, bytes.NewReader(corrupted)); err != nil {
-		t.Fatal(err)
-	}
+		// The newest run's object is corrupted in place — same length, different
+		// bytes — so the storage listing still matches the manifest (the plan
+		// picks the newest run) while the download's SHA-256 re-check fails. The
+		// older run still holds a verified copy: the fallback a loose fetch would
+		// take, on a run whose recorded origin differs from the target's and was
+		// never validated.
+		ar := artifactByName(repNew, "wireguard")
+		if ar.Key == "" {
+			t.Fatalf("the newer run records no key: %+v", ar)
+		}
+		f := w.storage(t, "primary")
+		var body bytes.Buffer
+		if err := f.Get(context.Background(), ar.Key, &body); err != nil {
+			t.Fatal(err)
+		}
+		corrupted := append([]byte(nil), body.Bytes()...)
+		if len(corrupted) == 0 {
+			t.Fatal("the stored object is empty")
+		}
+		corrupted[0] ^= 0xff
+		if _, err := f.Put(context.Background(), storage.PutRequest{
+			Key: ar.Key, Size: int64(len(corrupted)), SHA256: model.SHA256Hex(corrupted),
+		}, bytes.NewReader(corrupted)); err != nil {
+			t.Fatal(err)
+		}
 
-	_, err = e.Apply(context.Background(), ApplyRunRequest{
-		Fetch:  FetchRequest{Newest: true, Artifact: "wireguard"},
-		Target: "target", Mode: source.ApplySideBySide,
+		_, err = e.Apply(context.Background(), ApplyRunRequest{
+			Fetch:  FetchRequest{Newest: true, Artifact: "wireguard"},
+			Target: "target", Mode: source.ApplySideBySide,
+		})
+		if err == nil {
+			t.Fatal("the apply fell back to the older run whose origin was never validated")
+		}
+		if !strings.Contains(err.Error(), repNew.RunID) {
+			t.Fatalf("the refusal does not name the validated run %s: %v", repNew.RunID, err)
+		}
+		if target.applied != 0 {
+			t.Fatalf("the target was applied to %d times", target.applied)
+		}
 	})
-	if err == nil {
-		t.Fatal("the apply fell back to the older run whose origin was never validated")
-	}
-	if !strings.Contains(err.Error(), repNew.RunID) {
-		t.Fatalf("the refusal does not name the validated run %s: %v", repNew.RunID, err)
-	}
-	if target.applied != 0 {
-		t.Fatalf("the target was applied to %d times", target.applied)
-	}
 }
 
 // covStorage is a storage whose Stat and Get are scripted: the fetch paths that
@@ -896,9 +909,10 @@ func (s *covStorage) Get(ctx context.Context, key string, dst io.Writer) error {
 
 // hookStorage delegates to the in-memory fake and runs one hook after a
 // successful Get — what proves a spool file the download left behind is what a
-// later step reads.
+// later step reads. key narrows the hook to one artifact; empty means any.
 type hookStorage struct {
 	*storagetest.Fake
+	key   string
 	onGet func()
 }
 
@@ -906,7 +920,7 @@ func (h *hookStorage) Get(ctx context.Context, key string, dst io.Writer) error 
 	if err := h.Fake.Get(ctx, key, dst); err != nil {
 		return err
 	}
-	if h.onGet != nil {
+	if h.onGet != nil && (h.key == "" || h.key == key) {
 		h.onGet()
 	}
 	return nil
@@ -1040,8 +1054,7 @@ func covSpool(t *testing.T) (*spool.Spool, string) {
 // covSpoolFile writes one file into a spool and returns its name.
 func covSpoolFile(t *testing.T, sp *spool.Spool, data []byte) string {
 	t.Helper()
-	name := sp.NextName("src")
-	w, err := sp.Create(name)
+	w, err := sp.Create("src")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1051,7 +1064,7 @@ func covSpoolFile(t *testing.T, sp *spool.Spool, data []byte) string {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return name
+	return w.Name()
 }
 
 // --- pure functions ----------------------------------------------------------
