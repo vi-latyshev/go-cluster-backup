@@ -771,11 +771,10 @@ func (e *Engine) produce(ctx context.Context, sp *spool.Spool, plan artifactPlan
 	if free < e.cfg.Run.SpoolReserveBytes.Int64() {
 		return producedArtifact{}, plugin.Permanent(fmt.Errorf("spool has %d free bytes, reserve is %d", free, e.cfg.Run.SpoolReserveBytes))
 	}
-	name := sp.NextName(plan.artifact.Group + "-" + plan.artifact.Name + plan.artifact.Ext)
 	e.sourceEvent(plan.srcType, plan.instance, human.New("source.dump.start", human.Text("origin", plan.source.Origin)))
 	start := time.Now()
 	pa, err := attempt(ctx, e.retry, "produce "+plan.artifact.Name, func(ctx context.Context, _ int) (producedArtifact, error) {
-		w, err := sp.Create(name)
+		w, err := sp.Create(plan.artifact.Group + "-" + plan.artifact.Name + plan.artifact.Ext)
 		if err != nil {
 			return producedArtifact{}, plugin.Permanent(err)
 		}
@@ -788,16 +787,16 @@ func (e *Engine) produce(ctx context.Context, sp *spool.Spool, plan artifactPlan
 			cerr = closeErr
 		}
 		if cerr != nil {
-			_ = sp.Remove(name)
+			_ = sp.Remove(w.Name())
 			return producedArtifact{}, cerr
 		}
 		stats, err := e.dumpStats(ctx, plan)
 		if err != nil {
-			_ = sp.Remove(name)
+			_ = sp.Remove(w.Name())
 			return producedArtifact{}, err
 		}
 		return producedArtifact{artifact: plan.artifact, chain: plan.chain, source: plan.source,
-			file: name, bytes: w.Size(), raw: raw, sha256: w.SHA256(), stats: stats}, nil
+			file: w.Name(), bytes: w.Size(), raw: raw, sha256: w.SHA256(), stats: stats}, nil
 	})
 	if err != nil {
 		return producedArtifact{}, fmt.Errorf("artifact %s: %w", plan.artifact.Name, err)

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -105,5 +106,71 @@ func TestTwoStoragesFinishOneArtifactAtOnce(t *testing.T) {
 		if got := storageResult(rep, name); got.Outcome != model.StorageVerified {
 			t.Fatalf("storage %s %+v", name, got)
 		}
+	}
+}
+
+// TestConcurrentRestoresShareOneSpoolDirectory: two restore fetches on one
+// restore.spool_dir must each hand back exactly the bytes their manifest
+// verified. The hooks interleave them inside Get, after one restore's bytes sit
+// in the spool file and before the hash check and the re-read by name — a
+// shared spool name lets the second restore truncate the first's file there.
+func TestConcurrentRestoresShareOneSpoolDirectory(t *testing.T) {
+	w := newWorld(t)
+	cfg := withRestore(t, twoSources(t, w), "primary")
+	fixture := runOnce(t, w, cfg)
+	runs, err := fixture.StoredRuns(context.Background(), StoredRunsRequest{})
+	if err != nil || len(runs) != 1 || len(runs[0].Report.Artifacts) != 2 {
+		t.Fatalf("fixture run: %+v, %v", runs, err)
+	}
+	runID := runs[0].RunID
+	keys := map[string]string{}
+	for _, ar := range runs[0].Report.Artifacts {
+		keys[ar.Artifact.Name] = ar.Key
+	}
+	fake := w.storage(t, "primary")
+	wantA, okA := fake.Bytes(keys["small"])
+	wantB, okB := fake.Bytes(keys["large"])
+	if !okA || !okB {
+		t.Fatalf("the fixture objects are missing: %v", fake.Keys())
+	}
+
+	aWritten, bWritten := make(chan struct{}), make(chan struct{})
+	aDone, bDone := make(chan struct{}), make(chan struct{})
+	eA := w.newEngine(t, cfg)
+	eB := w.newEngine(t, cfg)
+	eA.storages[0].inst = &hookStorage{Fake: fake, key: keys["small"],
+		onGet: func() { close(aWritten); <-bWritten }}
+	eB.storages[0].inst = &hookStorage{Fake: fake, key: keys["large"],
+		onGet: func() { close(bWritten); <-aDone }}
+
+	var outA, outB bytes.Buffer
+	var repA FetchReport
+	var errA error
+	go func() {
+		repA, errA = eA.Fetch(context.Background(), FetchRequest{RunID: runID, Artifact: "small"}, &outA)
+		close(aDone)
+	}()
+	<-aWritten
+	var errB error
+	go func() {
+		_, errB = eB.Fetch(context.Background(), FetchRequest{RunID: runID, Artifact: "large"}, &outB)
+		close(bDone)
+	}()
+	<-bWritten
+	<-aDone
+	<-bDone
+
+	if errA != nil {
+		t.Fatalf("the first restore failed: %v", errA)
+	}
+	if !repA.Verified || !bytes.Equal(outA.Bytes(), wantA) {
+		t.Fatalf("the first restore returned %d bytes with verified=%v, want the %d bytes of %q: got %q",
+			outA.Len(), repA.Verified, len(wantA), keys["small"], outA.Bytes())
+	}
+	if errB != nil {
+		t.Fatalf("the second restore failed: %v", errB)
+	}
+	if !bytes.Equal(outB.Bytes(), wantB) {
+		t.Fatalf("the second restore returned %q, want the bytes of %q", outB.Bytes(), keys["large"])
 	}
 }

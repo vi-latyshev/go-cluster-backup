@@ -1,12 +1,15 @@
 package kubeapitest
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -251,6 +254,46 @@ func TestDelayHoldsTheResponse(t *testing.T) {
 	}
 }
 
+// TestDelayReleasesOnCancellation: the delay must never outlive the request it
+// holds. A client that gives up is the whole reason the handler watches the
+// context; Close waits for outstanding handlers, so a handler still sleeping on
+// its own timer makes this fail.
+func TestDelayReleasesOnCancellation(t *testing.T) {
+	// The branch itself, without a socket in the way: a request whose context is
+	// already done must leave the delay at once and never reach the handler.
+	s0 := New(t)
+	s0.Delay = time.Hour
+	reached := false
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil).WithContext(ctx)
+	s0.delayed(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })).
+		ServeHTTP(httptest.NewRecorder(), req)
+	if reached {
+		t.Fatal("a cancelled request reached the handler through the delay")
+	}
+
+	s := New(t)
+	s.Delay = time.Hour
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel2()
+	req2, err := http.NewRequestWithContext(ctx2, http.MethodGet, s.srv.URL+"/api/v1/pods", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := s.srv.Client().Do(req2); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("a request cancelled inside the delay answered")
+	}
+	closed := make(chan struct{})
+	go func() { s.srv.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler is still delayed after its client gave up")
+	}
+}
+
 func TestUnknownRouteIs404(t *testing.T) {
 	if code, _ := get(t, New(t), "/api/v1/namespaces"); code != http.StatusNotFound {
 		t.Fatalf("status = %d", code)
@@ -295,23 +338,6 @@ func message(t *testing.T, body []byte) string {
 	return st.Message
 }
 
-// TestFailOnceForcesExactlyOneRequest: a single blip answers the forced status
-// once and the next request of the same object succeeds — what a client that
-// retries must survive.
-func TestFailOnceForcesExactlyOneRequest(t *testing.T) {
-	s := New(t)
-	s.AddSecret("ns", "pw", map[string]string{"PASSWORD": "s3cret"})
-	s.FailOnce("secrets/ns/pw", http.StatusInternalServerError)
-	code, body := get(t, s, "/api/v1/namespaces/ns/secrets/pw")
-	if code != http.StatusInternalServerError {
-		t.Fatalf("first GET = %d: %s", code, body)
-	}
-	code, body = get(t, s, "/api/v1/namespaces/ns/secrets/pw")
-	if code != http.StatusOK {
-		t.Fatalf("second GET = %d: %s", code, body)
-	}
-}
-
 // TestFailNthForcesTheChosenRequest: only the nth request of the key answers
 // the forced status — a blip aimed past the calls that came before it.
 func TestFailNthForcesTheChosenRequest(t *testing.T) {
@@ -330,7 +356,7 @@ func TestFailNthForcesTheChosenRequest(t *testing.T) {
 func TestCallsCountsRequestsPerKey(t *testing.T) {
 	s := New(t)
 	s.AddSecret("ns", "pw", map[string]string{"PASSWORD": "s3cret"})
-	s.FailOnce("secrets/ns/pw", http.StatusInternalServerError)
+	s.FailNth("secrets/ns/pw", http.StatusInternalServerError, 1)
 	for range 2 {
 		_, _ = get(t, s, "/api/v1/namespaces/ns/secrets/pw")
 	}
@@ -342,30 +368,177 @@ func TestCallsCountsRequestsPerKey(t *testing.T) {
 	}
 }
 
-// TestHoldLandsInsideTheRead: the request is counted before the hold, so a test
-// that polls Calls sees the read as started while the fake still holds it.
-func TestHoldLandsInsideTheRead(t *testing.T) {
-	s := New(t)
-	s.Hold = map[string]time.Duration{"secrets/ns/pw": 80 * time.Millisecond}
-	s.AddSecret("ns", "pw", map[string]string{"PASSWORD": "s3cret"})
-	done := make(chan int, 1)
+// serve runs one request through the server's own handler chain — delayed, the
+// mux, the handler — without a socket, so the test can hold and cancel it
+// deterministically.
+func serve(s *Server, ctx context.Context, path string) (*httptest.ResponseRecorder, chan struct{}) {
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
 	go func() {
-		code, _ := get(t, s, "/api/v1/namespaces/ns/secrets/pw")
-		done <- code
+		s.srv.Config.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+		close(done)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for s.Calls("secrets/ns/pw") == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	return rec, done
+}
+
+// TestEveryArmedOrdinalAdvancesOncePerRequest is the fault-injection contract in
+// one table: every armed FailNth on a request's key chain advances exactly once
+// at arrival — before any answer is chosen and before the hold — so a shot that
+// a more specific key or a higher-priority fault masks is spent on the request
+// that landed on it, never shifted to the next. Each row runs in four shapes of
+// one held first request: answered after its hold, cancelled inside it, a second
+// request overlapped with it, and an overlapped second request whose first is
+// then cancelled. A re-arm row replaces a rule while its earlier count is
+// non-zero: the fresh count starts over, it does not continue.
+func TestEveryArmedOrdinalAdvancesOncePerRequest(t *testing.T) {
+	const (
+		p1   = "pods/ns/p1"
+		get  = "/api/v1/namespaces/ns/pods/p1"
+		list = "/api/v1/pods"
+	)
+	rows := []struct {
+		name   string
+		arm    func(*Server)
+		second string
+		want   [2]int
+		// rearm, when set, replaces a rule after request 1 was counted and
+		// before request 2 starts; third then asks for a third request and
+		// want3 is what it answers.
+		rearm func(*Server)
+		third string
+		want3 int
+	}{
+		{"specific FailNth alone", func(s *Server) { s.FailNth(p1, 502, 2) }, get, [2]int{200, 502}, nil, "", 0},
+		{"resource FailNth alone", func(s *Server) { s.FailNth("pods", 502, 2) }, list, [2]int{200, 502}, nil, "", 0},
+		{"specific FailNth fires first", func(s *Server) {
+			s.FailNth(p1, 500, 1)
+			s.FailNth("pods", 502, 2)
+		}, list, [2]int{500, 502}, nil, "", 0},
+		{"specific Fail first", func(s *Server) {
+			s.Fail(p1, 500)
+			s.FailNth("pods", 502, 2)
+		}, list, [2]int{500, 502}, nil, "", 0},
+		{"specific Deny first", func(s *Server) {
+			s.Deny(p1)
+			s.FailNth("pods", 502, 2)
+		}, list, [2]int{403, 502}, nil, "", 0},
+		{"same-key Fail", func(s *Server) {
+			s.Fail(p1, 500)
+			s.FailNth(p1, 502, 2)
+		}, get, [2]int{500, 502}, nil, "", 0},
+		{"same-key Deny", func(s *Server) {
+			s.Deny(p1)
+			s.FailNth(p1, 502, 2)
+		}, get, [2]int{403, 502}, nil, "", 0},
+		{"resource Fail, specific FailNth", func(s *Server) {
+			s.Fail("pods", 500)
+			s.FailNth(p1, 502, 2)
+		}, get, [2]int{500, 502}, nil, "", 0},
+		{"masked shot is spent", func(s *Server) {
+			s.Fail(p1, 500)
+			s.FailNth("pods", 502, 1)
+		}, list, [2]int{500, 200}, nil, "", 0},
+		{"re-arming resets the count", func(s *Server) { s.FailNth(p1, 502, 2) }, get, [2]int{200, 200},
+			func(s *Server) { s.FailNth(p1, 502, 2) }, get, 502},
 	}
-	if s.Calls("secrets/ns/pw") == 0 {
-		t.Fatal("the request was never counted")
-	}
-	select {
-	case code := <-done:
-		t.Fatalf("the answer arrived (%d) although the read is held", code)
-	default:
-	}
-	if code := <-done; code != http.StatusOK {
-		t.Fatalf("status = %d", code)
+
+	const (
+		answered            = "answered"
+		cancelled           = "cancelled"
+		overlapped          = "overlapped"
+		overlappedCancelled = "overlapped then cancelled"
+	)
+	for _, row := range rows {
+		for _, shape := range []string{answered, cancelled, overlapped, overlappedCancelled} {
+			t.Run(row.name+"/"+shape, func(t *testing.T) {
+				s := New(t)
+				s.AddPod(`{"metadata":{"name":"p1","namespace":"ns"},"status":{"phase":"Running"}}`)
+				row.arm(s)
+				// One hold, set before the bubble and never changed: the first
+				// request is the one it holds.
+				s.Hold = map[string]time.Duration{p1: time.Hour}
+
+				synctest.Test(t, func(t *testing.T) {
+					fail := func(which string, got, want int) {
+						t.Helper()
+						t.Fatalf("%s/%s: %s = %d, want %d; Calls(%s)=%d, Calls(pods)=%d",
+							row.name, shape, which, got, want, p1, s.Calls(p1), s.Calls("pods"))
+					}
+					ctx1, cancel1 := context.WithCancel(t.Context())
+					defer cancel1()
+					rec1, done1 := serve(s, ctx1, get)
+
+					synctest.Wait()
+					if got := s.Calls(p1); got != 1 {
+						fail("Calls before the hold ended", got, 1)
+					}
+					select {
+					case <-done1:
+						t.Fatalf("%s/%s: the first request finished while its hold was still on", row.name, shape)
+					default:
+					}
+
+					var rec2 *httptest.ResponseRecorder
+					var done2 chan struct{}
+					rearm := func() {
+						if row.rearm != nil {
+							row.rearm(s)
+						}
+					}
+					second := func() {
+						rec2, done2 = serve(s, t.Context(), row.second)
+					}
+					switch shape {
+					case answered:
+						time.Sleep(2 * time.Hour)
+						<-done1
+						rearm()
+						second()
+					case cancelled:
+						cancel1()
+						<-done1
+						if rec1.Body.Len() != 0 {
+							t.Fatalf("%s/%s: a cancelled request wrote %q", row.name, shape, rec1.Body.String())
+						}
+						rearm()
+						second()
+					case overlapped:
+						rearm()
+						second()
+						synctest.Wait()
+						time.Sleep(2 * time.Hour)
+						<-done1
+					case overlappedCancelled:
+						rearm()
+						second()
+						synctest.Wait()
+						cancel1()
+						<-done1
+						if rec1.Body.Len() != 0 {
+							t.Fatalf("%s/%s: a cancelled request wrote %q", row.name, shape, rec1.Body.String())
+						}
+					}
+					if shape == answered || shape == overlapped {
+						if rec1.Code != row.want[0] {
+							fail("the first request", rec1.Code, row.want[0])
+						}
+					}
+					time.Sleep(2 * time.Hour)
+					<-done2
+					if rec2.Code != row.want[1] {
+						fail("the second request", rec2.Code, row.want[1])
+					}
+					if row.rearm == nil {
+						return
+					}
+					rec3, done3 := serve(s, t.Context(), row.third)
+					time.Sleep(2 * time.Hour)
+					<-done3
+					if rec3.Code != row.want3 {
+						fail("the third request after the re-arm", rec3.Code, row.want3)
+					}
+				})
+			})
+		}
 	}
 }

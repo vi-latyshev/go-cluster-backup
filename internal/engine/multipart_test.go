@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
@@ -388,47 +389,49 @@ func TestSmallObjectKeepsTheSinglePut(t *testing.T) {
 // middle of an upload aborts it and fails only its own copy — reported the way
 // every other budget failure is, and never at the cost of the other storage.
 func TestStorageBudgetEndsMidUpload(t *testing.T) {
-	w := newWorld(t)
-	parts := newFakeMultipart(4)
-	parts.partDelay = func(ctx context.Context) error {
-		select {
-		case <-time.After(40 * time.Millisecond):
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		parts := newFakeMultipart(4)
+		parts.partDelay = func(ctx context.Context) error {
+			select {
+			case <-time.After(40 * time.Millisecond):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-	}
-	w.extraStorages["a_parts"] = parts
-	w.storages["a_parts"] = parts.Fake
-	cfg := baseConfig(t, twoWayStorages())
-	w.sources["vpn"] = &fakeSource{data: []byte("0123456789")}
-	// The budget is shorter than the three parts need, and longer than one.
-	cfg["storages"].(map[string]any)["a_parts"].(map[string]any)["time_budget"] = "60ms"
+		w.extraStorages["a_parts"] = parts
+		w.storages["a_parts"] = parts.Fake
+		cfg := baseConfig(t, twoWayStorages())
+		w.sources["vpn"] = &fakeSource{data: []byte("0123456789")}
+		// The budget is shorter than the three parts need, and longer than one.
+		cfg["storages"].(map[string]any)["a_parts"].(map[string]any)["time_budget"] = "60ms"
 
-	rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, aborts, completes, _ := parts.stats()
-	if aborts != 1 {
-		t.Fatalf("aborts = %d, want 1: the budget ended mid-upload", aborts)
-	}
-	if completes != 0 {
-		t.Fatalf("completes = %d, want none", completes)
-	}
-	r := storageResult(rep, "a_parts")
-	if r.Outcome != model.StorageFailed {
-		t.Fatalf("a_parts = %+v", r)
-	}
-	if !strings.Contains(r.Error, "part") && !strings.Contains(r.Error, "deadline") {
-		t.Fatalf("the failure does not name what ended: %q", r.Error)
-	}
-	if other := storageResult(rep, "b_plain"); other.Outcome != model.StorageVerified {
-		t.Fatalf("b_plain = %+v, want the other storage's copy intact", other)
-	}
-	if rep.Outcome != model.OutcomeDegraded {
-		t.Fatalf("outcome %q, want degraded", rep.Outcome)
-	}
+		rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, aborts, completes, _ := parts.stats()
+		if aborts != 1 {
+			t.Fatalf("aborts = %d, want 1: the budget ended mid-upload", aborts)
+		}
+		if completes != 0 {
+			t.Fatalf("completes = %d, want none", completes)
+		}
+		r := storageResult(rep, "a_parts")
+		if r.Outcome != model.StorageFailed {
+			t.Fatalf("a_parts = %+v", r)
+		}
+		if !strings.Contains(r.Error, "part") && !strings.Contains(r.Error, "deadline") {
+			t.Fatalf("the failure does not name what ended: %q", r.Error)
+		}
+		if other := storageResult(rep, "b_plain"); other.Outcome != model.StorageVerified {
+			t.Fatalf("b_plain = %+v, want the other storage's copy intact", other)
+		}
+		if rep.Outcome != model.OutcomeDegraded {
+			t.Fatalf("outcome %q, want degraded", rep.Outcome)
+		}
+	})
 }
 
 // TestMultipartCompletionThatCommitsNothingFails: a Complete that answers success
@@ -735,7 +738,7 @@ func TestUploadPartsWrongPartNumber(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := newStorageRunState(e.storages[0])
-	pa := producedArtifact{artifact: model.Artifact{Group: "g", Name: "n"}, file: "f.bin", bytes: 10}
+	pa := producedArtifact{artifact: model.Artifact{Group: "g", Name: "n"}, file: wr.Name(), bytes: 10}
 	_, err = e.uploadParts(context.Background(), st, z, sp, pa, session)
 	if err == nil || !strings.Contains(err.Error(), "answered part") {
 		t.Fatalf("uploadParts = %v, want the wrong-part-number refusal", err)

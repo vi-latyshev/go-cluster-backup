@@ -64,8 +64,10 @@ vet:
 test: unit-cover test-gate
 
 # unit-cover runs the unit suite and writes the unit profile without gating it.
+# GORACE=atexit_sleep_ms=0 drops the race runtime's one-second sleep at every
+# test binary's exit — one per package, and the suite is dozens of packages.
 unit-cover:
-	$(GO) test -race -timeout=5m -coverprofile=$(COVERAGE_PROFILE) ./...
+	GORACE=atexit_sleep_ms=0 $(GO) test -race -timeout=5m -coverprofile=$(COVERAGE_PROFILE) ./...
 
 # test-gate enforces the threshold on an existing unit profile, without running
 # the suite again — the same reporter `make test` uses.

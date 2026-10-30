@@ -109,7 +109,7 @@ done
 if [ ! -t 0 ]; then cat > "$STUB_LOG/stdin.` + name + `"; fi
 cat "$STUB_LOG/out.` + name + `" 2>/dev/null
 if [ -f "$STUB_LOG/stderr.` + name + `" ]; then cat "$STUB_LOG/stderr.` + name + `" >&2; fi
-if [ -f "$STUB_LOG/sleep.` + name + `" ]; then exec sleep "$(cat "$STUB_LOG/sleep.` + name + `")"; fi
+if [ -f "$STUB_LOG/sleep.` + name + `" ]; then : > "$STUB_LOG/started.` + name + `"; exec sleep "$(cat "$STUB_LOG/sleep.` + name + `")"; fi
 code=0; if [ -f "$STUB_LOG/exit.` + name + `" ]; then code=$(cat "$STUB_LOG/exit.` + name + `"); fi
 exit "$code"
 `
@@ -133,6 +133,25 @@ func stubLog(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// waitStarted waits for the stub of one binary to report that it has begun the
+// work the test wants to interrupt. A sleep long enough for "the process
+// probably started" is a wall-clock bet that passes on an idle machine and
+// fails under -race on a loaded one.
+func waitStarted(t *testing.T, name string) {
+	t.Helper()
+	started := filepath.Join(os.Getenv("STUB_LOG"), "started."+name)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the %s stub never started", name)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestGeneralConformance(t *testing.T) {
@@ -304,7 +323,7 @@ func TestDumpReturnsOnCancellationMidRun(t *testing.T) {
 	done := make(chan error, 1)
 	start := time.Now()
 	go func() { done <- s.Dump(ctx, io.Discard) }()
-	time.Sleep(150 * time.Millisecond)
+	waitStarted(t, "pg_dump")
 	cancel()
 	select {
 	case err := <-done:

@@ -273,7 +273,9 @@ make e2e         # k3d end-to-end suite: E2E_IMAGE=<image loaded into the cluste
 make image       # docker build -t go-cluster-backup .
 ```
 
-CI runs two jobs: `make vet lint vuln chart`, and `make test e2e cover`.
+CI runs two jobs: `make lint vuln chart`, and `make test e2e cover`. It has no
+separate `go vet` step — golangci-lint's govet runs the same analysers inside
+`make lint`; `make vet` stays in `make check` for a local run.
 `make e2e` builds `go-cluster-backup:e2e` with `--build-arg COVER=1` unless
 `E2E_IMAGE` names an image already loaded, and the suite creates and deletes its
 own k3d cluster (k3d v5.9.0, `rancher/k3s:v1.37.1-k3s1`, name `E2E_CLUSTER`,
@@ -317,3 +319,6 @@ then run `make check` once before handing the work over.
 - `examples/config/*.yaml` are validated by the same test, so a shipped example
   never drifts from the schema.
 - The s3 live test stays skipped; the offline suite is the gate.
+- A test that waits for time goes into `testing/synctest` unless it touches a
+  socket; an httptest fake releases a held request on `r.Context().Done()`, never
+  on a fixed sleep.

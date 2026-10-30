@@ -1,8 +1,10 @@
 // Package kubeapitest is the fake Kubernetes API server the kubeapi client and
 // the Kubernetes plugins are tested against: an httptest TLS server that answers
-// the six routes they use with the JSON shapes the real API server returns —
-// label selectors, phase field selectors, continue-token pagination, base64
-// Secret data, and a ConfigMap update that can conflict on resourceVersion.
+// the routes they use — pod, job, PVC, PV and event listings, pod and job reads,
+// Secrets, and ConfigMap reads, puts and patches — with the JSON shapes the real
+// API server returns — label selectors, phase field selectors, continue-token
+// pagination, base64 Secret data, and a ConfigMap update that can conflict on
+// resourceVersion.
 package kubeapitest
 
 import (
@@ -91,17 +93,14 @@ type Server struct {
 	ConflictNextPut bool
 	// Delay holds every response, for exercising a client timeout.
 	Delay time.Duration
-	// Denied answers 403 the way RBAC refuses an object outside resourceNames.
+	// denied answers 403 the way RBAC refuses an object outside resourceNames.
 	// Keys are a list resource ("pods", "persistentvolumeclaims",
 	// "persistentvolumes"), "secrets", "configmaps",
 	// "secrets/<namespace>/<name>" or "configmaps/<namespace>/<name>", most
 	// specific first.
-	Denied map[string]bool
-	// Failures forces a status code for the same keys as Denied.
-	Failures map[string]int
-	// failOnce forces a status code for exactly one request per key, then
-	// clears itself — the way a single blip looks to a client that retries.
-	failOnce map[string]int
+	denied map[string]bool
+	// failures forces a status code for the same keys as denied.
+	failures map[string]int
 	// failNth forces a status code for the Nth request of a key (1-based) and
 	// only that one — a blip aimed at a chosen call, e.g. past a preflight.
 	failNth map[string]*nthFailure
@@ -110,7 +109,8 @@ type Server struct {
 	calls map[string]int
 	// Hold delays the answer of one key by the given duration: the request is
 	// counted first and then held, so a test can land a cancellation inside
-	// the read itself (Keys are Deny's).
+	// the read itself. The key is the request's most specific key — the one
+	// Calls counts.
 	Hold map[string]time.Duration
 	// Tokens records the bearer token of every request, oldest first, so a test
 	// can prove the client re-reads the token file.
@@ -124,9 +124,8 @@ func New(t *testing.T) *Server {
 		t:        t,
 		secrets:  map[string]map[string]string{},
 		configs:  map[string]*configMap{},
-		Denied:   map[string]bool{},
-		Failures: map[string]int{},
-		failOnce: map[string]int{},
+		denied:   map[string]bool{},
+		failures: map[string]int{},
 		failNth:  map[string]*nthFailure{},
 		calls:    map[string]int{},
 	}
@@ -158,14 +157,19 @@ func New(t *testing.T) *Server {
 }
 
 // delayed holds every request for Delay before answering, for exercising a
-// client timeout.
+// client timeout. A client that gives up first releases the handler: the hold
+// must never outlive the request it is holding.
 func (s *Server) delayed(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delay := s.Delay
 		s.mu.Unlock()
 		if delay > 0 {
-			time.Sleep(delay)
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -215,7 +219,7 @@ func SetToken(t *testing.T, opts kubeapi.Options, value string) {
 // liveness check makes.
 func (s *Server) handlePodGet(w http.ResponseWriter, r *http.Request) {
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	if s.refuse(w, "pods/"+namespace+"/"+name, "pods") {
+	if s.refuse(r, w, "pods/"+namespace+"/"+name, "pods") {
 		return
 	}
 	s.mu.Lock()
@@ -248,7 +252,7 @@ func (s *Server) AddEvent(raw string) { s.add(&s.events, raw) }
 // handleJobGet serves one Job by namespace and name.
 func (s *Server) handleJobGet(w http.ResponseWriter, r *http.Request) {
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	if s.refuse(w, "jobs/"+namespace+"/"+name, "jobs") {
+	if s.refuse(r, w, "jobs/"+namespace+"/"+name, "jobs") {
 		return
 	}
 	s.mu.Lock()
@@ -299,14 +303,14 @@ func (s *Server) add(list *[]item, raw string) {
 func (s *Server) Deny(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Denied[key] = true
+	s.denied[key] = true
 }
 
 // Allow undoes Deny.
 func (s *Server) Allow(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.Denied, key)
+	delete(s.denied, key)
 }
 
 // Fail forces a status code for the same keys as Deny; Fail(key, 0) clears it.
@@ -314,10 +318,10 @@ func (s *Server) Fail(key string, code int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if code == 0 {
-		delete(s.Failures, key)
+		delete(s.failures, key)
 		return
 	}
-	s.Failures[key] = code
+	s.failures[key] = code
 }
 
 // AddSecret adds one Secret; values are plaintext here and base64-encoded on
@@ -390,16 +394,13 @@ func (s *Server) BumpConfigMap(namespace, name string) {
 	}
 }
 
-// FailOnce forces a status code for exactly one request of the key, the way a
-// single API blip looks to a client that retries; keys are the same as Deny's.
-func (s *Server) FailOnce(key string, code int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.failOnce[key] = code
-}
-
-// FailNth forces a status code for the nth request of the key (1-based) and
-// only that one; keys are the same as Deny's.
+// FailNth forces a status code for the nth request since arming among every
+// request whose path carries the key (1-based) — a resource key counts its
+// objects' reads and its listings alike, unlike Calls — and only that one. A
+// request that a more specific key or a higher-priority fault answers still
+// takes its ordinal: the shot is spent there, never shifted to the next request.
+// Arming again replaces the rule and resets the count. Keys are the same as
+// Deny's.
 func (s *Server) FailNth(key string, code, nth int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -415,47 +416,64 @@ func (s *Server) Calls(key string) int {
 	return s.calls[key]
 }
 
-// refuse answers a forced status when one is configured for the path keys, the
-// most specific key first ("secrets/ns/name" before "secrets"); it reports
-// whether it wrote a response.
-func (s *Server) refuse(w http.ResponseWriter, keys ...string) bool {
+// refuse counts one request of the path keys, advances every armed FailNth on
+// that chain, then answers what forced selected — the accounting, the choice and
+// the hold are three separate steps. A held request is released by the client's
+// own cancellation as well as by the hold's end: cancellation skips only the
+// response, never the accounting.
+func (s *Server) refuse(r *http.Request, w http.ResponseWriter, keys ...string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(keys) > 0 {
-		s.calls[keys[0]]++
-		if hold := s.Hold[keys[0]]; hold > 0 {
-			// Counted, then held: the caller is already blocked in its read
-			// when the sleep ends. The lock is released so the hold cannot
-			// block a test's own polling.
-			s.mu.Unlock()
-			time.Sleep(hold)
-			s.mu.Lock()
-		}
-	}
+	// A caller always passes the request's most specific key first — it is the
+	// one Calls counts and Hold matches.
+	s.calls[keys[0]]++
+	hold := s.Hold[keys[0]]
+	// Every armed ordinal on the chain advances exactly once, whichever rule
+	// answers: a shot masked by a specific key or a higher-priority fault is
+	// spent where the request landed, never shifted to the next one.
 	for _, key := range keys {
-		if code, ok := s.failOnce[key]; ok {
-			delete(s.failOnce, key)
-			writeStatus(w, code, "Forced", fmt.Sprintf("the fake answers %d once for %s", code, key))
-			return true
-		}
 		if f, ok := s.failNth[key]; ok {
 			f.seen++
-			if f.seen == f.nth {
-				writeStatus(w, f.code, "Forced", fmt.Sprintf("the fake answers %d for request %d of %s", f.code, f.nth, key))
-				return true
-			}
 		}
-		if code, ok := s.Failures[key]; ok {
-			writeStatus(w, code, "Forced", fmt.Sprintf("the fake answers %d for %s", code, key))
-			return true
-		}
-		if s.Denied[key] {
-			writeStatus(w, http.StatusForbidden, "Forbidden",
-				fmt.Sprintf("secrets or configmaps %q is forbidden: User cannot get resource - add it to resourceNames", key))
+	}
+	code, reason, message := s.forced(keys)
+	s.mu.Unlock()
+
+	if hold > 0 {
+		select {
+		case <-time.After(hold):
+			// Counted, held, then answered: the caller is blocked in its read
+			// for the whole hold.
+		case <-r.Context().Done():
+			// The client is gone; the request still counts and its ordinals
+			// have already advanced.
 			return true
 		}
 	}
-	return false
+	if code == 0 {
+		return false
+	}
+	writeStatus(w, code, reason, message)
+	return true
+}
+
+// forced is the answer to one request, chosen from the rule state its own
+// arrival produced: most specific key first, and at one key a firing FailNth,
+// then Fail, then Deny. It mutates nothing — the ordinals advanced before it
+// ran — and answers 0 when no rule fires.
+func (s *Server) forced(keys []string) (int, string, string) {
+	for _, key := range keys {
+		if f, ok := s.failNth[key]; ok && f.seen == f.nth {
+			return f.code, "Forced", fmt.Sprintf("the fake answers %d for request %d of %s", f.code, f.nth, key)
+		}
+		if code, ok := s.failures[key]; ok {
+			return code, "Forced", fmt.Sprintf("the fake answers %d for %s", code, key)
+		}
+		if s.denied[key] {
+			return http.StatusForbidden, "Forbidden",
+				fmt.Sprintf("secrets or configmaps %q is forbidden: User cannot get resource - add it to resourceNames", key)
+		}
+	}
+	return 0, "", ""
 }
 
 func (s *Server) record(r *http.Request) {
@@ -469,7 +487,7 @@ func (s *Server) record(r *http.Request) {
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, resource, namespace string) {
 	s.record(r)
-	if s.refuse(w, resource) {
+	if s.refuse(r, w, resource) {
 		return
 	}
 	q := r.URL.Query()
@@ -664,7 +682,7 @@ func matchesSelector(selector string, labels map[string]string) bool {
 func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
 	s.record(r)
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	if s.refuse(w, "secrets/"+namespace+"/"+name, "secrets") {
+	if s.refuse(r, w, "secrets/"+namespace+"/"+name, "secrets") {
 		return
 	}
 	s.mu.Lock()
@@ -689,7 +707,7 @@ func (s *Server) handleSecret(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigMapGet(w http.ResponseWriter, r *http.Request) {
 	s.record(r)
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	if s.refuse(w, "configmaps/"+namespace+"/"+name, "configmaps") {
+	if s.refuse(r, w, "configmaps/"+namespace+"/"+name, "configmaps") {
 		return
 	}
 	s.mu.Lock()
@@ -709,7 +727,7 @@ func (s *Server) handleConfigMapGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigMapPatch(w http.ResponseWriter, r *http.Request) {
 	s.record(r)
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	if s.refuse(w, "configmaps/"+namespace+"/"+name, "configmaps") {
+	if s.refuse(r, w, "configmaps/"+namespace+"/"+name, "configmaps") {
 		return
 	}
 	if ct := r.Header.Get("Content-Type"); ct != "application/merge-patch+json" {
@@ -773,7 +791,7 @@ func (s *Server) handleConfigMapPatch(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfigMapPut(w http.ResponseWriter, r *http.Request) {
 	s.record(r)
 	namespace, name := r.PathValue("namespace"), r.PathValue("name")
-	if s.refuse(w, "configmaps/"+namespace+"/"+name, "configmaps") {
+	if s.refuse(r, w, "configmaps/"+namespace+"/"+name, "configmaps") {
 		return
 	}
 	var body struct {

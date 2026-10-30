@@ -97,7 +97,7 @@ for a in "$@"; do
 done
 cat "$STUB_LOG/out" 2>/dev/null
 if [ -f "$STUB_LOG/stderr" ]; then cat "$STUB_LOG/stderr" >&2; fi
-if [ -f "$STUB_LOG/sleep" ]; then exec sleep "$(cat "$STUB_LOG/sleep")"; fi
+if [ -f "$STUB_LOG/sleep" ]; then : > "$STUB_LOG/started"; exec sleep "$(cat "$STUB_LOG/sleep")"; fi
 code=0; if [ -f "$STUB_LOG/exit" ]; then code=$(cat "$STUB_LOG/exit"); fi
 exit "$code"
 `
@@ -120,6 +120,23 @@ func stubLog(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// waitStarted waits for the stub to report that it has begun the work a test
+// wants to interrupt, instead of betting a fixed sleep that it probably has.
+func waitStarted(t *testing.T) {
+	t.Helper()
+	started := filepath.Join(os.Getenv("STUB_LOG"), "started")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the redis-cli stub never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestGeneralConformance(t *testing.T) {
@@ -292,7 +309,7 @@ func TestDumpReturnsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Dump(ctx, io.Discard) }()
-	time.Sleep(150 * time.Millisecond)
+	waitStarted(t)
 	cancel()
 	select {
 	case err := <-done:
@@ -387,7 +404,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 // cancellation branch is unreachable once the wait has already given up.
 func slowConfig(t *testing.T, addr string) string {
 	t.Helper()
-	return fmt.Sprintf(`{"address": %q, "password": {"file": %q}, "scratch_dir": %q, "connect_attempts": 20, "connect_interval": "200ms"}`,
+	return fmt.Sprintf(`{"address": %q, "password": {"file": %q}, "scratch_dir": %q, "connect_attempts": 20, "connect_interval": "1s"}`,
 		addr, passwordFile(t), t.TempDir())
 }
 
@@ -453,8 +470,10 @@ func TestCheckCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	// The first attempt fails at once and the wait then sleeps a full second:
+	// cancelling 20ms in lands inside it with a fiftyfold margin.
 	go func() {
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
 	if err := s.(plugin.Checker).Check(ctx); !errors.Is(err, context.Canceled) {
@@ -527,8 +546,10 @@ func TestDumpCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	// The first attempt fails at once and the wait then sleeps a full second:
+	// cancelling 20ms in lands inside it with a fiftyfold margin.
 	go func() {
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
 	if err := s.Dump(ctx, io.Discard); !errors.Is(err, context.Canceled) {

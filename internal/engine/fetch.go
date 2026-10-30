@@ -400,21 +400,19 @@ func (e *Engine) fetchRaw(ctx context.Context, req FetchRequest, sp *spool.Spool
 		return FetchReport{}, "", fmt.Errorf("fetch: unknown storage %q (known: %v)", req.RawStorage, e.storageNames())
 	}
 	ro := readOnlyStorage{sb.inst}
-	var name string
 	var w *spool.Writer
 	_, err := attempt(ctx, e.restoreRetry, "get "+req.RawKey, func(ctx context.Context, _ int) (struct{}, error) {
-		name = sp.NextName("raw")
-		f, err := sp.Create(name)
+		f, err := sp.Create("raw")
 		if err != nil {
 			return struct{}{}, plugin.Permanent(err)
 		}
 		if err := safeCall(func() error { return ro.Get(ctx, req.RawKey, f) }); err != nil {
 			_ = f.Close()
-			_ = sp.Remove(name)
+			_ = sp.Remove(f.Name())
 			return struct{}{}, err
 		}
 		if err := f.Close(); err != nil {
-			_ = sp.Remove(name)
+			_ = sp.Remove(f.Name())
 			return struct{}{}, plugin.Transient(err)
 		}
 		w = f
@@ -423,7 +421,7 @@ func (e *Engine) fetchRaw(ctx context.Context, req FetchRequest, sp *spool.Spool
 	if err != nil {
 		return FetchReport{}, "", fmt.Errorf("fetch: raw object %s on %s: %w", req.RawKey, sb.name, err)
 	}
-	return FetchReport{Storage: sb.name, Key: req.RawKey, Bytes: w.Size(), SHA256: w.SHA256(), Verified: false}, name, nil
+	return FetchReport{Storage: sb.name, Key: req.RawKey, Bytes: w.Size(), SHA256: w.SHA256(), Verified: false}, w.Name(), nil
 }
 
 func (e *Engine) fetchArtifact(ctx context.Context, req FetchRequest, sp *spool.Spool) (FetchReport, model.ArtifactResult, string, *spool.Spool, error) {
@@ -618,21 +616,19 @@ func (e *Engine) fetchCandidate(ctx context.Context, sb *storageBinding, getSurv
 	if st.Size != ar.Bytes {
 		return skip(fmt.Sprintf("the object is %d bytes, the manifest says %d", st.Size, ar.Bytes))
 	}
-	var name string
 	var w *spool.Writer
 	_, err = attempt(ctx, e.restoreRetry, "get "+ar.Key, func(ctx context.Context, _ int) (struct{}, error) {
-		name = sp.NextName("fetch")
-		f, err := sp.Create(name)
+		f, err := sp.Create("fetch")
 		if err != nil {
 			return struct{}{}, plugin.Permanent(err)
 		}
 		if err := safeCall(func() error { return ro.Get(ctx, ar.Key, f) }); err != nil {
 			_ = f.Close()
-			_ = sp.Remove(name)
+			_ = sp.Remove(f.Name())
 			return struct{}{}, err
 		}
 		if err := f.Close(); err != nil {
-			_ = sp.Remove(name)
+			_ = sp.Remove(f.Name())
 			return struct{}{}, plugin.Transient(err)
 		}
 		w = f
@@ -641,6 +637,7 @@ func (e *Engine) fetchCandidate(ctx context.Context, sb *storageBinding, getSurv
 	if err != nil {
 		return skip(fmt.Sprintf("download: %v", err))
 	}
+	name := w.Name()
 	if w.Size() != ar.Bytes {
 		_ = sp.Remove(name)
 		return skip(fmt.Sprintf("downloaded %d bytes, the manifest says %d", w.Size(), ar.Bytes))
@@ -657,12 +654,12 @@ func (e *Engine) fetchCandidate(ctx context.Context, sb *storageBinding, getSurv
 		_ = sp.Remove(name)
 		return "", model.ArtifactResult{}, nil, err
 	}
-	decName := sp.NextName("decoded")
-	dw, err := sp.Create(decName)
+	dw, err := sp.Create("decoded")
 	if err != nil {
 		_ = sp.Remove(name)
 		return "", model.ArtifactResult{}, nil, err
 	}
+	decName := dw.Name()
 	src, err := sp.Open(name)
 	if err != nil {
 		_ = sp.Remove(name)
