@@ -345,6 +345,32 @@ func TestAStatFailureThatIsNotAbsenceRefuses(t *testing.T) {
 	}
 }
 
+// TestARecordExtThatLeavesTheDirRefuses: the record names the artifact by its
+// ext, and this source joins that name to the stage dir. An ext that would step
+// out of the directory is a permanent fault of the record, never joined to a
+// path.
+func TestARecordExtThatLeavesTheDirRefuses(t *testing.T) {
+	dir := t.TempDir()
+	writeRecord(t, dir, "example-state", "/../../victim", `[]`)
+	s, err := build(t, config(dir, "example-state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string]func() error{
+		"Check":    func() error { return s.(plugin.Checker).Check(context.Background()) },
+		"Describe": func() error { _, err := s.Describe(context.Background()); return err },
+	}
+	for name, check := range checks {
+		err := check()
+		if err == nil {
+			t.Fatalf("%s accepted a record ext that leaves the dir", name)
+		}
+		if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+			t.Fatalf("%s: class = %q, want permanent: %v", name, class, err)
+		}
+	}
+}
+
 // TestAnUnopenableStagedFileRefuses: the file is there and non-empty, but this
 // process cannot open it — a permanent fault, not a retry.
 func TestAnUnopenableStagedFileRefuses(t *testing.T) {

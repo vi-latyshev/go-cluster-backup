@@ -6,8 +6,10 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -75,8 +77,8 @@ func TestStageWritesSealedArtifact(t *testing.T) {
 	if len(rec.Chain) != 1 || rec.Chain[0] != want {
 		t.Fatalf("the chain record = %+v, want [%+v]", rec.Chain, want)
 	}
-	if got := source.StagedArtifactName("k3s-state", rec); got != "k3s-state.dat.age" {
-		t.Fatalf("the record names %q, want the published file k3s-state.dat.age", got)
+	if got, err := source.StagedArtifactName("k3s-state", rec); err != nil || got != "k3s-state.dat.age" {
+		t.Fatalf("the record names %q (%v), want the published file k3s-state.dat.age", got, err)
 	}
 	if rep.Artifacts[0].Bytes != int64(len("sealed bytes")) || rep.Artifacts[0].SHA256 == "" {
 		t.Fatalf("artifact result %+v", rep.Artifacts[0])
@@ -120,75 +122,647 @@ func TestStageNeedsItsConfig(t *testing.T) {
 	}
 }
 
-// TestStageClearsWhatAPreviousStageLeft: a stage directory that survives the
-// container — any deployment whose dir is not this cluster's emptyDir — must
-// never hand the run yesterday's artifact and record as tonight's after a stage
-// that failed: the run cannot tell the two apart. Mutant: without the clear, the
-// failed second night leaves the first night's pair in place.
-func TestStageClearsWhatAPreviousStageLeft(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age"}
-	src := &fakeSource{data: []byte("sealed bytes")}
-	w.sources["snapshot"] = src
-	dir := t.TempDir()
-	e := w.newEngine(t, stageConfig(t, dir))
+// stageArtifact is one artifact a stage case declares: the instance that
+// produces it, the artifact it names, and what the case needs from the source.
+type stageArtifact struct {
+	inst, name, importance, ext string
+	pipeline                    []string
+	prepare                     func(w *world, src *fakeSource)
+}
 
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil || rep.Outcome != model.OutcomeDelivered {
-		t.Fatalf("first night: %+v, %v", rep, err)
+// TestStagePublishesOnlyThisStagesPairs is the one proof of the stage's
+// admission contract: a stage publishes into an empty directory it owns, never
+// deletes, and refuses to start on any other directory; within one stage, an
+// artifact whose record or file name another artifact already claimed fails
+// before it produces bytes, so one artifact's file can never answer another's
+// record — not after a failed check, and not after a failed publish. Every
+// refusal leaves the directory byte-identical and runs no plugin Check or Dump.
+func TestStagePublishesOnlyThisStagesPairs(t *testing.T) {
+	seedPair := func(t *testing.T, dir, name, ext, body string) {
+		t.Helper()
+		if err := os.WriteFile(source.StagedChainFile(dir, name), mustMarshal(t, source.StagedRecord{Ext: ext}), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name+ext), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if names, err := readDirNames(dir); err != nil || len(names) != 2 {
-		t.Fatalf("first night left %v (%v), want the artifact and its record", names, err)
+	healthy := func(inst string) stageArtifact {
+		return stageArtifact{inst: inst, name: "ok", importance: "required"}
 	}
-
-	// Second night: the source fails before a byte is written.
-	src.dumpErr = plugin.Permanent(errors.New("datastore vanished"))
-	rep, err = e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name string
+		// setup builds the start state of stage.dir and returns the stage dir.
+		setup func(t *testing.T) (dir string)
+		// check runs after a refusal instead of the snapshot comparison, for a
+		// stage.dir that is not a directory.
+		check        func(t *testing.T, dir string)
+		artifacts    []stageArtifact
+		prepareWorld func(w *world)
+		degraded     int
+		failed       int
+		wantErr      string
+		wantOutcome  model.Outcome
+		wantExit     int
+		// wantFailed maps an instance to the error its artifact must carry.
+		wantFailed map[string]string
+		// dumps overrides the expected Dump count for a failed instance.
+		dumps map[string]int
+	}{
+		{
+			name: "refuses a previous pair of the configured name",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				seedPair(t, dir, "k3s-state", ".dat", "last night")
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses the C2b sequence on a persistent directory",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				seedPair(t, dir, "state", ".old", "night one state")
+				seedPair(t, dir, "state.dat", ".old", "night one state.dat")
+				return dir
+			},
+			artifacts: []stageArtifact{
+				{inst: "aa", name: "state", importance: "required", ext: ".dat.old"},
+				{inst: "bb", name: "state.dat", importance: "required", ext: ".new"},
+			},
+			degraded: 0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses an orphan pair of an unconfigured name",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				seedPair(t, dir, "legacy", ".dat", "orphan")
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses a lone record",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(source.StagedChainFile(dir, "k3s-state"), mustMarshal(t, source.StagedRecord{Ext: ".dat"}), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses a lone artifact",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "k3s-state.dat"), []byte("lone"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses a garbage record",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(source.StagedChainFile(dir, "k3s-state"), []byte("not json"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses a stale temp",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, ".tmp-123"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses an unrelated file",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "keep.me"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses a non-empty subdirectory",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "sub", "x"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "must be an empty directory",
+		},
+		{
+			name: "refuses a stage dir under a regular file",
+			setup: func(t *testing.T) string {
+				blocker := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return filepath.Join(blocker, "stage")
+			},
+			check: func(t *testing.T, dir string) {
+				t.Helper()
+				blocker := filepath.Dir(dir)
+				if body, err := os.ReadFile(blocker); err != nil || string(body) != "x" {
+					t.Fatalf("the refused stage touched its blocker: %q, %v", body, err)
+				}
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "k3s-state", importance: "best_effort"}},
+			degraded:  0, failed: 0,
+			wantErr: "stage:",
+		},
+		{
+			name: "creates an absent stage dir",
+			setup: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "staged")
+			},
+			artifacts: []stageArtifact{{inst: "snap", name: "state", importance: "required"}},
+			degraded:  5, failed: 9,
+			wantOutcome: model.OutcomeDelivered, wantExit: 0,
+		},
+		{
+			name:  "keeps prefix-named neighbours",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "aa", name: "k3s-state", importance: "required"},
+				{inst: "bb", name: "k3s.v2", importance: "required"},
+				{inst: "cc", name: "k3s", importance: "required"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeDelivered, wantExit: 0,
+		},
+		{
+			name:  "keeps an extension-named sibling, name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state", name: "state", importance: "required"},
+				{inst: "b-state.dat", name: "state.dat", importance: "required"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeDelivered, wantExit: 0,
+		},
+		{
+			name:  "keeps an extension-named sibling, longer name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state.dat", name: "state.dat", importance: "required"},
+				{inst: "b-state", name: "state", importance: "required"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeDelivered, wantExit: 0,
+		},
+		{
+			name:  "keeps a changed-ext overlap, name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state", name: "state", importance: "required", ext: ".dat.old"},
+				{inst: "b-state.dat", name: "state.dat", importance: "required", ext: ".new"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeDelivered, wantExit: 0,
+		},
+		{
+			name:  "keeps a changed-ext overlap, longer name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state.dat", name: "state.dat", importance: "required", ext: ".new"},
+				{inst: "b-state", name: "state", importance: "required", ext: ".dat.old"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeDelivered, wantExit: 0,
+		},
+		{
+			name:  "refuses a colliding file, name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state", name: "state", importance: "required", ext: ".dat.old"},
+				{inst: "b-state.dat", name: "state.dat", importance: "required", ext: ".old"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"b-state.dat": "would replace state.dat.old"},
+		},
+		{
+			name:  "refuses a colliding file, longer name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state.dat", name: "state.dat", importance: "required", ext: ".old"},
+				{inst: "b-state", name: "state", importance: "required", ext: ".dat.old"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"b-state": "would replace state.dat.old"},
+		},
+		{
+			name:  "refuses a duplicate name after the owner failed its check",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-first", name: "state", importance: "required", prepare: func(_ *world, src *fakeSource) {
+					src.checkErr = errors.New("datastore vanished")
+				}},
+				{inst: "b-second", name: "state", importance: "required"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-first": "source check", "b-second": "already claimed"},
+		},
+		{
+			name:  "refuses a duplicate name with different extensions",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-first", name: "state", importance: "required", ext: ".dat"},
+				{inst: "b-second", name: "state", importance: "required", ext: ".old"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"b-second": "already claimed"},
+		},
+		{
+			name:  "refuses a duplicate name after the owner published",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-first", name: "state", importance: "required"},
+				{inst: "b-second", name: "state", importance: "required"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"b-second": "already claimed"},
+		},
+		{
+			name:  "refuses a failed owner's file, name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state", name: "state", importance: "required", ext: ".dat.old", prepare: func(_ *world, src *fakeSource) {
+					src.dumpErr = plugin.Permanent(errors.New("dump vanished"))
+				}},
+				{inst: "b-state.dat", name: "state.dat", importance: "required", ext: ".old"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-state": "dump vanished", "b-state.dat": "would replace state.dat.old"},
+			dumps:      map[string]int{"a-state": 1},
+		},
+		{
+			name:  "refuses a failed owner's file, longer name first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-state.dat", name: "state.dat", importance: "required", ext: ".old", prepare: func(_ *world, src *fakeSource) {
+					src.dumpErr = plugin.Permanent(errors.New("dump vanished"))
+				}},
+				{inst: "b-state", name: "state", importance: "required", ext: ".dat.old"},
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-state.dat": "dump vanished", "b-state": "would replace state.dat.old"},
+			dumps:      map[string]int{"a-state.dat": 1},
+		},
+		{
+			name:  "a source check failure leaves the sibling intact",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "required", prepare: func(_ *world, src *fakeSource) {
+					src.checkErr = errors.New("datastore vanished")
+				}},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "source check"},
+		},
+		{
+			name:  "a processor check failure leaves the sibling intact",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "required", pipeline: []string{"seal"}},
+				healthy("b-ok"),
+			},
+			prepareWorld: func(w *world) {
+				w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age", checkErr: errors.New("no key material")}
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "processor seal check"},
+		},
+		{
+			name:  "refuses a name that starts with a dot",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: ".hidden", importance: "required"},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "must be a plain file name"},
+		},
+		{
+			name:  "refuses a name with a separator",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad/name", importance: "required"},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "must be a plain file name"},
+		},
+		{
+			name:  "an enumeration failure leaves the sibling intact",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "required", prepare: func(_ *world, src *fakeSource) {
+					src.unitsErr = errors.New("cannot enumerate")
+				}},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "enumerating a-bad"},
+		},
+		{
+			name:  "a multi-unit refusal leaves the sibling intact",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "required", prepare: func(_ *world, src *fakeSource) {
+					src.units = []source.Unit{{Name: "one", Config: jsontext.Value(`{}`)}, {Name: "two", Config: jsontext.Value(`{}`)}}
+				}},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "stage does not expand a multi-unit source"},
+		},
+		{
+			name:  "a describe failure leaves the sibling intact",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "required", prepare: func(_ *world, src *fakeSource) {
+					src.describeErr = errors.New("describe boom")
+				}},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "describe"},
+		},
+		{
+			name:  "a dump failure leaves the sibling intact",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "required", prepare: func(_ *world, src *fakeSource) {
+					src.dumpErr = plugin.Permanent(errors.New("dump vanished"))
+				}},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "dump vanished"},
+			dumps:      map[string]int{"a-bad": 1},
+		},
+		{
+			name:  "a best-effort guard failure degrades",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: "bad", importance: "best_effort", prepare: func(_ *world, src *fakeSource) {
+					src.checkErr = errors.New("datastore vanished")
+				}},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeDegraded, wantExit: 5,
+			wantFailed: map[string]string{"a-bad": "source check"},
+		},
+		{
+			name:  "reports a filesystem error that is not absence",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "a-bad", name: strings.Repeat("x", 300), importance: "required"},
+				healthy("b-ok"),
+			},
+			degraded: 5, failed: 9, wantOutcome: model.OutcomeFailed, wantExit: 9,
+			wantFailed: map[string]string{"a-bad": "file name too long"},
+		},
+		{
+			name:  "an invalid name claims no record alias, bad first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "aa-bad", name: "x/../.chain-ok", importance: "best_effort"},
+				{inst: "bb-good", name: "ok", importance: "required"},
+			},
+			degraded: 0, failed: 9, wantOutcome: model.OutcomeDegraded, wantExit: 0,
+			wantFailed: map[string]string{"aa-bad": "must be a plain file name"},
+		},
+		{
+			name:  "an invalid name claims no record alias, good first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "aa-good", name: "ok", importance: "required"},
+				{inst: "bb-bad", name: "x/../.chain-ok", importance: "best_effort"},
+			},
+			degraded: 0, failed: 9, wantOutcome: model.OutcomeDegraded, wantExit: 0,
+			wantFailed: map[string]string{"bb-bad": "must be a plain file name"},
+		},
+		{
+			name:  "an invalid name claims no file alias, bad first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "aa-bad", name: "x/../ok.dat", importance: "best_effort"},
+				{inst: "bb-good", name: "ok", importance: "required", ext: ".dat.json"},
+			},
+			degraded: 0, failed: 9, wantOutcome: model.OutcomeDegraded, wantExit: 0,
+			wantFailed: map[string]string{"aa-bad": "must be a plain file name"},
+		},
+		{
+			name:  "an invalid name claims no file alias, good first",
+			setup: func(t *testing.T) string { return t.TempDir() },
+			artifacts: []stageArtifact{
+				{inst: "aa-good", name: "ok", importance: "required", ext: ".dat.json"},
+				{inst: "bb-bad", name: "x/../ok.dat", importance: "best_effort"},
+			},
+			degraded: 0, failed: 9, wantOutcome: model.OutcomeDegraded, wantExit: 0,
+			wantFailed: map[string]string{"bb-bad": "must be a plain file name"},
+		},
 	}
-	if rep.Outcome != model.OutcomeFailed || rep.ExitCode != 9 {
-		t.Fatalf("second night: %+v", rep)
-	}
-	if names, err := readDirNames(dir); err != nil || len(names) != 0 {
-		t.Fatalf("a failed stage left %v (%v); the run would upload them as tonight's", names, err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorld(t)
+			if tc.prepareWorld != nil {
+				tc.prepareWorld(w)
+			}
+			sources := map[string]any{}
+			specs := append([]stageArtifact(nil), tc.artifacts...)
+			for _, a := range specs {
+				src := &fakeSource{data: []byte("bytes of " + a.inst)}
+				if a.ext != "" {
+					src.traits.Ext = a.ext
+				}
+				w.sources[a.inst] = src
+				sources[a.inst] = sourceInstance("fake", "control-plane", a.name, a.pipeline, a.importance, "plain")
+			}
+			for _, a := range specs {
+				if a.prepare != nil {
+					a.prepare(w, w.sources[a.inst])
+				}
+			}
+			// The engine stages sorted instance names.
+			sort.Slice(specs, func(i, j int) bool { return specs[i].inst < specs[j].inst })
+			dir := tc.setup(t)
+			before := snapshotTree(t, dir)
+			cfg := map[string]any{
+				"version": 1, "layout": configLayout(),
+				"stage":      map[string]any{"dir": dir, "degraded_exit_code": tc.degraded, "failed_exit_code": tc.failed, "sources": sources},
+				"processors": map[string]any{"seal": instance("fake")},
+			}
+			rep, err := w.newEngine(t, cfg).Stage(context.Background(), StageRequest{})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("stage = %v, want a refusal naming %q", err, tc.wantErr)
+				}
+				for _, a := range specs {
+					if n := w.sources[a.inst].checkCount(); n != 0 {
+						t.Fatalf("%s was checked %d times before the refusal", a.inst, n)
+					}
+					if n := w.sources[a.inst].dumpCount(); n != 0 {
+						t.Fatalf("%s was dumped %d times before the refusal", a.inst, n)
+					}
+				}
+				if tc.check != nil {
+					tc.check(t, dir)
+				} else if after := snapshotTree(t, dir); !maps.Equal(before, after) {
+					t.Fatalf("the refusal changed the directory: before %v, after %v", before, after)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("stage: %v", err)
+			}
+			if rep.Outcome != tc.wantOutcome || rep.ExitCode != tc.wantExit {
+				t.Fatalf("outcome %q exit %d, want %q/%d (artifacts %+v)", rep.Outcome, rep.ExitCode, tc.wantOutcome, tc.wantExit, rep.Artifacts)
+			}
+			if len(rep.Artifacts) != len(specs) {
+				t.Fatalf("report holds %d artifacts, want %d", len(rep.Artifacts), len(specs))
+			}
+			var want []string
+			for i, a := range specs {
+				got := rep.Artifacts[i]
+				if wantErr, failed := tc.wantFailed[a.inst]; failed {
+					if got.Outcome != model.ArtifactFailed || !strings.Contains(got.Error, wantErr) {
+						t.Fatalf("%s: outcome %q error %q, want failed naming %q", a.inst, got.Outcome, got.Error, wantErr)
+					}
+					if n := w.sources[a.inst].dumpCount(); n != tc.dumps[a.inst] {
+						t.Fatalf("%s was dumped %d times, want %d", a.inst, n, tc.dumps[a.inst])
+					}
+					continue
+				}
+				if got.Outcome != model.ArtifactOK {
+					t.Fatalf("%s: outcome %q error %q, want ok", a.inst, got.Outcome, got.Error)
+				}
+				ext := a.ext
+				if ext == "" {
+					ext = ".dat"
+				}
+				for range a.pipeline {
+					ext += ".age"
+				}
+				rec, err := source.ReadStagedRecord(dir, a.name)
+				if err != nil {
+					t.Fatalf("%s: no record: %v", a.inst, err)
+				}
+				if rec.Ext != ext {
+					t.Fatalf("%s: record ext %q, want %q", a.inst, rec.Ext, ext)
+				}
+				body, err := os.ReadFile(filepath.Join(dir, a.name+ext))
+				if err != nil {
+					t.Fatalf("%s: no artifact: %v", a.inst, err)
+				}
+				if string(body) != "bytes of "+a.inst {
+					t.Fatalf("%s: artifact holds %q, another artifact's bytes", a.inst, body)
+				}
+				want = append(want, a.name+ext, filepath.Base(source.StagedChainFile(dir, a.name)))
+				if n := w.sources[a.inst].dumpCount(); n != 1 {
+					t.Fatalf("%s was dumped %d times, want 1", a.inst, n)
+				}
+			}
+			names, err := readDirNames(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sort.Strings(names)
+			sort.Strings(want)
+			if strings.Join(names, ",") != strings.Join(want, ",") {
+				t.Fatalf("stage dir holds %v, want exactly %v", names, want)
+			}
+		})
 	}
 }
 
-// TestStageKeepsTheArtifactsOfPrefixNamedSources: clearing what a previous run
-// left for one artifact must never reach another whose name merely starts with
-// it — "k3s" against "k3s-state" and against "k3s.v2". The instances are named
-// so the prefix artifact is produced last: with a bare name prefix as the
-// pattern, its clear would delete the artifacts and records this same run had
-// just published for its neighbours.
-func TestStageKeepsTheArtifactsOfPrefixNamedSources(t *testing.T) {
-	w := newWorld(t)
-	dir := t.TempDir()
-	cfg := map[string]any{
-		"version": 1,
-		"layout":  configLayout(),
-		"stage": map[string]any{"dir": dir, "degraded_exit_code": 5, "failed_exit_code": 9,
-			"sources": map[string]any{
-				"aa": sourceInstance("fake", "control-plane", "k3s-state", []string{}, "required", "plain"),
-				"bb": sourceInstance("fake", "control-plane", "k3s.v2", []string{}, "required", "plain"),
-				"cc": sourceInstance("fake", "control-plane", "k3s", []string{}, "required", "plain"),
-			}},
-		"processors": map[string]any{},
-	}
-	e := w.newEngine(t, cfg)
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil || rep.Outcome != model.OutcomeDelivered {
-		t.Fatalf("stage: %+v, %v", rep, err)
-	}
-	for _, want := range []string{
-		"k3s-state.dat", ".chain-k3s-state.json",
-		"k3s.v2.dat", ".chain-k3s.v2.json",
-		"k3s.dat", ".chain-k3s.json",
-	} {
-		if _, err := os.Stat(filepath.Join(dir, want)); err != nil {
-			names, _ := readDirNames(dir)
-			t.Fatalf("%s is missing after the stage (%v): a neighbouring artifact's clear took it", want, names)
+// snapshotTree maps every entry under dir to its bytes, a directory to "dir",
+// and returns nil when dir cannot be walked.
+func snapshotTree(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			out[rel] = "dir"
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out[rel] = string(body)
+		return nil
+	})
+	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// TestStageRefusesAnExtThatLeavesTheDir: an extension reaches the writer from a
+// processor's traits. A separator or a parent step in it must be refused before
+// the writer joins it, so no trait can steer a write outside stage.dir. (The
+// reader refuses the same shape in a record; the staged package proves it.)
+func TestStageRefusesAnExtThatLeavesTheDir(t *testing.T) {
+	w := newWorld(t)
+	w.processors["seal"] = &fakeProcessor{seals: true, ext: "/../../evil"}
+	w.sources["snapshot"] = &fakeSource{data: []byte("bytes")}
+	dir := t.TempDir()
+	evil := filepath.Join(filepath.Dir(dir), "evil")
+	e := w.newEngine(t, stageConfig(t, dir))
+	rep, err := e.Stage(context.Background(), StageRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(evil); statErr == nil {
+		t.Fatalf("the writer reached outside the stage dir: %s", evil)
+	}
+	if len(rep.Artifacts) != 1 || !strings.Contains(rep.Artifacts[0].Error, "ext") {
+		t.Fatalf("artifacts %+v, want the refusal of the trait's ext", rep.Artifacts)
 	}
 }
 
@@ -280,39 +854,6 @@ func TestStageRetriesATransientDumpFailure(t *testing.T) {
 	}
 }
 
-// TestStageRefusesAMultiUnitSource: a stage writes one sealed file per artifact
-// and the run side reads it back by that one name. An instance whose domain
-// holds several artifacts has no such name, and staging only the first of them
-// would stage a fraction of the data under a name that reads as all of it.
-func TestStageRefusesAMultiUnitSource(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age"}
-	src := &fakeSource{data: []byte("parent"), units: []source.Unit{
-		{Name: "one", Config: jsontext.Value(`{}`)},
-		{Name: "two", Config: jsontext.Value(`{}`)},
-	}}
-	w.extraSources["snapshot"] = src
-	dir := t.TempDir()
-
-	e := w.newEngine(t, stageConfig(t, dir))
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Outcome != model.OutcomeFailed || rep.ExitCode != 9 {
-		t.Fatalf("report %+v", rep)
-	}
-	if len(rep.Artifacts) != 1 || !strings.Contains(rep.Artifacts[0].Error, "stage does not expand a multi-unit source") {
-		t.Fatalf("artifacts %+v", rep.Artifacts)
-	}
-	if src.dumpCount() != 0 {
-		t.Fatal("a multi-unit source was staged anyway")
-	}
-	if names, err := readDirNames(dir); err != nil || len(names) != 0 {
-		t.Fatalf("the stage directory holds %v, %v", names, err)
-	}
-}
-
 func registerStageProcessor(t *testing.T, w *world, typ string, mk func() processor.Processor) {
 	t.Helper()
 	err := plugin.Register(w.registry, processor.Kind, plugin.Spec[map[string]jsontext.Value, processor.Processor]{
@@ -379,181 +920,6 @@ func TestStageRefusesAMissingBinary(t *testing.T) {
 	}
 }
 
-// TestStageBestEffortFailureDegrades: a best-effort artifact whose stage
-// failed degrades the stage — the configured degraded exit code, not the failed
-// one — while the required case is proven by TestStageClearsWhatAPreviousStageLeft.
-func TestStageBestEffortFailureDegrades(t *testing.T) {
-	w := newWorld(t)
-	src := &fakeSource{data: []byte("bytes"), dumpErr: plugin.Permanent(errors.New("dump vanished"))}
-	w.extraSources["snapshot"] = src
-	dir := t.TempDir()
-	cfg := map[string]any{
-		"version": 1, "layout": configLayout(),
-		"stage": map[string]any{"dir": dir, "degraded_exit_code": 5, "failed_exit_code": 9,
-			"sources": map[string]any{"snapshot": sourceInstance("fake", "g", "n", []string{}, "best_effort", "plain")}},
-		"processors": map[string]any{},
-	}
-	e := w.newEngine(t, cfg)
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Outcome != model.OutcomeDegraded || rep.ExitCode != 5 {
-		t.Fatalf("a best-effort stage failure = outcome %q exit %d, want degraded and 5", rep.Outcome, rep.ExitCode)
-	}
-	if len(rep.Artifacts) != 1 || rep.Artifacts[0].Outcome != model.ArtifactFailed {
-		t.Fatalf("artifacts %+v", rep.Artifacts)
-	}
-}
-
-// TestStageOneProcessorCheckFails: a processor that failed its own Check
-// fails every artifact routed through it, before any byte is produced.
-func TestStageOneProcessorCheckFails(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{checkErr: errors.New("no key material")}
-	src := &fakeSource{data: []byte("bytes")}
-	w.sources["snapshot"] = src
-	dir := t.TempDir()
-	cfg := map[string]any{
-		"version": 1, "layout": configLayout(),
-		"stage": map[string]any{"dir": dir, "degraded_exit_code": 3, "failed_exit_code": 7,
-			"sources": map[string]any{"snapshot": sourceInstance("fake", "g", "n", []string{"seal"}, "required", "plain")}},
-		"processors": map[string]any{"seal": instance("fake")},
-	}
-	e := w.newEngine(t, cfg)
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Outcome != model.OutcomeFailed || len(rep.Artifacts) != 1 {
-		t.Fatalf("report %+v", rep)
-	}
-	if !strings.Contains(rep.Artifacts[0].Error, "processor seal check") {
-		t.Fatalf("artifact error %q, want the processor check failure", rep.Artifacts[0].Error)
-	}
-	if src.dumpCount() != 0 {
-		t.Fatal("bytes were produced for an artifact whose processor failed its check")
-	}
-}
-
-// TestStageOneRefusesANonPlainName: a stage writes one file per artifact and
-// the run side reads it back by that name, so a name carrying a separator or a
-// leading dot is refused.
-func TestStageOneRefusesANonPlainName(t *testing.T) {
-	for _, name := range []string{"bad/name", ".hidden"} {
-		t.Run(name, func(t *testing.T) {
-			w := newWorld(t)
-			src := &fakeSource{data: []byte("bytes")}
-			w.extraSources["snapshot"] = src
-			dir := t.TempDir()
-			cfg := map[string]any{
-				"version": 1, "layout": configLayout(),
-				"stage": map[string]any{"dir": dir, "degraded_exit_code": 3, "failed_exit_code": 7,
-					"sources": map[string]any{"snapshot": sourceInstance("fake", "g", name, []string{}, "required", "plain")}},
-				"processors": map[string]any{},
-			}
-			e := w.newEngine(t, cfg)
-			rep, err := e.Stage(context.Background(), StageRequest{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(rep.Artifacts) != 1 || !strings.Contains(rep.Artifacts[0].Error, "must be a plain file name") {
-				t.Fatalf("artifacts %+v, want the plain-name refusal", rep.Artifacts)
-			}
-			if src.dumpCount() != 0 {
-				t.Fatal("a source produced bytes for a refused artifact name")
-			}
-		})
-	}
-}
-
-// TestStageOneEnumerateError: an enumerating source whose Units fails is a
-// failed artifact of its own — a stage never expands a multi-unit source.
-func TestStageOneEnumerateError(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age"}
-	src := &fakeSource{data: []byte("bytes"), unitsErr: errors.New("cannot enumerate")}
-	w.extraSources["snapshot"] = src
-	dir := t.TempDir()
-	e := w.newEngine(t, stageConfig(t, dir))
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rep.Artifacts) != 1 || !strings.Contains(rep.Artifacts[0].Error, "enumerating snapshot") {
-		t.Fatalf("artifacts %+v, want the enumeration failure", rep.Artifacts)
-	}
-	if src.dumpCount() != 0 {
-		t.Fatal("a source that failed to enumerate was dumped anyway")
-	}
-}
-
-// TestStageOneDescribeError: a source whose Describe fails fails its artifact
-// before the dir is even created.
-func TestStageOneDescribeError(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age"}
-	src := &fakeSource{data: []byte("bytes"), describeErr: errors.New("describe boom")}
-	w.extraSources["snapshot"] = src
-	dir := t.TempDir()
-	e := w.newEngine(t, stageConfig(t, dir))
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rep.Artifacts) != 1 || !strings.Contains(rep.Artifacts[0].Error, "describe") {
-		t.Fatalf("artifacts %+v, want the describe failure", rep.Artifacts)
-	}
-	if src.dumpCount() != 0 {
-		t.Fatal("a source whose Describe failed was dumped")
-	}
-}
-
-// TestStageOneMkdirFails: a stage dir that cannot be created fails the
-// artifact before anything is written.
-func TestStageOneMkdirFails(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age"}
-	blocker := filepath.Join(t.TempDir(), "a-file")
-	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	dir := filepath.Join(blocker, "stage") // a path under a regular file
-	e := w.newEngine(t, stageConfig(t, dir))
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rep.Artifacts) != 1 || rep.Artifacts[0].Error == "" {
-		t.Fatalf("artifacts %+v, want a failed artifact for the uncreatable dir", rep.Artifacts)
-	}
-}
-
-// TestStageOneClearStagedFails: a chain record that cannot be read is a
-// permanent refusal — guessing the old file's name would be the collision the
-// whole staged-record contract exists to prevent.
-func TestStageOneClearStagedFails(t *testing.T) {
-	w := newWorld(t)
-	w.processors["seal"] = &fakeProcessor{seals: true, ext: ".age"}
-	src := &fakeSource{data: []byte("bytes")}
-	w.sources["snapshot"] = src
-	dir := t.TempDir()
-	if err := os.WriteFile(source.StagedChainFile(dir, "k3s-state"), []byte("not json"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	e := w.newEngine(t, stageConfig(t, dir))
-	rep, err := e.Stage(context.Background(), StageRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rep.Artifacts) != 1 || !strings.Contains(rep.Artifacts[0].Error, "staged chain record") {
-		t.Fatalf("artifacts %+v, want the unreadable-record refusal", rep.Artifacts)
-	}
-	if src.dumpCount() != 0 {
-		t.Fatal("a source was dumped for an artifact whose old record could not be read")
-	}
-}
-
 // TestWriteStagedRecordRefusesABadExt: a record that cannot be encoded (an
 // invalid-UTF-8 extension) is a permanent failure and writes no file.
 func TestWriteStagedRecordRefusesABadExt(t *testing.T) {
@@ -611,55 +977,6 @@ func TestPublishFileFailurePaths(t *testing.T) {
 		return err
 	}); err == nil {
 		t.Fatal("publishFile accepted a Rename failure")
-	}
-}
-
-// TestClearStagedAndRemoveIfPresent drives the removal failures the stage's
-// clear exists for: a non-empty directory where an artifact or the record must
-// go is a real error, never a silent skip.
-func TestClearStagedAndRemoveIfPresent(t *testing.T) {
-	// The old record names an artifact that is a non-empty directory.
-	dir1 := t.TempDir()
-	old := source.StagedRecord{Ext: ".old"}
-	if err := os.WriteFile(source.StagedChainFile(dir1, "n"), mustMarshal(t, old), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir1, "n.old"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir1, "n.old", "x"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := clearStaged(dir1, "n", source.StagedRecord{}); err == nil {
-		t.Fatal("clearStaged ignored an old artifact it could not remove")
-	}
-
-	// No record; the new artifact's own name is a non-empty directory.
-	dir2 := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir2, "n.new"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir2, "n.new", "x"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := clearStaged(dir2, "n", source.StagedRecord{Ext: ".new"}); err == nil {
-		t.Fatal("clearStaged ignored a new artifact it could not remove")
-	}
-
-	// removeIfPresent itself: a non-empty directory is a transient failure, a
-	// missing path is done.
-	dir3 := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir3, "full"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir3, "full", "x"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := removeIfPresent(filepath.Join(dir3, "full")); err == nil {
-		t.Fatal("removeIfPresent ignored a non-empty directory")
-	}
-	if err := removeIfPresent(filepath.Join(dir3, "gone")); err != nil {
-		t.Fatalf("removeIfPresent on a missing path = %v, want nil", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package webhook_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -195,9 +196,11 @@ func TestMaxResponseBytesTakesAUnit(t *testing.T) {
 }
 
 // TestUnsubscribedEventIsSkipped settles the question the brief left open: an
-// event absent from `events` is "not subscribed" and returns success without a
-// request, because a notifier is handed every engine event and refusing the
-// ones it was never told about would fail runs for no reason.
+// event absent from `events` is "not subscribed" — it returns notifier.ErrSkipped
+// without a request, because a notifier is handed every engine event and
+// refusing the ones it was never told about would fail runs for no reason. The
+// sentinel keeps the skip neutral: it is not a delivery the engine could mistake
+// for one that reached a receiver.
 func TestUnsubscribedEventIsSkipped(t *testing.T) {
 	var requests int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -209,8 +212,9 @@ func TestUnsubscribedEventIsSkipped(t *testing.T) {
 
 	ev := notifiertest.Event()
 	ev.Name = "run_started"
-	if err := n.Notify(context.Background(), ev); err != nil {
-		t.Fatalf("an unsubscribed event returned %v, want nil", err)
+	err := n.Notify(context.Background(), ev)
+	if !errors.Is(err, notifier.ErrSkipped) {
+		t.Fatalf("an unsubscribed event returned %v, want notifier.ErrSkipped", err)
 	}
 	if requests != 0 {
 		t.Errorf("an unsubscribed event made %d requests, want 0", requests)

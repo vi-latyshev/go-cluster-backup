@@ -61,6 +61,19 @@ reference is resolved, never read — so it needs no secret mount. When it fails
 the install or upgrade aborts, and with Flux's `upgrade.remediation.strategy:
 rollback` the previous release stays in place.
 
+### Upgrading: the image and the configuration move together
+
+The tool reads the configuration with a strict decoder: any member the running
+image does not know, or any field it demands and the document lacks, is an error
+at startup, before a single plugin is built — and that run produces no backup.
+When `values.config` and the image tag are updated by different paths (a values
+change merged now, an image automation or a manual `image.tag` bump later), a
+pod can run the previous image against the new document and fail instantly.
+Update both together, or pin `image.tag` and confirm it matches the release
+before the first scheduled run. The pre-upgrade hook proves only that the new
+document suits the image the hook itself ran; it cannot see a pod that still
+carries an older tag.
+
 ## Example values and manifests
 
 - `examples/values/minimal.yaml` with `examples/config/minimal.yaml`
@@ -145,7 +158,7 @@ kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <nam
 | restore.volumeMounts | list | `[]` | VolumeMounts only the restore container mounts, on top of the shared ones. Pair them with `restore.volumes`. |
 | writer.volumes | list | `[]` | Volumes only the writer pods declare, on top of the shared ones. A node hostPath holding node state or secrets — the k3s datastore, a VPN database — belongs here, never in `extraVolumes`, which reaches the restore and hook pods too. |
 | writer.volumeMounts | list | `[]` | VolumeMounts only the writer container mounts, on top of the shared ones. Pair them with `writer.volumes`; the restore container never sees them. |
-| stage.enabled | bool | `false` | Render the `stage` initContainer on the writer pod. |
+| stage.enabled | bool | `false` | Render the `stage` initContainer on the writer pod. The config's `stage.dir` must be an emptyDir of this one pod — the chart's `spool`, or one declared in `writer.volumes` — never a hostPath or a PVC shared between pods. A stage publishes into an empty directory it owns and never deletes; it refuses a non-empty `stage.dir` (a retained pair makes it re-run against data a previous stage left). The writer lease is taken by `run`, after `stage`, so a shared directory also lets another pod's stage republish the pair between this pod's stage and its run. |
 | stage.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsGroup":0,"runAsNonRoot":false,"runAsUser":0}` | securityContext of the stage initContainer. It reads host paths owned by root, so it defaults to root without capabilities. |
 | stage.resources | object | `{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"50m","memory":"128Mi"}}` | Resources of the stage initContainer. |
 | stage.volumeMounts | list | `[]` | Extra volumeMounts of the stage initContainer, on top of the shared ones. Pair them with writer.volumes, which the stage container's pod declares. |

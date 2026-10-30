@@ -110,9 +110,12 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 
 // RecordedChain reports the processor chain the stage ran, from the record it
 // left beside the artifact: this source's bytes are that chain's output, so the
-// run records it as the artifact's chain and a restore reverses exactly it. A
-// missing record is a permanent error, never an empty chain — bytes whose
-// encoding nobody recorded are bytes nobody can prove are sealed.
+// run records it as the artifact's chain and a restore reverses exactly it. It
+// reads only the record — a lone valid record (a publish that failed after its
+// record went in) yields its chain here, while the methods that return the file
+// refuse that state — and a missing record is a permanent error, never an empty
+// chain: bytes whose encoding nobody recorded are bytes nobody can prove are
+// sealed.
 func (s *Source) RecordedChain(ctx context.Context) ([]model.ProcessorStep, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -146,7 +149,10 @@ func (s *Source) artifact() (string, source.StagedRecord, error) {
 	if err != nil {
 		return "", source.StagedRecord{}, err
 	}
-	name := source.StagedArtifactName(s.cfg.Name, rec)
+	name, err := source.StagedArtifactName(s.cfg.Name, rec)
+	if err != nil {
+		return "", source.StagedRecord{}, plugin.Permanent(err)
+	}
 	path := filepath.Join(s.cfg.Dir, name)
 	info, err := os.Stat(path)
 	if err != nil {

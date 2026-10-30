@@ -51,6 +51,21 @@ processor chain is recorded in the manifest; `--raw` writes them as stored. A
 decoded `secret` artifact goes to a file only with `--plaintext-to-file` — prefer
 `--out -` and a pipe.
 
+Everything a fetch can refuse without the object — the run, the name, the
+storage, the plaintext rule — is settled before a byte moves. The request is
+resolved first and the plan printed (run, artifact, sensitivity, stored and raw
+sizes, and every storage of the walk with whether it holds a copy) before a
+transfer that may take minutes starts; a refused request downloads nothing and
+writes nothing. A file destination is written as `<out>.partial`, mode 0600
+whether or not the artifact is labelled secret, since a dump is as sensitive as
+one, and renamed only after the bytes matched the manifest's size and sha256 — a
+failure never leaves a half-written file at `<out>`. A name the selected run
+does not hold is refused with the names it does hold; when the artifact failed
+in that run, the refusal names the nearest run where it is `ok`. A run with no
+manifest is not fetchable by artifact at all: only `--storage NAME --key KEY`
+reads its objects, as stored and explicitly unverified. An unreadable storage
+does not stop the walk — see [Unreachable storage](#unreachable-storage).
+
 Manual unpacking applies to stored bytes (`--raw`, or `--storage … --key …`); the
 `.zst`/`.age` members are single streams:
 
@@ -66,6 +81,18 @@ A post-rollout check without restoring anything:
 go-cluster-backup restore verify --config backup.yaml \
   --run <run-id> --artifact app/postgres --depth probed --target discovered
 ```
+
+| Depth | Proves | Needs |
+|---|---|---|
+| `stored` | a storage — the first in `restore.storage_order` that holds the object — has it at the size the manifest records; the sha256 is compared only where that storage's `Stat` exposes one | storage credentials |
+| `decoded` | the processor chain the manifest records reverses | the `age` identity for a sealed artifact |
+| `probed` | the named source's `Prober` reads the artifact — `pg_restore` walks the archive without a server | `--target NAME`, or `discovered` |
+
+Every depth resolves `newest-ok` itself, prints the run id it checked and the
+storage that served the copy, and exits 1 on a failed verification; a name the
+selected run does not hold is a command error, while a verification that ran
+and failed keeps its own row. `stored` proves one readable copy, so use
+`decoded` or `probed` when the bytes themselves are in question.
 
 ## One Postgres database
 
@@ -92,7 +119,15 @@ replaces the database in one transaction (`pg_restore --clean --if-exists
 --single-transaction`) and demands `--mode in-place` **and** `--confirm` equal to
 the target's origin verbatim (the origin is in the manifest; `restore list
 --output json` shows it). Prefer side-by-side. In-place requires `jobs: 1` — the
-tool refuses it otherwise before anything runs.
+refusal is in the postgres restorer, after the artifact was fetched and verified
+and before `pg_restore` runs.
+
+**A dump carries one database, not the cluster.** `pg_dump` runs per database:
+the dump holds that database's schema and data, and the object owners and
+grants it references, but no roles, role memberships or other cluster globals
+(`pg_dumpall` territory). A restore reproduces the database only, and every role
+an object names must already exist on the target server; a role created by hand
+on the source and never recreated by bootstrap is not in the backup.
 
 ## PVC file tree
 
@@ -151,18 +186,30 @@ etcd is not covered.
 
 ## Unreachable storage
 
-`restore list` walks `restore.storage_order`. A storage that cannot be read is
-reported on its own line and the walk continues, so a fetch can still be served
-from another storage. If **no** storage holds the object, the answer names the
-newest run a storage *can* read and what that run holds — never a bare "not
-found". Narrow the walk with `--storage NAME` (repeatable).
+`restore list` is all-or-nothing: it surveys every storage in
+`restore.storage_order`, and one that cannot be read fails the command, naming
+that storage. Narrow it with `--storage NAME` (repeatable) to list the ones that
+answer.
+
+`restore fetch` and `restore verify` walk the same order storage by storage, so
+an unreadable one costs only its own turn and a copy is still served from
+another — the report names the storage that served it. A name the selected run
+does not hold is refused with what that run holds; when `newest-ok` finds no run
+holding it at all, the answer names the newest run with a manifest that a
+readable storage holds, and what that run holds, so it is never a bare "not
+found" while some storage answers.
 
 ## Incomplete or failed run
 
 - **Incomplete** (`manifest=no`): the run started and never wrote a manifest.
-  Its objects exist but nothing describes them, so retention never judges them
-  and a restore cannot resolve an artifact from them. They are swept by a later
-  run on the same storage.
+  Its objects exist but nothing describes them, so a restore cannot resolve an
+  artifact from them. Retention does judge them: both `keep_last` and `gfs`
+  count a run without a verified manifest under `count_incomplete` when it is
+  `true`, and with it `false` keep such runs in addition, outside the tiers. A
+  scheduled run's cap eviction takes an inactive incomplete run first, and
+  retention never deletes another run's incomplete objects younger than
+  `run.deadline + run.finish_allowance` — the bound after which its writer
+  cannot be alive.
 - **Failed**: the manifest exists with `outcome: failed`. A failed artifact has
   no verified copy, so `--run newest-ok` skips it and finds the newest run where
   the artifact is `ok`. `--run <id>` on a failed run still fetches the copy it
@@ -172,3 +219,9 @@ When a night fails before the tool even starts (a rejected init container, an
 `ImagePullBackOff`, a deadline, an OOMKill), there is no run to list at all: the
 next run's notification reports that failure from the cluster, via
 `.Run.Previous.Failure`.
+
+The tool reports its own runs and nothing else: there is no heartbeat and no
+periodic self-check. Its reports are the `run_started` and `run_finished`
+notifications and the catalog entry of a run that got as far as reading the
+catalog; a run that never wrote an entry surfaces in the next run's
+previous-run line. Watching the Job itself is the deployment's to add.

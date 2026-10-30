@@ -628,7 +628,8 @@ func (d *fakeDiscovery) RuleSources(ctx context.Context) ([]discovery.RuleSource
 type fakeNotifier struct {
 	mu       sync.Mutex
 	events   []model.Event
-	fails    int // fail this many calls, then succeed
+	fails    int    // fail this many calls, then succeed
+	failOn   string // fail every call for this event name, whatever fails says
 	checkErr error
 }
 
@@ -639,6 +640,9 @@ func (n *fakeNotifier) Notify(ctx context.Context, ev model.Event) error {
 	defer n.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if n.failOn == ev.Name {
+		return errors.New("test notifier failure")
 	}
 	if n.fails > 0 {
 		n.fails--
@@ -666,6 +670,18 @@ func (n *fakeNotifier) last() (model.Event, bool) {
 		return model.Event{}, false
 	}
 	return n.events[len(n.events)-1], true
+}
+
+// finished returns the finished event the notifier delivered, if any.
+func (n *fakeNotifier) finished() (model.Event, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, e := range n.events {
+		if e.Name == model.EventFinished {
+			return e, true
+		}
+	}
+	return model.Event{}, false
 }
 
 type fakeCatalog struct {

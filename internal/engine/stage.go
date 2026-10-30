@@ -24,10 +24,14 @@ import (
 
 // Stage runs the sources of the stage section and leaves their sealed artifacts
 // in stage.dir, one file per artifact named <artifact name><ext>. That name is
-// the contract the run-side staged source reads back: it looks for the file
-// named <name> or <name>.<ext> in the same directory — never a file whose name
-// merely starts with this one. A stage report carries no run id: the file name
-// is the identity, and the stage section has no run section to read one from.
+// the contract the run-side staged source reads back: the reader opens exactly
+// <name><ext> from the record — never a file whose name merely starts with this
+// one. A stage publishes into an empty directory it owns and never deletes:
+// stage.dir must hold no entry when the stage starts, and a directory that holds
+// one (a previous stage's pair, a stale temp, anything) is refused before any
+// source runs. A stage re-run on data a pod retained is refused, fail-closed, by
+// design. A stage report carries no run id: the file name is the identity, and
+// the stage section has no run section to read one from.
 func (e *Engine) Stage(ctx context.Context, req StageRequest) (model.RunReport, error) {
 	cfg := e.cfg
 	if cfg.Stage == nil || cfg.Stage.Dir == "" {
@@ -41,17 +45,22 @@ func (e *Engine) Stage(ctx context.Context, req StageRequest) (model.RunReport, 
 	if errs := e.binaryErrors(scopeStage); len(errs) > 0 {
 		return model.RunReport{}, fmt.Errorf("preflight: %w", errors.Join(errs...))
 	}
+	dir := cfg.Stage.Dir
+	if err := emptyStageDir(dir); err != nil {
+		return model.RunReport{}, err
+	}
+	reserved := newStageReservations(dir, e.stageSources)
 	checks := e.scopedChecks(ctx, e.checkPolicy(), scopeStage)
 	started := time.Now().UTC()
 	rep := model.RunReport{Schema: model.ManifestSchema, StartedAt: started, Outcome: model.OutcomeRunning}
-	e.event(human.New("stage.start", human.Text("config", req.ConfigPath), human.Text("dir", cfg.Stage.Dir)))
+	e.event(human.New("stage.start", human.Text("config", req.ConfigPath), human.Text("dir", dir)))
 
 	outcome := model.OutcomeDelivered
 	for _, sb := range e.stageSources {
 		e.event(human.New("artifact.start",
 			human.Text("artifact", human.ArtifactLabel(sb.artifact.Group, sb.artifact.Name)),
 			human.Text("importance", string(sb.artifact.Importance))))
-		ar := e.stageOne(ctx, sb, checks)
+		ar := e.stageOne(ctx, sb, checks, reserved)
 		if ar.Outcome != model.ArtifactOK {
 			if ar.Artifact.Importance == model.ImportanceRequired {
 				outcome = model.OutcomeFailed
@@ -72,13 +81,104 @@ func (e *Engine) Stage(ctx context.Context, req StageRequest) (model.RunReport, 
 	return rep, nil
 }
 
+// emptyStageDir refuses a stage.dir that holds anything: a stage never deletes,
+// so a pair a previous stage left would read exactly like this one's and the run
+// would upload yesterday's bytes as tonight's. The ReadDir error and the
+// non-empty case fold into one refusal so every start state is one message.
+func emptyStageDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("stage: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err == nil && len(entries) > 0 {
+		err = fmt.Errorf("it holds %s", entries[0].Name())
+	}
+	if err != nil {
+		return fmt.Errorf("stage: stage.dir %s must be an empty directory this pod owns when a stage starts — a stage never deletes, and a pair a previous stage left would read exactly like this one's: %w", dir, err)
+	}
+	return nil
+}
+
+// stageReservations is what this stage invocation has claimed in its empty
+// directory. Every artifact's chain record is claimed up front — it depends on
+// the artifact name alone — and an artifact's file path the moment it is known,
+// whether or not that artifact later publishes. A later artifact that would take
+// either fails before it produces bytes, so one artifact's file can never answer
+// another's record: not after a failed check, and not after a failed publish.
+type stageReservations struct {
+	owners map[string]string // path -> the instance that claimed it
+}
+
+func newStageReservations(dir string, sources []sourceBinding) *stageReservations {
+	r := &stageReservations{owners: make(map[string]string, len(sources))}
+	for _, sb := range sources {
+		// A name the plain-name guard rejects claims nothing: deriving a path
+		// from it could alias a healthy sibling's record or file.
+		if !plainStageName(sb.artifact.Name) {
+			continue
+		}
+		path := source.StagedChainFile(dir, sb.artifact.Name)
+		if _, claimed := r.owners[path]; !claimed {
+			r.owners[path] = sb.name
+		}
+	}
+	return r
+}
+
+// plainStageName reports whether an artifact name can name a file in the stage
+// directory: no separator and no leading dot. The artifact guard and the
+// reservation pass share it, so a rejected name grants no ownership.
+func plainStageName(name string) bool {
+	return !strings.Contains(name, "/") && !strings.HasPrefix(name, ".")
+}
+
+// claimRecord refuses an artifact whose chain record another artifact of this
+// stage already claimed, whatever became of that artifact.
+func (r *stageReservations) claimRecord(dir, name, instance string) error {
+	if owner, claimed := r.owners[source.StagedChainFile(dir, name)]; claimed && owner != instance {
+		return fmt.Errorf("stage artifact %s: its chain record is already claimed by %s, another artifact of this stage", name, owner)
+	}
+	return nil
+}
+
+// claimFile refuses a file path another artifact of this stage claimed, and
+// claims the path for this artifact whether or not it goes on to publish. The
+// directory started empty (emptyStageDir), so anything present at a path this
+// stage wrote is owned by the reservation above; Lstat is here for a filesystem
+// error that is not absence, which is the real error and never a collision.
+func (r *stageReservations) claimFile(path, name, instance string) error {
+	if owner, claimed := r.owners[path]; claimed && owner != instance {
+		return fmt.Errorf("stage artifact %s would replace %s, which another artifact of this stage published", name, filepath.Base(path))
+	}
+	if _, err := os.Lstat(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("stage artifact %s: %w", name, err)
+	}
+	r.owners[path] = instance
+	return nil
+}
+
 // stageOne stages one artifact. ar is a named result so the deferred duration
 // lands on the value the caller receives: `return ar` copies a struct, so a
 // closure over a local would set the duration on a copy the caller never sees.
-func (e *Engine) stageOne(ctx context.Context, sb sourceBinding, checks failedChecks) (ar model.ArtifactResult) {
+func (e *Engine) stageOne(ctx context.Context, sb sourceBinding, checks failedChecks, reserved *stageReservations) (ar model.ArtifactResult) {
 	ar = model.ArtifactResult{Artifact: sb.artifact, Pipeline: sb.pipeline, Outcome: model.ArtifactFailed}
 	start := time.Now()
 	defer func() { ar.Duration = model.Duration(time.Since(start)) }()
+	dir := e.cfg.Stage.Dir
+	// The name is refused before any path is derived from it: a name carrying a
+	// separator must never reach outside the stage directory.
+	if !plainStageName(sb.artifact.Name) {
+		ar.Error = fmt.Sprintf("stage artifact name %q must be a plain file name", sb.artifact.Name)
+		return ar
+	}
+	// The chain record is claimed before this artifact's check: another artifact
+	// of this stage that owns the name owns the identity, whatever became of it.
+	if err := reserved.claimRecord(dir, sb.artifact.Name, sb.name); err != nil {
+		ar.Error = err.Error()
+		e.event(human.Failure("artifact.failed",
+			human.Text("artifact", human.ArtifactLabel(sb.artifact.Group, sb.artifact.Name)), human.Text("reason", ar.Error)))
+		return ar
+	}
 	if err := checks.err(sb.checkKind, sb.name); err != nil {
 		ar.Error = fmt.Sprintf("source check: %v", err)
 		e.event(human.Failure("artifact.failed",
@@ -89,10 +189,6 @@ func (e *Engine) stageOne(ctx context.Context, sb sourceBinding, checks failedCh
 		ar.Error = err.Error()
 		e.event(human.Failure("artifact.failed",
 			human.Text("artifact", human.ArtifactLabel(sb.artifact.Group, sb.artifact.Name)), human.Text("reason", ar.Error)))
-		return ar
-	}
-	if strings.Contains(sb.artifact.Name, "/") || strings.HasPrefix(sb.artifact.Name, ".") {
-		ar.Error = fmt.Sprintf("stage artifact name %q must be a plain file name", sb.artifact.Name)
 		return ar
 	}
 	// A stage writes one sealed file per artifact, and the run side reads it
@@ -126,26 +222,9 @@ func (e *Engine) stageOne(ctx context.Context, sb sourceBinding, checks failedCh
 	}
 	ar.Artifact = plan.artifact
 	e.sourceEvent(plan.srcType, plan.instance, human.New("source.dump.start", human.Text("origin", plan.source.Origin)))
-	dir := e.cfg.Stage.Dir
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		ar.Error = err.Error()
-		return ar
-	}
 	// The record carries the artifact's exact file name tail and the chain; from
 	// here on the file is named by it, never by a directory scan.
 	rec := source.StagedRecord{Ext: plan.artifact.Ext, Chain: plan.chain}
-	// What a previous stage left for this artifact goes before anything new is
-	// produced: a stage directory that survives the container would otherwise
-	// hand the run yesterday's artifact and record as tonight's after a stage
-	// that failed — the run cannot tell the two apart, and the mode-0644 file
-	// from last night reads exactly like one written now. With nothing left
-	// behind, a failed stage fails the run's staged source loudly.
-	if err := clearStaged(dir, sb.artifact.Name, rec); err != nil {
-		ar.Error = err.Error()
-		e.event(human.Failure("artifact.failed",
-			human.Text("artifact", human.ArtifactLabel(sb.artifact.Group, sb.artifact.Name)), human.Text("reason", ar.Error)))
-		return ar
-	}
 	// Every attempt publishes through its own temp file, so a half-written
 	// artifact is never visible to the run-side "staged" source, and a stage
 	// config that carries a retry policy gets that many attempts. The chain
@@ -155,10 +234,30 @@ func (e *Engine) stageOne(ctx context.Context, sb sourceBinding, checks failedCh
 	// without an artifact fails the staged source loudly ("no staged
 	// artifact"), while an artifact without a record would be bytes nobody can
 	// prove are sealed.
-	final := filepath.Join(dir, source.StagedArtifactName(sb.artifact.Name, rec))
+	// The ext the writer appends is the source's and every processor's trait
+	// joined: StagedArtifactName refuses one that would step out of the stage
+	// dir, so a hostile or broken trait fails here, before a byte is produced.
+	name, err := source.StagedArtifactName(sb.artifact.Name, rec)
+	if err != nil {
+		ar.Error = err.Error()
+		e.event(human.Failure("artifact.failed",
+			human.Text("artifact", human.ArtifactLabel(sb.artifact.Group, sb.artifact.Name)), human.Text("reason", ar.Error)))
+		return ar
+	}
+	final := filepath.Join(dir, name)
+	// The final name is claimed before a byte is produced, and stays claimed
+	// even if this artifact fails: the directory started empty, so anything at
+	// the path now is an earlier artifact of this stage, and a later artifact
+	// must not take a name this one owns whatever became of it.
+	if err := reserved.claimFile(final, sb.artifact.Name, sb.name); err != nil {
+		ar.Error = err.Error()
+		e.event(human.Failure("artifact.failed",
+			human.Text("artifact", human.ArtifactLabel(sb.artifact.Group, sb.artifact.Name)), human.Text("reason", ar.Error)))
+		return ar
+	}
 	var raw, bytes int64
 	var sum []byte
-	_, err := attempt(ctx, e.checkPolicy(), "stage "+sb.artifact.Name, func(ctx context.Context, _ int) (struct{}, error) {
+	_, err = attempt(ctx, e.checkPolicy(), "stage "+sb.artifact.Name, func(ctx context.Context, _ int) (struct{}, error) {
 		err := publishFile(dir, final, func(f *os.File) error {
 			hw := &hashWriter{w: f, h: sha256.New()}
 			gotRaw, cerr := e.dumpChain(ctx, plan, hw)
@@ -218,9 +317,9 @@ func writeStagedRecord(rec source.StagedRecord, path string) error {
 // publishFile writes one file into dir under its final name: a temp file inside
 // the same directory, the caller's write, mode 0644 — the deployment contract
 // for a file another container reads, whatever uid it runs as: the image's own
-// default is the unprivileged 1000, this cluster's CronJob runs both containers
-// as root — and an atomic rename, so a half-written file is never visible. The
-// temp file is removed on every failure path.
+// default is the unprivileged 1000, so the reader may run as another user — and
+// an atomic rename, so a half-written file is never visible. The temp file is
+// removed on every failure path.
 func publishFile(dir, final string, write func(*os.File) error) error {
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
@@ -242,36 +341,6 @@ func publishFile(dir, final string, write func(*os.File) error) error {
 	}
 	if err := os.Rename(name, final); err != nil {
 		_ = os.Remove(name)
-		return plugin.Transient(err)
-	}
-	return nil
-}
-
-// clearStaged removes what a previous stage run left for one artifact: exactly
-// the file the record names — the old record's own name when the pipeline
-// changed since last night, so a differently named artifact cannot linger as an
-// orphan — and the record itself, which the run publishes again from the new
-// chain. On a stage directory that survives the container this is what keeps a
-// failed stage from leaving yesterday's bytes to be uploaded as tonight's. A
-// record that cannot be read is a permanent failure: guessing the old file's
-// name would be the collision this whole contract exists to prevent.
-func clearStaged(dir, name string, rec source.StagedRecord) error {
-	if old, err := source.ReadStagedRecord(dir, name); err == nil {
-		if err := removeIfPresent(filepath.Join(dir, source.StagedArtifactName(name, old))); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return plugin.Permanent(fmt.Errorf("staged chain record: %w", err))
-	}
-	if err := removeIfPresent(filepath.Join(dir, source.StagedArtifactName(name, rec))); err != nil {
-		return err
-	}
-	return removeIfPresent(source.StagedChainFile(dir, name))
-}
-
-// removeIfPresent removes one path, and a path that is already gone is done.
-func removeIfPresent(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return plugin.Transient(err)
 	}
 	return nil

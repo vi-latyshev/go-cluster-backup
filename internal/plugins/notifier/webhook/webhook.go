@@ -62,9 +62,10 @@ type Config struct {
 
 	// Events is the message of every event this notifier delivers, keyed by
 	// event name. An event with no entry here is "not subscribed": Notify
-	// returns nil without a request, because a notifier handed every engine
-	// event and refusing the ones it was never told about would fail runs for
-	// no reason.
+	// returns notifier.ErrSkipped without a request, because a notifier is handed
+	// every engine event and refusing the ones it was never told about would fail
+	// runs for no reason — and the engine counts the skip as neither a failure
+	// nor a delivery.
 	Events map[string]plugin.Template `json:"events" required:"true" doc:"the message of every event this notifier delivers, keyed by event name; an event with no entry here is not subscribed. The template is plain text: its first rendered line is the title, a line that renders empty is dropped, and a pair of markup backticks marks a line's monospace part"`
 	// Payload is one body template for every event, executed with .Title, .Lines
 	// (each .Text and .Code), .Text (the whole message) and .Event (the event as
@@ -261,7 +262,8 @@ func (n *Notifier) Close() error {
 
 // Notify renders the message of one event and the body built from it, and posts
 // it once. An event with no entry in `events` is not subscribed: it is skipped
-// and returns nil. Errors are classified for the engine's retry loop: 429 and
+// and returns notifier.ErrSkipped, which the engine counts as neither a failure
+// nor a delivery. Errors are classified for the engine's retry loop: 429 and
 // every 5xx are transient; any other unexpected status, an unrenderable message
 // and a body its format refuses are permanent.
 func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
@@ -271,7 +273,7 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 	event, subscribed := n.events[ev.Name]
 	if !subscribed {
 		n.log.Debug("event is not subscribed by this notifier", "event", ev.Name)
-		return nil
+		return notifier.ErrSkipped
 	}
 	// ONE cleaned copy, passed to both templates. Cleaning inside render alone
 	// left the payload's `.Event` unclean, so a payload that serializes the

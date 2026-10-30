@@ -85,9 +85,9 @@ func TestNotifySkipsANotifierWhoseCheckFailed(t *testing.T) {
 	e := w.newEngine(t, cfg)
 
 	checks := failedChecks{instanceKey{"notifier", "ops"}: errors.New("check failed")}
-	failed := e.notify(context.Background(), model.Event{Name: model.EventStarted}, checks)
-	if !failed {
-		t.Fatal("a notifier whose Check failed did not count as failed")
+	failed, delivered := e.notify(context.Background(), model.Event{Name: model.EventStarted}, checks)
+	if !failed || delivered {
+		t.Fatalf("a notifier whose Check failed: failed %v delivered %v", failed, delivered)
 	}
 	if len(n.events) != 0 {
 		t.Fatalf("a notifier whose Check failed was called: %v", n.events)

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
@@ -42,10 +43,16 @@ type StagedRecord struct {
 
 // StagedArtifactName is the exact file name of the artifact one record
 // describes: the artifact's name plus the record's extension tail. The writer
-// names the file this way, the reader opens exactly this file, and the clear
-// removes exactly this file — one derivation, both sides.
-func StagedArtifactName(name string, rec StagedRecord) string {
-	return name + rec.Ext
+// names the file this way and the reader opens exactly this file — one
+// derivation, both sides. An extension that carries a path separator or a parent
+// step is refused here, at the one place the writer and the reader both join it:
+// a record or a plugin's trait must never steer a path outside the stage
+// directory.
+func StagedArtifactName(name string, rec StagedRecord) (string, error) {
+	if strings.Contains(rec.Ext, "/") || strings.Contains(rec.Ext, "..") {
+		return "", fmt.Errorf("staged ext %q must not contain a path separator or a parent step", rec.Ext)
+	}
+	return name + rec.Ext, nil
 }
 
 // ReadStagedRecord reads the record a stage left for the artifact named name. A

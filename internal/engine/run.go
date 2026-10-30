@@ -17,6 +17,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/catalog"
 	"github.com/vi-latyshev/go-cluster-backup/internal/human"
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/notifier"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
 	"github.com/vi-latyshev/go-cluster-backup/internal/processor"
 	"github.com/vi-latyshev/go-cluster-backup/internal/source"
@@ -336,7 +337,7 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (model.RunReport, erro
 		}
 		e.inspectPreviousJob(ctx, &rep)
 		e.saveCatalog(ctx, rep)
-		notifierFailed = e.notify(ctx, model.Event{Name: model.EventStarted, At: started, Run: rep}, checks)
+		notifierFailed, _ = e.notify(ctx, model.Event{Name: model.EventStarted, At: started, Run: rep}, checks)
 		// The quarantine is decided BEFORE the first survey call. A survey that
 		// starts under a quarantine and finishes after it expired is still a
 		// snapshot taken under it — the dead holder's in-flight operations may
@@ -464,8 +465,12 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (model.RunReport, erro
 	rep.Outcome = e.reportOutcome(&rep, notifierFailed)
 	rep.ExitCode = e.exitCode(rep.Outcome)
 
-	if e.notify(finish, model.Event{Name: model.EventFinished, At: time.Now().UTC(), Run: rep}, checks) &&
-		cfg.Run.NotifierFailureIsFatal {
+	// The verdict is composed first, and a finished notification nobody received
+	// is the only notification failure allowed to lower it: a message that did
+	// reach a receiver already names the outcome, so failing the run under it
+	// would contradict what was delivered. With the flag off nothing changes.
+	if failed, delivered := e.notify(finish, model.Event{Name: model.EventFinished, At: time.Now().UTC(), Run: rep}, checks); failed &&
+		!delivered && cfg.Run.NotifierFailureIsFatal {
 		rep.Outcome = model.OutcomeFailed
 		rep.ExitCode = e.exitCode(rep.Outcome)
 	}
@@ -1279,7 +1284,9 @@ func (e *Engine) assembleResults(order []*storageBinding, results map[string]*st
 	return out
 }
 
-// reportOutcome turns the report into delivered / degraded / failed.
+// reportOutcome turns the report into delivered / degraded / failed. notifierFailed
+// is the started notification's failure: it degrades a run at most. The finished
+// notification is the caller's later override, and only when nobody received it.
 func (e *Engine) reportOutcome(rep *model.RunReport, notifierFailed bool) model.Outcome {
 	if rep.Lease != nil && (rep.Lease.Refused || rep.Lease.Error != "") {
 		// The run never wrote: the writer lease decided it. A refusal or a failed
@@ -1439,11 +1446,15 @@ func (e *Engine) catalogType() string {
 	return e.cfg.Catalog.Type
 }
 
-// notify delivers one event to every notifier; true when any of them failed. A
-// notifier that failed its Check is not called and counts as failed — the same
-// way one whose call failed does, so notifier_failure_is_fatal decides.
-func (e *Engine) notify(ctx context.Context, ev model.Event, checks failedChecks) bool {
-	failed := false
+// notify delivers one event to every notifier; failed reports whether any of
+// them failed, delivered whether any of them took the event. A notifier that
+// failed its Check is not called and counts as failed — the same way one whose
+// call failed does. A notifier answering notifier.ErrSkipped has nothing for this
+// event and is neutral: it is neither a failure nor a delivery, so it can neither
+// fail a run nor stand in for a notifier that delivered. The caller decides what
+// a failure means: notifier_failure_is_fatal is fatal for a finished event only
+// when no notifier delivered it.
+func (e *Engine) notify(ctx context.Context, ev model.Event, checks failedChecks) (failed, delivered bool) {
 	for _, nb := range e.notifiers {
 		if err := checks.err("notifier", nb.name); err != nil {
 			failed = true
@@ -1454,15 +1465,19 @@ func (e *Engine) notify(ctx context.Context, ev model.Event, checks failedChecks
 		_, err := attempt(ctx, e.retry, "notify "+nb.name, func(ctx context.Context, _ int) (struct{}, error) {
 			return struct{}{}, safeCall(func() error { return nb.inst.Notify(ctx, ev) })
 		})
+		if errors.Is(err, notifier.ErrSkipped) {
+			continue
+		}
 		if err != nil {
 			failed = true
 			e.at("notifier", e.notifierType(nb.name), nb.name, human.Failure("notify.failed",
 				human.Text("event", ev.Name), human.Text("reason", err.Error())))
 			continue
 		}
+		delivered = true
 		e.at("notifier", e.notifierType(nb.name), nb.name, human.New("notify.sent", human.Text("event", ev.Name)))
 	}
-	return failed
+	return failed, delivered
 }
 
 // notifierType is the registered type of one notifier instance, for the log's

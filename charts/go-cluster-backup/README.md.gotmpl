@@ -56,6 +56,19 @@ reference is resolved, never read — so it needs no secret mount. When it fails
 the install or upgrade aborts, and with Flux's `upgrade.remediation.strategy:
 rollback` the previous release stays in place.
 
+### Upgrading: the image and the configuration move together
+
+The tool reads the configuration with a strict decoder: any member the running
+image does not know, or any field it demands and the document lacks, is an error
+at startup, before a single plugin is built — and that run produces no backup.
+When `values.config` and the image tag are updated by different paths (a values
+change merged now, an image automation or a manual `image.tag` bump later), a
+pod can run the previous image against the new document and fail instantly.
+Update both together, or pin `image.tag` and confirm it matches the release
+before the first scheduled run. The pre-upgrade hook proves only that the new
+document suits the image the hook itself ran; it cannot see a pod that still
+carries an older tag.
+
 ## Example values and manifests
 
 - `examples/values/minimal.yaml` with `examples/config/minimal.yaml`
