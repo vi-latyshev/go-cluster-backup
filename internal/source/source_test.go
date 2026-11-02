@@ -24,12 +24,19 @@ func TestStagedChainFileNamesTheRecord(t *testing.T) {
 // <name><Ext>, so nothing else in the directory can be mistaken for it.
 func TestStagedArtifactNameIsTheRecordsOwnTail(t *testing.T) {
 	rec := source.StagedRecord{Ext: ".tar.age"}
-	if got := source.StagedArtifactName("example-state", rec); got != "example-state.tar.age" {
-		t.Fatalf("StagedArtifactName = %q, want example-state.tar.age", got)
+	if got, err := source.StagedArtifactName("example-state", rec); err != nil || got != "example-state.tar.age" {
+		t.Fatalf("StagedArtifactName = %q, %v, want example-state.tar.age", got, err)
 	}
 	// An empty tail is valid for a format without a suffix.
-	if got := source.StagedArtifactName("example-state", source.StagedRecord{}); got != "example-state" {
-		t.Fatalf("StagedArtifactName = %q, want the bare name", got)
+	if got, err := source.StagedArtifactName("example-state", source.StagedRecord{}); err != nil || got != "example-state" {
+		t.Fatalf("StagedArtifactName = %q, %v, want the bare name", got, err)
+	}
+	// A tail that could steer a write or a read out of the stage dir is refused
+	// by the one derivation the writer and the reader share.
+	for _, ext := range []string{"/../../x", "..", ".a/b"} {
+		if name, err := source.StagedArtifactName("example-state", source.StagedRecord{Ext: ext}); err == nil {
+			t.Fatalf("StagedArtifactName accepted ext %q as %q", ext, name)
+		}
 	}
 }
 

@@ -164,7 +164,14 @@ writer:
 # its own volumeMounts, and typically a root securityContext — a namespace that
 # admits it, not `restricted`.
 stage:
-  # -- Render the `stage` initContainer on the writer pod.
+  # -- Render the `stage` initContainer on the writer pod. The config's
+  # `stage.dir` must be an emptyDir of this one pod — the chart's `spool`, or one
+  # declared in `writer.volumes` — never a hostPath or a PVC shared between pods.
+  # A stage publishes into an empty directory it owns and never deletes; it
+  # refuses a non-empty `stage.dir` (a retained pair makes it re-run against data
+  # a previous stage left). The writer lease is taken by `run`, after `stage`, so
+  # a shared directory also lets another pod's stage republish the pair between
+  # this pod's stage and its run.
   enabled: false
   # -- securityContext of the stage initContainer. It reads host paths owned by
   # root, so it defaults to root without capabilities.

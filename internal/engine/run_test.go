@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +20,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier/webhook"
 	"github.com/vi-latyshev/go-cluster-backup/internal/processor"
 	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
 )
@@ -610,30 +614,148 @@ func TestSpoolReserveBlocksTheArtifact(t *testing.T) {
 	}
 }
 
-func TestNotifierFatalFlag(t *testing.T) {
-	w := newWorld(t)
-	w.notifiers["ops"] = &fakeNotifier{fails: 100}
-	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
-	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
-	e := w.newEngine(t, cfg)
-	rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil {
-		t.Fatal(err)
+// TestNotifierFailureVerdict pins what run.notifier_failure_is_fatal does to the
+// outcome: a failed finished notification no notifier delivered makes the run
+// failed, a failed started notification only degrades it, and a finished message
+// that was delivered always names the verdict the report, the exit code and the
+// catalog carry — so a second notifier that worked cannot contradict a faulty
+// one, and a notifier subscribed to nothing cannot stand in for one that did.
+func TestNotifierFailureVerdict(t *testing.T) {
+	tests := []struct {
+		name              string
+		notifiers         int
+		fault             string // started | finished | both | retry
+		backup            string // "" = a healthy fake; webhook-both | webhook-started | webhook-mute
+		fatal             bool
+		finishedDelivered int
+		outcome           model.Outcome
+		exit              int
+	}{
+		// One notifier: its finished message reaches nobody when it fails, so the
+		// flag's finished rule decides alone.
+		{"one/started/off", 1, "started", "", false, 1, model.OutcomeDelivered, 0},
+		{"one/started/on", 1, "started", "", true, 1, model.OutcomeDegraded, 3},
+		{"one/finished/off", 1, "finished", "", false, 0, model.OutcomeDelivered, 0},
+		{"one/finished/on", 1, "finished", "", true, 0, model.OutcomeFailed, 7},
+		{"one/both/off", 1, "both", "", false, 0, model.OutcomeDelivered, 0},
+		{"one/both/on", 1, "both", "", true, 0, model.OutcomeFailed, 7},
+		// Two notifiers, one faulty: the healthy one still delivers the finished
+		// verdict, so its failure is not fatal; the started failure still degrades.
+		{"two/started/off", 2, "started", "", false, 2, model.OutcomeDelivered, 0},
+		{"two/started/on", 2, "started", "", true, 2, model.OutcomeDegraded, 3},
+		{"two/finished/off", 2, "finished", "", false, 1, model.OutcomeDelivered, 0},
+		{"two/finished/on", 2, "finished", "", true, 1, model.OutcomeDelivered, 0},
+		{"two/both/off", 2, "both", "", false, 1, model.OutcomeDelivered, 0},
+		{"two/both/on", 2, "both", "", true, 1, model.OutcomeDegraded, 3},
+		// A real webhook as the second notifier: only an event it is subscribed to
+		// is a delivery; a started-only or mute notifier skips the finished event
+		// and its skip is neutral, so the faulty notifier's finished failure stays
+		// fatal. A webhook subscribed to both still suppresses it.
+		{"two/finished/on/webhook-both", 2, "finished", "webhook-both", true, 1, model.OutcomeDelivered, 0},
+		{"two/finished/on/webhook-started", 2, "finished", "webhook-started", true, 0, model.OutcomeFailed, 7},
+		{"two/finished/on/webhook-mute", 2, "finished", "webhook-mute", true, 0, model.OutcomeFailed, 7},
+		// A notifier that failed an attempt and delivered on the retry counts as
+		// delivered: the flag reads the final answer, never the attempts.
+		{"one/retry/on", 1, "retry", "", true, 1, model.OutcomeDelivered, 0},
 	}
-	if rep.Outcome != model.OutcomeDelivered {
-		t.Fatalf("not fatal: outcome %q", rep.Outcome)
-	}
-
-	w2 := newWorld(t)
-	w2.notifiers["ops"] = &fakeNotifier{fails: 100}
-	cfg["run"].(map[string]any)["notifier_failure_is_fatal"] = true
-	e2 := w2.newEngine(t, cfg)
-	rep, err = e2.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Outcome != model.OutcomeFailed || rep.ExitCode != 7 {
-		t.Fatalf("fatal notifier: outcome %q exit %d", rep.Outcome, rep.ExitCode)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorld(t)
+			faulty := &fakeNotifier{}
+			switch tc.fault {
+			case "started":
+				faulty.failOn = model.EventStarted
+			case "finished":
+				faulty.failOn = model.EventFinished
+			case "both":
+				faulty.fails = 100
+			case "retry":
+				faulty.fails = 1
+			}
+			w.notifiers["ops"] = faulty
+			notifiers := map[string]any{"ops": instance("fake")}
+			var (
+				bodiesMu sync.Mutex
+				bodies   []string
+			)
+			if tc.notifiers == 2 {
+				switch tc.backup {
+				case "webhook-both", "webhook-started", "webhook-mute":
+					if err := webhook.Register(w.registry); err != nil {
+						t.Fatal(err)
+					}
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						body, _ := io.ReadAll(r.Body)
+						bodiesMu.Lock()
+						bodies = append(bodies, string(body))
+						bodiesMu.Unlock()
+						w.WriteHeader(http.StatusOK)
+					}))
+					t.Cleanup(srv.Close)
+					events := map[string]any{}
+					switch tc.backup {
+					case "webhook-both":
+						events = map[string]any{
+							model.EventStarted:  "started",
+							model.EventFinished: "outcome={{ .Run.Outcome }} exit={{ .Run.ExitCode }}",
+						}
+					case "webhook-started":
+						events = map[string]any{model.EventStarted: "started"}
+					}
+					notifiers["backup"] = map[string]any{"type": "webhook", "config": map[string]any{
+						"url": srv.URL, "method": "POST", "headers": map[string]string{},
+						"body_format": "text", "timeout": "5s", "success_status": []int{200},
+						"max_response_bytes": 512, "events": events, "payload": "{{ .Text }}",
+					}}
+				default:
+					w.notifiers["backup"] = &fakeNotifier{}
+					notifiers["backup"] = instance("fake")
+				}
+			}
+			cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+			cfg["notifiers"] = notifiers
+			cfg["catalog"] = instance("fake")
+			cfg["run"].(map[string]any)["notifier_failure_is_fatal"] = tc.fatal
+			e := w.newEngine(t, cfg)
+			rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep.Outcome != tc.outcome || rep.ExitCode != tc.exit {
+				t.Fatalf("outcome %q exit %d, want %q exit %d", rep.Outcome, rep.ExitCode, tc.outcome, tc.exit)
+			}
+			if got := w.catalog.runs[rep.RunID]; got.Outcome != rep.Outcome || got.ExitCode != rep.ExitCode {
+				t.Fatalf("catalog %q exit %d disagrees with the report %q exit %d",
+					got.Outcome, got.ExitCode, rep.Outcome, rep.ExitCode)
+			}
+			want := fmt.Sprintf("outcome=%s exit=%d", rep.Outcome, rep.ExitCode)
+			delivered := 0
+			for name, n := range w.notifiers {
+				ev, ok := n.finished()
+				if !ok {
+					continue
+				}
+				delivered++
+				if ev.Run.Outcome != rep.Outcome || ev.Run.ExitCode != rep.ExitCode {
+					t.Fatalf("notifier %s delivered %q exit %d, the run ended %q exit %d",
+						name, ev.Run.Outcome, ev.Run.ExitCode, rep.Outcome, rep.ExitCode)
+				}
+			}
+			bodiesMu.Lock()
+			defer bodiesMu.Unlock()
+			for _, body := range bodies {
+				if !strings.Contains(body, "outcome=") {
+					continue // the started message carries no verdict
+				}
+				delivered++
+				if !strings.Contains(body, want) {
+					t.Fatalf("the webhook delivered %q, the run ended %s", body, want)
+				}
+			}
+			if delivered != tc.finishedDelivered {
+				t.Fatalf("%d notifiers delivered the finished verdict, want %d", delivered, tc.finishedDelivered)
+			}
+		})
 	}
 }
 

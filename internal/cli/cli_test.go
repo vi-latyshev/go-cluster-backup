@@ -151,6 +151,43 @@ stage:
 	}
 }
 
+// TestStageRefusesADirAPreviousStageLeft: a stage publishes into an empty
+// directory it owns and never deletes. A second stage against the pair the
+// first one left refuses before any source runs and exits 1 — whatever
+// degraded_exit_code and failed_exit_code say, because a pair a previous stage
+// left would read exactly like this one's.
+func TestStageRefusesADirAPreviousStageLeft(t *testing.T) {
+	w := newWorld()
+	dir := t.TempDir()
+	staged := filepath.Join(dir, "staged")
+	cfg := mustWrite(t, dir, "config.yaml", `version: 1
+stage:
+  dir: `+staged+`
+  degraded_exit_code: 0
+  failed_exit_code: 0
+  sources:
+    control:
+      type: synthetic
+      artifact: {group: control-plane, name: state, importance: best_effort, sensitivity: plain}
+      pipeline: []
+      config: {payload: staged-bytes, dir: "", origin: "test:stage"}
+`)
+
+	if code, stdout, stderr := w.main(context.Background(), "stage", "--config", cfg); code != 0 {
+		t.Fatalf("first stage exit code = %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	code, _, stderr := w.main(context.Background(), "stage", "--config", cfg)
+	if code != exitFailure {
+		t.Fatalf("second stage exit code = %d, want %d: a non-empty stage.dir is refused whatever the exit codes say", code, exitFailure)
+	}
+	if !strings.Contains(stderr, staged) || !strings.Contains(stderr, "empty") {
+		t.Fatalf("the refusal does not name the stage dir and what is wrong with it: %s", stderr)
+	}
+	if got := mustRead(t, filepath.Join(staged, "state.dat")); got != "staged-bytes" {
+		t.Fatalf("the refused stage changed the previous pair: %q", got)
+	}
+}
+
 // TestRunCancelledContextExitsNonZero: cancellation returns promptly and is
 // never a zero exit.
 func TestRunCancelledContextExitsNonZero(t *testing.T) {

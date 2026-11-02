@@ -47,7 +47,7 @@ type RunConfig struct {
 	FailedExitCode         int            `json:"failed_exit_code" doc:"exit code of the failed outcome"`
 	StorageParallelism     int            `json:"storage_parallelism" doc:"how many storages upload at once"`
 	UnclassifiedError      plugin.Class   `json:"unclassified_error" doc:"class applied to an error a plugin did not classify: transient or permanent"`
-	NotifierFailureIsFatal bool           `json:"notifier_failure_is_fatal" doc:"a failed notification makes the outcome failed"`
+	NotifierFailureIsFatal bool           `json:"notifier_failure_is_fatal" doc:"a failed finished notification that no notifier delivered makes the outcome failed; a failed started notification only degrades it, and a notifier subscribed to nothing is neither"`
 	Retry                  RetryConfig    `json:"retry" doc:"engine retry policy for every plugin call"`
 	// ProgressInterval is how often a running dump reports the bytes it has
 	// produced so far. 0 reports none.
