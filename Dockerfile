@@ -11,11 +11,11 @@ ARG TARGETARCH
 ARG COVER=""
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod,id=go-mod-backup \
+RUN --mount=type=cache,target=/go/pkg/mod,id=go-mod \
     go mod download
 COPY . .
-RUN --mount=type=cache,target=/root/.cache/go-build,id=go-build-backup \
-    --mount=type=cache,target=/go/pkg/mod,id=go-mod-backup \
+RUN --mount=type=cache,target=/root/.cache/go-build,id=go-build \
+    --mount=type=cache,target=/go/pkg/mod,id=go-mod \
     cover=""; \
     if [ "$COVER" = "1" ]; then cover="-cover -covermode=atomic"; fi; \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \

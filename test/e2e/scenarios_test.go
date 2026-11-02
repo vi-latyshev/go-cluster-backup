@@ -140,7 +140,7 @@ func TestSuite(t *testing.T) {
 	t.Run("upgrade_rejected", func(t *testing.T) {
 		bad := writeFiles(t, map[string]string{
 			"bad-config.yaml": e.toolConfig(ns, catalogName(suiteFullname)) + "\nunknown_section: {nope: true}\n"})
-		out, err := e.exec("", "helm", append(e.helmArgs(ns, bad["bad-config.yaml"], values), "--wait")...)
+		out, err := e.exec("", e.helmPinned(t), append(e.helmArgs(ns, bad["bad-config.yaml"], values), "--wait")...)
 		if err == nil {
 			t.Fatalf("helm upgrade with an invalid config succeeded:\n%s", out)
 		}
