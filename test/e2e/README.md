@@ -133,6 +133,8 @@ go test -count=1 -timeout=20m ./test/e2e/...
 ```
 
 - **k3d** v5.9.0 (any v5.x works). **k3s** `rancher/k3s:v1.37.1-k3s1`.
+- **kubectl** on `PATH` (any version), and **helm** is the one pinned in
+  `tools/go.mod` — the suite resolves it there, never from `PATH`.
 - **image**: `docker build -t go-cluster-backup:e2e --build-arg COVER=1 .`, where
   `COVER=1` builds with `-cover -covermode=atomic`. The suite pulls the four
   dependency images by digest, re-tags each and loads all five into the node's

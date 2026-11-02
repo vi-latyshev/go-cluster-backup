@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -383,10 +384,40 @@ func (e *Env) apply(t *testing.T, manifest string) {
 	}
 }
 
+// helmPath is the helm pinned in tools/go.mod, resolved once per test run. The
+// suite must never pick up a helm from PATH: a runner has one installed, and a
+// different version would silently change what the chart is rendered with.
+var helmPath = sync.OnceValues(func() (string, error) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		return "", fmt.Errorf("resolving the repository root: %w", err)
+	}
+	cmd := exec.Command("go", "tool", "-modfile="+filepath.Join(root, "tools", "go.mod"), "-n", "helm")
+	cmd.Dir = root
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolving the helm pinned in tools/go.mod: %w\n%s", err, stderr.String())
+	}
+	return strings.TrimSpace(string(out)), nil
+})
+
+// helmPinned returns the resolved helm binary, failing the test if it is not
+// available.
+func (e *Env) helmPinned(t *testing.T) string {
+	t.Helper()
+	path, err := helmPath()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return path
+}
+
 // helm runs helm and fails the test on a non-zero exit.
 func (e *Env) helm(t *testing.T, args ...string) string {
 	t.Helper()
-	out, err := e.exec("", "helm", args...)
+	out, err := e.exec("", e.helmPinned(t), args...)
 	if err != nil {
 		t.Fatalf("helm %s: %v\n%s", strings.Join(args, " "), err, out)
 	}

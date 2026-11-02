@@ -11,8 +11,12 @@ path for a contributor adding a plugin.
 ## Tech Stack
 
 - **Language**: Go 1.27.3, one module (`github.com/vi-latyshev/go-cluster-backup`).
-  Lint and vulnerability scanning are pinned as tool dependencies in `tools/go.mod`
-  (a separate module, never linked into the binary).
+  The Makefile exports `GOTOOLCHAIN` from go.mod's `go` line, so every target runs
+  that toolchain. Lint, vulnerability scanning, the chart tools and `helm` v4 are
+  pinned as tool dependencies in `tools/go.mod` (a separate module, never linked
+  into the binary). No target or test takes `helm` from `PATH`; each runs these
+  through `go tool`. Tidy that module with `cd tools && go mod tidy`, never with
+  `-modfile` from the root.
 - **Config**: YAML on disk, converted to JSON in `internal/cli` (one dependency,
   `go.yaml.in/yaml/v3`); the engine and every plugin see JSON bytes only. That
   dependency has exactly one other reader: the webhook notifier, whose
@@ -256,13 +260,14 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
 
 ## Commands
 
-The Makefile is the entry point; CI calls the same targets.
+The Makefile is the entry point; CI calls the same targets. `make check` needs
+only Go, plus a C compiler on Linux for `-race`.
 
 ```bash
 make check       # vet test lint vuln chart — the whole gate
 make vet         # go vet ./...
 make test        # unit-cover + test-gate: the unit suite, gated at 100%
-make unit-cover  # go test -race -timeout=5m -coverprofile=coverage.out ./... (no gate)
+make unit-cover  # go test -race -trimpath -timeout=5m -coverprofile=coverage.out ./... (no gate)
 make test-gate   # gate an existing coverage.out — no second test run
 make cover       # gate the unit+e2e union (needs coverage.out and coverage-e2e.out)
 make lint        # golangci-lint, then the hard `//nolint` grep gate
@@ -271,11 +276,16 @@ make chart       # helm lint --strict, kubeconform (1.31 and 1.36), helm-docs dr
 make docs        # regenerate charts/go-cluster-backup/README.md from values.yaml
 make e2e         # k3d end-to-end suite: E2E_IMAGE=<image loaded into the cluster>
 make image       # docker build -t go-cluster-backup .
+make hooks       # opt in to .githooks/commit-msg, the commit-message check
 ```
 
 CI runs two jobs: `make lint vuln chart`, and `make test e2e cover`. It has no
 separate `go vet` step — golangci-lint's govet runs the same analysers inside
-`make lint`; `make vet` stays in `make check` for a local run.
+`make lint`; `make vet` stays in `make check` for a local run. The first job also
+runs `.githooks/commit-msg` over every commit the push or pull request brings.
+Each job keeps its own Go cache; the e2e image build keeps its `go-mod` and
+`go-build` cache mounts through buildkit-cache-dance, whose `cache-map` in
+`ci.yml` must match the Dockerfile's cache-mount ids.
 `make e2e` builds `go-cluster-backup:e2e` with `--build-arg COVER=1` unless
 `E2E_IMAGE` names an image already loaded, and the suite creates and deletes its
 own k3d cluster (k3d v5.9.0, `rancher/k3s:v1.37.1-k3s1`, name `E2E_CLUSTER`,
@@ -283,7 +293,9 @@ default `gcb-e2e`). It runs 7 scenarios — install + validate hook, manual run,
 restore round-trip, previous-run failure, writer lease, rejected upgrade,
 k3s_state — writes counters to `coverage-e2e/` and converts them to
 `coverage-e2e.out`; `make cover` then gates the unit+e2e union at 100%.
-Prerequisites: `docker`, `k3d`, `helm`. Details in `test/e2e/README.md`.
+Each run first deletes the cluster of its name, so concurrent runs need distinct
+`E2E_CLUSTER` names. Prerequisites: `docker`, `k3d`, `kubectl`. Details in
+`test/e2e/README.md`.
 
 Narrow a fix cycle to the affected package (`go test -race ./internal/<pkg>/...`),
 then run `make check` once before handing the work over.

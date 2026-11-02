@@ -2,11 +2,17 @@
 
 ## Development setup
 
-The Go version is the one in `go.mod` (the `go` directive). The linter, the
-vulnerability scanner and the chart tools are pinned as tool dependencies in
-`tools/go.mod`, so a checkout lints with the versions CI runs — never with a
-`golangci-lint` from `PATH`. The chart gate needs `helm` on `PATH`
-(`make chart` runs `helm lint`, `kubeconform` and `helm-docs`).
+The Go version is the one in `go.mod` (the `go` directive): the Makefile
+exports `GOTOOLCHAIN` from that line, so every target runs that toolchain
+whatever Go is installed, and one that is older is downloaded once. A
+`tools/go.mod` newer than `go.mod` fails loudly instead of silently selecting
+another toolchain. The linter, the vulnerability scanner, the chart tools and
+`helm` are pinned as tool dependencies in `tools/go.mod`, so a checkout lints,
+renders and tests with the versions CI runs — never with a `golangci-lint` or
+`helm` from `PATH`.
+
+`make check` needs only Go and a network for the first download, plus a C
+compiler on Linux for `-race`.
 
 ```bash
 go build ./...
@@ -34,15 +40,18 @@ Two rules the gate enforces mechanically:
   `make cover` the unit+e2e union. Nothing may move the number by construction:
   no `-coverpkg`, no build tags, no assertion-free tests.
 
-`make e2e` needs `docker`, `k3d` and `helm`: it builds the `COVER=1` image itself
-(or takes `E2E_IMAGE`), the suite creates and deletes its own k3d cluster, and
-`make cover` then gates the union. See [test/e2e/README.md](test/e2e/README.md).
+`make e2e` needs `docker`, `k3d` and `kubectl`: it builds the `COVER=1` image
+itself (or takes `E2E_IMAGE`), the suite creates and deletes its own k3d
+cluster, and `make cover` then gates the union. See
+[test/e2e/README.md](test/e2e/README.md).
 
 ## Commits
 
 Conventional Commits: `type(scope): description`, single line preferred; a body
 only when the change is unintelligible without one. Types: `feat`, `fix`,
 `refactor`, `perf`, `test`, `docs`, `chore`, `ci`, `build`, `style`, `revert`.
+
+Run `make hooks` to install the commit-msg hook; its rules live in `.commitlint.yaml`.
 
 The type decides the release: `feat` is a minor, `fix`, `perf`, `revert` and
 `fix(deps)` are patches, and `type!:` or a `BREAKING CHANGE:` footer is a major;

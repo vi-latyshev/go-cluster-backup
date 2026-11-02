@@ -42,16 +42,31 @@ func repoRoot(t *testing.T) string {
 	return root
 }
 
-// helmBinary returns the helm in PATH. A missing helm is a failure in CI and a
-// loud skip locally: a chart test that silently does nothing is worse than none.
+// helmBinary returns the helm pinned in tools/go.mod, built once per test run
+// into the Go build cache. Nothing is read from PATH and a missing tool is a
+// failure, never a skip: a chart test that silently does nothing is worse than
+// none.
+var helmBinaryOnce = sync.OnceValues(func() (string, error) {
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		return "", fmt.Errorf("resolving the repository root: %w", err)
+	}
+	cmd := exec.Command("go", "tool", "-modfile=tools/go.mod", "-n", "helm")
+	cmd.Dir = root
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolving the helm pinned in tools/go.mod: %w\n%s", err, stderr.String())
+	}
+	return strings.TrimSpace(string(out)), nil
+})
+
 func helmBinary(t *testing.T) string {
 	t.Helper()
-	path, err := exec.LookPath("helm")
+	path, err := helmBinaryOnce()
 	if err != nil {
-		if os.Getenv("CI") != "" {
-			t.Fatalf("helm is required in CI and was not found in PATH: %v", err)
-		}
-		t.Skipf("SKIPPED: helm not found in PATH, so this chart test did not run (set CI=1 to make this a failure): %v", err)
+		t.Fatalf("%v", err)
 	}
 	return path
 }
@@ -82,21 +97,13 @@ func render(t *testing.T, extraArgs ...string) (string, error) {
 
 // renderNotes renders the chart's NOTES. `helm template` does not render
 // NOTES.txt, so this is a client-side dry run — the form that never contacts a
-// cluster. Helm 3 spells the flag as a bare boolean, so a rejection of the
-// value falls back to that.
+// cluster.
 func renderNotes(t *testing.T, extraArgs ...string) string {
 	t.Helper()
 	root := repoRoot(t)
-	base := []string{"install", releaseName, filepath.Join(root, chartPath), "--namespace", "backup"}
-	withDryRun := func(flag string) []string {
-		args := append([]string{}, base...)
-		args = append(args, flag)
-		return append(args, extraArgs...)
-	}
-	manifest, err := runHelm(t, root, withDryRun("--dry-run=client")...)
-	if err != nil {
-		manifest, err = runHelm(t, root, withDryRun("--dry-run")...)
-	}
+	args := []string{"install", releaseName, filepath.Join(root, chartPath), "--namespace", "backup", "--dry-run=client"}
+	args = append(args, extraArgs...)
+	manifest, err := runHelm(t, root, args...)
 	if err != nil {
 		t.Fatalf("rendering NOTES: %v", err)
 	}

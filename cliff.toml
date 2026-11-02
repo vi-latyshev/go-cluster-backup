@@ -17,6 +17,7 @@ initial_tag = "v1.0.0"
 
 [git]
 conventional_commits = true
+require_conventional = true
 filter_unconventional = true
 protect_breaking_commits = true
 tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+"
@@ -25,7 +26,13 @@ commit_parsers = [
   { message = "^fix", group = "Bug fixes" },
   { message = "^perf", group = "Performance" },
   { message = "^revert", group = "Reverts" },
-  { message = "^.*", skip = true },
+  # Explicit skips, not `^.*`: a catch-all would also skip an unconventional
+  # commit before require_conventional sees it. Git-generated subjects are
+  # accepted by commitlint and must not reach the check either.
+  { message = "^(chore|docs|test|ci|build|style|refactor)", skip = true },
+  { message = "^Merge ", skip = true },
+  { message = '^Revert "', skip = true },
+  { message = '^Reapply "', skip = true },
 ]
 
 [changelog]

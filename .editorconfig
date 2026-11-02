@@ -9,7 +9,7 @@ end_of_line = lf
 insert_final_newline = true
 trim_trailing_whitespace = true
 
-[*.{yaml,yml,json,md,gotmpl}]
+[*.{yaml,yml,json,md,gotmpl,tpl,txt}]
 indent_style = space
 indent_size = 2
 

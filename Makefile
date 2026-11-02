@@ -2,10 +2,17 @@
 # documents them, .github/workflows/ci.yml calls them, and a contributor runs
 # `make check` before handing work over.
 #
-# Every tool but helm and k3d is a tool dependency of tools/go.mod, so its
-# version is pinned by that module and no target needs an install step.
+# Every tool but k3d, kubectl and docker is a tool dependency of tools/go.mod,
+# so its version is pinned by that module and no target needs an install step.
+# helm is one of them. k3d, kubectl and docker are host tools of the e2e suite.
 
 SHELL := /bin/sh
+
+# Every target runs the toolchain the go.mod `go` directive pins, whatever Go is
+# installed: the first run downloads it when the local Go is older. There is no
+# `+auto`, so a tools/go.mod newer than go.mod fails loudly instead of silently
+# selecting another toolchain. `make GOTOOLCHAIN=local ...` is the escape hatch.
+export GOTOOLCHAIN := go$(shell sed -n 's/^go //p' go.mod)
 
 GO ?= go
 TOOLS := -modfile=tools/go.mod
@@ -51,7 +58,7 @@ NOLINT_PATTERN := //[[:space:]]*nolint([[:space:]:,]|$$)
 
 IMAGE ?= go-cluster-backup
 
-.PHONY: check vet test unit-cover test-gate cover lint vuln chart docs e2e image
+.PHONY: check vet test unit-cover test-gate cover lint vuln chart docs e2e image hooks
 
 # check is the whole gate, in the order a failure is cheapest to act on.
 check: vet test lint vuln chart
@@ -66,8 +73,11 @@ test: unit-cover test-gate
 # unit-cover runs the unit suite and writes the unit profile without gating it.
 # GORACE=atexit_sleep_ms=0 drops the race runtime's one-second sleep at every
 # test binary's exit — one per package, and the suite is dozens of packages.
+# -trimpath keeps profile keys at import paths and lets the build cache be
+# shared between a worktree and its main checkout.
 unit-cover:
-	GORACE=atexit_sleep_ms=0 $(GO) test -race -timeout=5m -coverprofile=$(COVERAGE_PROFILE) ./...
+	@$(GO) tool -n $(TOOLS) helm > /dev/null
+	GORACE=atexit_sleep_ms=0 $(GO) test -race -trimpath -timeout=5m -coverprofile=$(COVERAGE_PROFILE) ./...
 
 # test-gate enforces the threshold on an existing unit profile, without running
 # the suite again — the same reporter `make test` uses.
@@ -105,16 +115,18 @@ vuln:
 # against the Kubernetes API schema of each version the chart claims
 # (kubeVersion >=1.31.0-0), and proves the generated README is not stale.
 chart:
-	@for example in $(CHART_EXAMPLES); do \
+	@set -e; \
+	helm="$$($(GO) tool $(TOOLS) -n helm)"; \
+	for example in $(CHART_EXAMPLES); do \
 		echo "helm lint --strict ($(CHART), $$example)"; \
-		helm lint --strict $(CHART) \
+		"$$helm" lint --strict $(CHART) \
 			-f examples/values/$$example.yaml \
 			--set-file config=examples/config/$$example.yaml || exit 1; \
-	done
-	@for version in $(KUBERNETES_VERSIONS); do \
+	done; \
+	for version in $(KUBERNETES_VERSIONS); do \
 		for example in $(CHART_EXAMPLES); do \
 			echo "kubeconform ($$example, kubernetes $$version)"; \
-			helm template $(HELM_RELEASE) $(CHART) \
+			"$$helm" template $(HELM_RELEASE) $(CHART) \
 				-f examples/values/$$example.yaml \
 				--set-file config=examples/config/$$example.yaml \
 			| $(GO) tool $(TOOLS) kubeconform -strict -summary -kubernetes-version $$version - || exit 1; \
@@ -147,6 +159,9 @@ e2e:
 	@k3d cluster delete $(E2E_CLUSTER) > /dev/null 2>&1 || true
 	@rm -rf $(E2E_COVERDIR) $(E2E_COVERAGE_PROFILE)
 	@mkdir -p $(E2E_COVERDIR)
+	@# Warm the pinned helm before the suite: its first `go tool` call compiles
+	@# the tool, and the suite runs helm under a three-minute exec limit.
+	@$(GO) tool $(TOOLS) helm version > /dev/null
 	GCB_E2E=1 \
 	GCB_E2E_IMAGE=$(E2E_IMAGE_NAME) \
 	GCB_E2E_CLUSTER=$(E2E_CLUSTER) \
@@ -162,3 +177,8 @@ e2e:
 # the COVER build arg, used by the e2e job only.
 image:
 	docker build -t $(IMAGE) .
+
+# hooks opts this checkout into the committed git hooks. It is opt-in and
+# idempotent: git never installs hooks on clone, and CI is the real gate.
+hooks:
+	git config core.hooksPath .githooks
