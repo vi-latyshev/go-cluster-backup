@@ -42,13 +42,6 @@ jobs:
           go-version-file: go.mod
           # setup-go's shared key would race; the cache below is per job.
           cache: false
-      - name: commit messages
-        run: |
-          range="${{ github.event.pull_request.base.sha || github.event.before }}..${{ github.sha }}"
-          commits="$(git rev-list --no-merges "$range" 2>/dev/null)" || commits="${{ github.sha }}"
-          for sha in $commits; do
-            git cat-file commit "$sha" | sed '1,/^$/d' | go tool -modfile=tools/go.mod commitlint lint || exit 1
-          done
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -57,6 +50,13 @@ jobs:
             ~/.cache/golangci-lint
           key: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.golangci.yml') }}
           restore-keys: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
+      - name: commit messages
+        run: |
+          range="${{ github.event.pull_request.base.sha || github.event.before }}..${{ github.sha }}"
+          commits="$(git rev-list --no-merges "$range" 2>/dev/null)" || commits="${{ github.sha }}"
+          for sha in $commits; do
+            git cat-file commit "$sha" | sed '1,/^$/d' | go tool -modfile=tools/go.mod commitlint lint || exit 1
+          done
       # No separate `go vet`: golangci-lint's govet runs the same analysers as
       # part of `make lint` (the `standard` linter set).
       - run: make lint
