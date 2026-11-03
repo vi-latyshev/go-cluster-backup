@@ -29,7 +29,7 @@ run:
   min_verified_storages: 1
   degraded_exit_code: 0
   failed_exit_code: 1
-  storage_parallelism: 1
+  storage_parallelism: 4
   unclassified_error: transient
   notifier_failure_is_fatal: false
   retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
@@ -132,7 +132,7 @@ plugins:
 
   source/postgres:
     format: custom
-    compression: none # the pipeline compresses; pg_dump must not
+    compression: none # none: the pipeline's processor compresses; a pg_dump compression instead of a pipeline processor is a deployment choice (docs)
     connect_attempts: 6
     connect_interval: 5s
     exclude_databases: []

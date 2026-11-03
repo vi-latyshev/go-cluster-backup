@@ -1,9 +1,13 @@
 package webhook
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
 )
 
 func artifactResult(group, name, outcome string, size int64) model.ArtifactResult {
@@ -135,5 +139,23 @@ func TestFuncPickDefFallsBackToTheDefault(t *testing.T) {
 	}
 	if _, err := funcPickDef("x", "d", "a"); err == nil {
 		t.Fatal("funcPickDef accepted a lone key with no text")
+	}
+}
+
+// TestReadFailureKeepsTheCallerStopAndHidesTheCause: a body read that failed is
+// either the caller's own cancellation or the read stage with its class. The
+// transport's text, which can quote the request URI, is never part of it.
+func TestReadFailureKeepsTheCallerStopAndHidesTheCause(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := readFailure(ctx, "run_finished"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("readFailure = %v, want context.Canceled", err)
+	}
+	err := readFailure(context.Background(), "run_finished")
+	if err == nil || !strings.Contains(err.Error(), "reading the run_finished response") {
+		t.Fatalf("readFailure = %v", err)
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("class = %q, want transient", class)
 	}
 }

@@ -62,6 +62,14 @@ type producedArtifact struct {
 	took  time.Duration
 }
 
+// produceOutcome is what the producer finally made: the whole artifact and the
+// error that ended the attempt loop. A follower that outlived the first attempt
+// reads it after the ready channel closes.
+type produceOutcome struct {
+	pa  producedArtifact
+	err error
+}
+
 // storageRunState accumulates one storage's result through the run. Upload and
 // retention errors are kept apart: a failed retention run is visible in the
 // report but never downgrades a verified copy.
@@ -763,12 +771,96 @@ func (e *Engine) artifactChain(ctx context.Context, plan *artifactPlan) ([]model
 	return chain, nil
 }
 
-// produce resolves traits, checks the spool reserve, and streams the artifact
-// into a fresh spool file per attempt.
-func (e *Engine) produce(ctx context.Context, sp *spool.Spool, plan artifactPlan) (producedArtifact, error) {
-	if err := e.resolveTraits(ctx, &plan); err != nil {
-		return producedArtifact{}, err
+// growth is the first produce attempt as its storages see it: the spool file it
+// is writing, the bytes of it that are final, and how the attempt ended. A
+// multipart storage follows it while it grows and sends only bytes that cannot
+// change any more; a storage that cannot overlap reads the finished file.
+type growth struct {
+	mu      sync.Mutex
+	file    string
+	written int64
+	done    bool
+	err     error
+	changed chan struct{}
+}
+
+func newGrowth() *growth { return &growth{changed: make(chan struct{})} }
+
+// notify wakes every follower; it replaces the channel so the next change is
+// awaited too.
+func (g *growth) notify() {
+	g.mu.Lock()
+	close(g.changed)
+	g.changed = make(chan struct{})
+	g.mu.Unlock()
+}
+
+// begin names the file the first attempt writes.
+func (g *growth) begin(file string) {
+	g.mu.Lock()
+	g.file = file
+	g.mu.Unlock()
+	g.notify()
+}
+
+// advance makes n more bytes final.
+func (g *growth) advance(n int64) {
+	g.mu.Lock()
+	g.written += n
+	g.mu.Unlock()
+	g.notify()
+}
+
+// fail ends the attempt with its error. Later changes are ignored: an attempt
+// that failed is over, and a retry produces its own file.
+func (g *growth) fail(err error) {
+	g.mu.Lock()
+	if !g.done {
+		g.done, g.err = true, err
 	}
+	g.mu.Unlock()
+	g.notify()
+}
+
+// succeed ends the attempt with the object whole; the last write already
+// announced every byte.
+func (g *growth) succeed() {
+	g.mu.Lock()
+	g.done = true
+	g.mu.Unlock()
+	g.notify()
+}
+
+// snapshot is a follower's view; changed closes on the next change.
+func (g *growth) snapshot() (file string, written int64, done bool, changed <-chan struct{}, err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.file, g.written, g.done, g.changed, g.err
+}
+
+// writer wraps the spool file the first attempt writes: the followers see each
+// byte only after the spool accepted it.
+func (g *growth) writer(w io.Writer) io.Writer { return &growthWriter{g: g, w: w} }
+
+// growthWriter makes a write's bytes final for the followers — a byte is
+// announced only after the spool accepted it.
+type growthWriter struct {
+	g *growth
+	w io.Writer
+}
+
+func (gw *growthWriter) Write(p []byte) (int, error) {
+	n, err := gw.w.Write(p)
+	if n > 0 {
+		gw.g.advance(int64(n))
+	}
+	return n, err
+}
+
+// produce checks the spool reserve and streams the artifact into a fresh spool
+// file per attempt. g follows the first attempt, so a multipart storage can
+// send parts before the producer is done; g may be nil when nothing follows.
+func (e *Engine) produce(ctx context.Context, sp *spool.Spool, plan artifactPlan, g *growth) (producedArtifact, error) {
 	free, err := sp.FreeBytes()
 	if err != nil {
 		return producedArtifact{}, err
@@ -778,27 +870,42 @@ func (e *Engine) produce(ctx context.Context, sp *spool.Spool, plan artifactPlan
 	}
 	e.sourceEvent(plan.srcType, plan.instance, human.New("source.dump.start", human.Text("origin", plan.source.Origin)))
 	start := time.Now()
-	pa, err := attempt(ctx, e.retry, "produce "+plan.artifact.Name, func(ctx context.Context, _ int) (producedArtifact, error) {
+	pa, err := attempt(ctx, e.retry, "produce "+plan.artifact.Name, func(ctx context.Context, attempt int) (producedArtifact, error) {
 		w, err := sp.Create(plan.artifact.Group + "-" + plan.artifact.Name + plan.artifact.Ext)
 		if err != nil {
 			return producedArtifact{}, plugin.Permanent(err)
 		}
+		first := attempt == 1 && g != nil
+		var sink io.Writer = w
+		if first {
+			g.begin(w.Name())
+			sink = g.writer(w)
+		}
 		// The cap is the spool's own bound: an artifact past it fails itself —
 		// permanently, because the next attempt produces the same bytes — while
 		// every other artifact, and the manifest, still fit.
-		limit := &limitWriter{w: w, limit: e.cfg.Run.MaxArtifactBytes.Int64()}
+		limit := &limitWriter{w: sink, limit: e.cfg.Run.MaxArtifactBytes.Int64()}
 		raw, cerr := e.dumpChain(ctx, plan, limit)
 		if closeErr := w.Close(); cerr == nil {
 			cerr = closeErr
 		}
 		if cerr != nil {
+			if first {
+				g.fail(cerr)
+			}
 			_ = sp.Remove(w.Name())
 			return producedArtifact{}, cerr
 		}
 		stats, err := e.dumpStats(ctx, plan)
 		if err != nil {
+			if first {
+				g.fail(err)
+			}
 			_ = sp.Remove(w.Name())
 			return producedArtifact{}, err
+		}
+		if first {
+			g.succeed()
 		}
 		return producedArtifact{artifact: plan.artifact, chain: plan.chain, source: plan.source,
 			file: w.Name(), bytes: w.Size(), raw: raw, sha256: w.SHA256(), stats: stats}, nil
@@ -992,11 +1099,67 @@ func (e *Engine) processArtifact(ctx context.Context, sp *spool.Spool, plan arti
 			human.Text("artifact", human.ArtifactLabel(plan.artifact.Group, plan.artifact.Name)), human.Text("reason", ar.Error)))
 		return ar, verified
 	}
-	pa, err := e.produce(ctx, sp, plan)
-	if err != nil {
-		ar.Error = err.Error()
+	// The plan's traits are resolved before the first byte: the object key exists
+	// before its bytes, so a multipart storage can reserve the cap and open its
+	// upload while the producer is still writing.
+	if err := e.resolveTraits(ctx, &plan); err != nil {
+		ar.Error = fmt.Errorf("artifact %s: %w", plan.artifact.Name, err).Error()
 		e.event(human.Failure("artifact.failed",
 			human.Text("artifact", human.ArtifactLabel(plan.artifact.Group, plan.artifact.Name)), human.Text("reason", ar.Error)))
+		return ar, verified
+	}
+	key, err := e.artifactKey(runID, plan.artifact)
+	if err != nil {
+		ar.Error = err.Error()
+		return ar, verified
+	}
+	ar.Key = key
+	label := human.ArtifactLabel(plan.artifact.Group, plan.artifact.Name)
+	g := newGrowth()
+	sem := make(chan struct{}, e.cfg.Run.StorageParallelism)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	// produced is what the producer finally made; ready closes once it is set, so
+	// a follower that outlived the first attempt reads it without a lock.
+	var produced produceOutcome
+	ready := make(chan struct{})
+	for _, sb := range order {
+		if _, ok := sb.inst.(storage.MultipartUploader); !ok {
+			continue
+		}
+		wg.Add(1)
+		go func(sb *storageBinding) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// A multipart storage follows the growing file from its first byte,
+			// inside its own slot: a storage that stalls must not hold back the
+			// line of one that finished minutes ago.
+			ok := e.followUpload(ctx, sb, results[sb.name], sp, g, key, label, kind, caps, ready, &produced)
+			mu.Lock()
+			defer mu.Unlock()
+			if ok {
+				verified[sb.name] = true
+			}
+		}(sb)
+	}
+	pa, err := e.produce(ctx, sp, plan, g)
+	if err != nil {
+		// A producer that stopped before its first attempt — a spool reserve, a
+		// statfs, a Create — never signalled the growth: the followers are told
+		// here, at the one completion boundary, so none waits for a change that
+		// cannot come. A first attempt that already failed is a no-op.
+		g.fail(err)
+	}
+	produced = produceOutcome{pa: pa, err: err}
+	close(ready)
+	if err != nil {
+		// The storages that overlapped are still unwinding: wait for them before
+		// the artifact is declared failed, so no goroutine outlives its file.
+		wg.Wait()
+		ar.Error = err.Error()
+		e.event(human.Failure("artifact.failed",
+			human.Text("artifact", label), human.Text("reason", ar.Error)))
 		return ar, verified
 	}
 	defer func() { _ = sp.Remove(pa.file) }()
@@ -1005,25 +1168,15 @@ func (e *Engine) processArtifact(ctx context.Context, sp *spool.Spool, plan arti
 	ar.Chain = pa.chain
 	ar.Source = pa.source
 	ar.Stats = pa.stats
-	key, err := e.artifactKey(runID, pa.artifact)
-	if err != nil {
-		ar.Error = err.Error()
-		return ar, verified
-	}
-	ar.Key = key
-	sem := make(chan struct{}, e.cfg.Run.StorageParallelism)
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	label := human.ArtifactLabel(plan.artifact.Group, plan.artifact.Name)
 	for _, sb := range order {
+		if _, ok := sb.inst.(storage.MultipartUploader); ok {
+			continue
+		}
 		wg.Add(1)
 		go func(sb *storageBinding) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			// Each storage announces its own upload and reports its own result,
-			// inside its own goroutine: a storage that stalls must not hold back
-			// the line of one that finished minutes ago.
 			e.storageEvent(sb, human.New("storage.upload.start", human.Text("artifact", label)))
 			ok := e.uploadObject(ctx, sb, results[sb.name], pa, sp, key, kind, caps)
 			mu.Lock()
@@ -1078,25 +1231,19 @@ func (e *Engine) uploadObject(ctx context.Context, sb *storageBinding, st *stora
 	if !e.reserveWrite(sb, st, caps[sb.name], key, pa.bytes, label, kind == model.RunKindManual) {
 		return false
 	}
-	_, err := storageCall(&st.clock, ctx, func(ctx context.Context) (struct{}, error) {
-		if handled, err := e.multipartUpload(ctx, sb, st, sp, pa, key); handled {
-			return struct{}{}, err
-		}
-		return struct{}{}, e.putWhole(ctx, sb, st, sp, pa, key)
-	})
+	// The multipart path books its own calls against the budget: it may wait for
+	// a producer between them, and that wait is not the storage's time. The
+	// whole-object path keeps one call around its retries.
+	var err error
+	if handled, merr := e.multipartUpload(ctx, sb, st, sp, pa, key); handled {
+		err = merr
+	} else {
+		_, err = storageCall(&st.clock, ctx, func(ctx context.Context) (struct{}, error) {
+			return struct{}{}, e.putWhole(ctx, sb, st, sp, pa, key)
+		})
+	}
 	if err != nil {
-		if class, _ := plugin.ClassOf(err); class == plugin.ClassPermanent && ctx.Err() == nil {
-			st.mu.Lock()
-			st.fatal = err
-			st.mu.Unlock()
-		}
-		// The artifact's label, never its key: this error reaches the report
-		// and the summary at info, and the key is machine detail (the log event
-		// carries it as an ObjectKey attr, shown only at debug).
-		st.setUploadError(fmt.Errorf("put %s: %w", label, err))
-		e.storageEvent(sb, human.Failure("storage.upload.failed",
-			human.Text("artifact", label),
-			human.Text("reason", err.Error()), human.ObjectKey("key", key)))
+		e.failUpload(ctx, sb, st, label, key, err)
 		return false
 	}
 	if c := caps[sb.name]; c != nil {
@@ -1104,6 +1251,26 @@ func (e *Engine) uploadObject(ctx context.Context, sb *storageBinding, st *stora
 	}
 	st.markObject(pa.bytes)
 	return true
+}
+
+// failUpload records one storage's failed upload: a permanent error takes the
+// storage out of the run, and the error reaches the report. The artifact's
+// label, never its key: this error reaches the report and the summary at info,
+// and the key is machine detail (the log event carries it as an ObjectKey attr,
+// shown only at debug).
+func (e *Engine) failUpload(ctx context.Context, sb *storageBinding, st *storageRunState, label, key string, err error) {
+	if class, _ := plugin.ClassOf(err); class == plugin.ClassPermanent && ctx.Err() == nil {
+		st.mu.Lock()
+		st.fatal = err
+		st.mu.Unlock()
+	}
+	st.mu.Lock()
+	st.tried = true
+	st.mu.Unlock()
+	st.setUploadError(fmt.Errorf("put %s: %w", label, err))
+	e.storageEvent(sb, human.Failure("storage.upload.failed",
+		human.Text("artifact", label),
+		human.Text("reason", err.Error()), human.ObjectKey("key", key)))
 }
 
 // reserveWrite books one object's bytes in the storage's ledger before its
@@ -1532,6 +1699,28 @@ func (c *capState) reserve(key string, n int64, refuse bool) bool {
 	}
 	c.reserved[key] = n
 	return true
+}
+
+// shrink lowers one object's reservation to the exact size the producer made —
+// what an overlapping upload holds as the run's artifact bound until the size is
+// known. It never raises a reservation: an object that came out larger than the
+// bound it was admitted against stays booked at the bound.
+func (c *capState) shrink(key string, n int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cur, ok := c.reserved[key]; ok && n >= 0 && n < cur {
+		c.reserved[key] = n
+	}
+}
+
+// unreserve drops the booking of an object that was never written, or whose
+// upload was aborted: no byte of it exists on the storage. It is called only
+// after that fact is confirmed — a failed abort keeps the booking, because the
+// parts it left behind may still be billed.
+func (c *capState) unreserve(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.reserved, key)
 }
 
 // markUnknown records that the storage's occupancy cannot be established — an

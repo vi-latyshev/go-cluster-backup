@@ -36,14 +36,26 @@ type state struct {
 	rules      []preparedRule
 	log        *slog.Logger
 	object     *object
-	// volumes is the node path of each PersistentVolume by name — "" for a
-	// volume that has none — read once per collect by volumePath. listed says
+	// volumes is each PersistentVolume as volumePath reads it, by name: the
+	// node path its data lives at ("") when it has none, and the claim it is
+	// bound to — read once per collect by volumePath. listed says
 	// whether that read was attempted and volumeErr what it answered: one
 	// attempt per plugin call, so the objects after a failure share the error
 	// and its class instead of hammering the API.
-	volumes      map[string]string
+	volumes      map[string]volume
 	volumeListed bool
 	volumeErr    error
+}
+
+// volume is one PersistentVolume as volumePath reads it: where its data lives
+// on a node, and the claim it is bound to. A volume bound to another claim —
+// including another incarnation of a claim of the same name — is never this
+// claim's volume, however stale spec.volumeName is.
+type volume struct {
+	path           string
+	claimNamespace string
+	claimName      string
+	claimUID       string
 }
 
 // forgetVolumes drops the previous collect's listing: each collect reads the
@@ -106,6 +118,7 @@ type object struct {
 	resource   string // "pod" or "persistentvolumeclaim", for error messages
 	namespace  string
 	name       string
+	uid        string
 	labels     map[string]string
 	phase      string
 	containers []kubeapi.Container
@@ -207,17 +220,24 @@ func (s *state) fnVolumePath() (string, error) {
 	switch {
 	case !known:
 		return "", plugin.Permanent(fmt.Errorf("%s: the cluster has no persistentvolume named %q", o.id(), o.volumeName))
-	case path == "":
+	case path.claimNamespace == "" && path.claimName == "":
+		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to no claim, so it is not this claim's volume", o.id(), o.volumeName))
+	case path.claimNamespace != o.namespace || path.claimName != o.name:
+		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s, not to this claim", o.id(), o.volumeName, path.claimNamespace, path.claimName))
+	case path.claimUID == "" || path.claimUID != o.uid:
+		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s with uid %q, not to this claim (uid %q): the name was reused by another claim", o.id(), o.volumeName, path.claimNamespace, path.claimName, path.claimUID, o.uid))
+	case path.path == "":
 		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q holds no spec.local.path and no spec.hostPath.path, so it is not a volume on a node", o.id(), o.volumeName))
 	}
-	return path, nil
+	return path.path, nil
 }
 
 // volumePaths lists the cluster's PersistentVolumes once per collect, mapping
-// each name to the node path its data lives on — "" when it has none. A failed
-// listing is cached with its class: the objects of this collect share the
-// failure instead of each making the call the engine counts as one attempt.
-func (s *state) volumePaths() (map[string]string, error) {
+// each name to the node path its data lives on — "" when it has none — and the
+// claim it is bound to. A failed listing is cached with its class: the objects
+// of this collect share the failure instead of each making the call the engine
+// counts as one attempt.
+func (s *state) volumePaths() (map[string]volume, error) {
 	if s.volumeListed {
 		return s.volumes, s.volumeErr
 	}
@@ -227,16 +247,19 @@ func (s *state) volumePaths() (map[string]string, error) {
 		s.volumeErr = fmt.Errorf("reading the persistent volumes: %w", err)
 		return nil, s.volumeErr
 	}
-	paths := make(map[string]string, len(pvs))
+	paths := make(map[string]volume, len(pvs))
 	for _, pv := range pvs {
+		var v volume
+		if ref := pv.Spec.ClaimRef; ref != nil {
+			v.claimNamespace, v.claimName, v.claimUID = ref.Namespace, ref.Name, ref.UID
+		}
 		switch {
 		case pv.Spec.Local != nil:
-			paths[pv.Metadata.Name] = pv.Spec.Local.Path
+			v.path = pv.Spec.Local.Path
 		case pv.Spec.HostPath != nil:
-			paths[pv.Metadata.Name] = pv.Spec.HostPath.Path
-		default:
-			paths[pv.Metadata.Name] = ""
+			v.path = pv.Spec.HostPath.Path
 		}
+		paths[pv.Metadata.Name] = v
 	}
 	s.volumes = paths
 	return paths, nil

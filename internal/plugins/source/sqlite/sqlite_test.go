@@ -306,6 +306,8 @@ func TestCheckRefusesADirectory(t *testing.T) {
 func TestNewRejectsBadConfig(t *testing.T) {
 	for _, cfg := range []string{
 		`{"path": "", "scratch_dir": "/scratch", "busy_timeout": "10s", "integrity_check": "quick"}`,
+		`{"path": "relative.db", "scratch_dir": "/scratch", "busy_timeout": "10s", "integrity_check": "quick"}`,
+		`{"path": "-cmd", "scratch_dir": "/scratch", "busy_timeout": "10s", "integrity_check": "quick"}`,
 		`{"path": "/x", "busy_timeout": "10s", "integrity_check": "quick"}`,
 		`{"path": "/x", "scratch_dir": "", "busy_timeout": "10s", "integrity_check": "quick"}`,
 		`{"path": "/x", "scratch_dir": "relative", "busy_timeout": "10s", "integrity_check": "quick"}`,

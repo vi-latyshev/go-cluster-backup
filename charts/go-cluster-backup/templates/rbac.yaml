@@ -4,8 +4,11 @@
 {{- $namespace := .Release.Namespace -}}
 {{/*
 Cluster-wide list (not get) for the label-driven discovery: every pod, claim
-and volume is listed and selected by labels, across all namespaces. Secrets and
-ConfigMaps are never cluster-wide — see the namespaced Roles below.
+and volume is listed and selected by labels, across all namespaces. A list
+returns the objects whole, so every pod's literal `env` values reach this
+ServiceAccount — a literal env is as readable as a Secret here, so a credential
+belongs in a Secret, never in a literal env. Secrets and ConfigMaps are never
+cluster-wide — see the namespaced Roles below.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

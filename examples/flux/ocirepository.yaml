@@ -9,12 +9,15 @@ spec:
   ref:
     # An exact version pin, never a moving tag: the chart version is the image
     # tag, and a moving tag would make the deployed configuration un-reviewable.
-    tag: "1.0.0"
+    tag: "1.1.4"
   layerSelector:
     mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
     operation: copy
-  # Optional: verify the chart's signature before Flux ever renders it.
-  # spec.verify:
-  #   provider: cosign
-  #   secretRef:
-  #     name: cosign-public-key
+  # Verify the chart's signature before Flux ever renders it. The release
+  # workflow signs every published chart keyless with cosign, so the identity is
+  # pinned to that workflow on the default branch and no key is shipped here.
+  verify:
+    provider: cosign
+    matchOIDCIdentity:
+      - issuer: '^https://token\.actions\.githubusercontent\.com$'
+        subject: '^https://github\.com/vi-latyshev/go-cluster-backup/\.github/workflows/ci\.yml@refs/heads/master$'

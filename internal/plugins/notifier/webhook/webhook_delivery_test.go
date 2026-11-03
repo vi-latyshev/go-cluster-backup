@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -269,6 +270,373 @@ func TestATruncatedResponseIsTransient(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reading the run_finished response") {
 		t.Errorf("the refusal does not name the response: %v", err)
+	}
+}
+
+// TestATransportFailureDoesNotCarryTheEndpoint: a *url.Error spells out the
+// request URL, and a bot endpoint's path is its credential
+// (https://host/bot123:SECRET/sendMessage). The engine stores the error text in
+// the run report and sends it to every other notifier, so the cause never
+// reaches it at all.
+func TestATransportFailureDoesNotCarryTheEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint := srv.URL + "/bot123:SECRET/sendMessage"
+	srv.Close()
+
+	err := build(t, baseConfig(endpoint)).Notify(context.Background(), notifiertest.Event())
+	if err == nil {
+		t.Fatal("Notify to a closed receiver returned success")
+	}
+	if strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("the error carries the endpoint's own URL: %v", err)
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Errorf("a refused connection classified %q, want transient", class)
+	}
+	if !strings.Contains(err.Error(), "posting run_finished") {
+		t.Errorf("the refusal does not name the event: %v", err)
+	}
+}
+
+// TestReviewMalformedEndpointDoesNotLeakSecret: a URL the client refuses to
+// build must not report itself — a *url.Error on the construction path spells
+// out the endpoint exactly as the transport one does.
+func TestReviewMalformedEndpointDoesNotLeakSecret(t *testing.T) {
+	err := build(t, baseConfig("https://notify.example.com/botSECRET/%zz")).Notify(context.Background(), notifiertest.Event())
+	if err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("delivery leaks endpoint: %v", err)
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		t.Errorf("an unbuildable request classified %q, want permanent", class)
+	}
+}
+
+// TestReviewResponseCannotEchoEndpoint: a receiver that copies the request URI
+// into its answer must not be able to put the endpoint's path or query into the
+// error text, which the run report stores verbatim — whatever the body's
+// length or representation.
+func TestReviewResponseCannotEchoEndpoint(t *testing.T) {
+	cases := map[string]struct {
+		answer           func(uri string) string
+		maxResponseBytes int
+	}{
+		"the whole URI":   {answer: func(uri string) string { return uri }, maxResponseBytes: 4096},
+		"a truncated URI": {answer: func(uri string) string { return uri }, maxResponseBytes: 10},
+		"an escaped URI":  {answer: func(uri string) string { return url.PathEscape(uri) }, maxResponseBytes: 4096},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, tc.answer(r.URL.RequestURI()), http.StatusForbidden)
+			}))
+			t.Cleanup(srv.Close)
+			cfg := baseConfig(srv.URL + "/botSECRET/sendMessage?token=TOKEN")
+			cfg["max_response_bytes"] = tc.maxResponseBytes
+			err := build(t, cfg).Notify(context.Background(), notifiertest.Event())
+			if err == nil {
+				t.Fatal("a 403 was accepted")
+			}
+			for _, secret := range []string{"SECRET", "TOKEN"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("response diagnostics leaked the endpoint: %v", err)
+				}
+			}
+			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+				t.Errorf("HTTP 403 classified %q, want permanent", class)
+			}
+		})
+	}
+}
+
+// TestReviewTruncatedEndpointEcho: the read bound must not reopen the leak the
+// whole-URI case closes — a body cut before the redacted prefix would still
+// carry the credential-bearing path into the report.
+func TestReviewTruncatedEndpointEcho(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, r.URL.RequestURI(), http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	cfg := baseConfig(srv.URL + "/botSECRET/sendMessage")
+	cfg["max_response_bytes"] = 10
+	err := build(t, cfg).Notify(context.Background(), notifiertest.Event())
+	if err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("truncated response leaked endpoint: %v", err)
+	}
+}
+
+// TestReviewMalformedHeadersCannotEchoEndpoint: a response whose header block
+// is malformed makes net/http quote the request line back. The delivery error
+// carries no cause at all, so the path never reaches it.
+func TestReviewMalformedHeadersCannotEchoEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nno-colon " + r.URL.RequestURI() + "\r\n\r\n"))
+	}))
+	t.Cleanup(srv.Close)
+	err := build(t, baseConfig(srv.URL+"/botSECRET/sendMessage?token=TOKEN")).Notify(context.Background(), notifiertest.Event())
+	if err == nil || strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "TOKEN") {
+		t.Fatalf("malformed headers leaked endpoint: %v", err)
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Errorf("a malformed response classified %q, want transient", class)
+	}
+}
+
+// TestReviewMalformedTrailerCannotEchoEndpoint: a chunked body whose trailer is
+// malformed fails while the body is read, and the parser's text quotes the
+// request URI. The read stage reports itself and nothing else.
+func TestReviewMalformedTrailerCannotEchoEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" + r.URL.RequestURI() + "\r\n\r\n"))
+	}))
+	t.Cleanup(srv.Close)
+	err := build(t, baseConfig(srv.URL+"/botSECRET/sendMessage?token=TOKEN")).Notify(context.Background(), notifiertest.Event())
+	if err == nil || strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "TOKEN") {
+		t.Fatalf("malformed trailer leaked endpoint: %v", err)
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Errorf("a malformed trailer classified %q, want transient", class)
+	}
+}
+
+// TestDeliveryDiagnosticsCarryNoCause is the one matrix for every stage: the
+// validation, request build, transport, response read and HTTP status branches
+// all report the stage, the event, the status when there is one, and the class
+// — never a cause, because a transport, parser or receiver text can quote the
+// endpoint's credential-bearing path or query.
+func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
+	const suffix = "/botSECRET/sendMessage?token=TOKEN"
+	notify := func(t *testing.T, cfg map[string]any) error {
+		t.Helper()
+		return build(t, cfg).Notify(context.Background(), notifiertest.Event())
+	}
+	validate := func(t *testing.T, cfg map[string]any) error {
+		t.Helper()
+		return check(t, cfg)
+	}
+	serve := func(t *testing.T, handler http.HandlerFunc) map[string]any {
+		t.Helper()
+		srv := httptest.NewServer(handler)
+		t.Cleanup(srv.Close)
+		return baseConfig(srv.URL + suffix)
+	}
+	withLimit := func(t *testing.T, handler http.HandlerFunc, limit any) map[string]any {
+		t.Helper()
+		cfg := serve(t, handler)
+		cfg["max_response_bytes"] = limit
+		return cfg
+	}
+	status := func(code int) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "x", code) }
+	}
+	echo := func(answer func(string) string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, answer(r.URL.RequestURI()), http.StatusForbidden)
+		}
+	}
+	cases := map[string]struct {
+		cfg  func(*testing.T) map[string]any
+		run  func(*testing.T, map[string]any) error
+		want plugin.Class
+	}{
+		"validation refuses a scheme": {
+			cfg:  func(*testing.T) map[string]any { return baseConfig("ftp://notify.example.com" + suffix) },
+			run:  validate,
+			want: "",
+		},
+		"the request cannot be built": {
+			cfg:  func(*testing.T) map[string]any { return baseConfig("https://notify.example.com" + suffix + "\x7f") },
+			run:  notify,
+			want: plugin.ClassPermanent,
+		},
+		"the transport has no answer": {
+			cfg: func(t *testing.T) map[string]any {
+				t.Helper()
+				srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+				cfg := baseConfig(srv.URL + suffix)
+				srv.Close()
+				return cfg
+			},
+			run:  notify,
+			want: plugin.ClassTransient,
+		},
+		"the transport times out": {
+			cfg: func(t *testing.T) map[string]any {
+				t.Helper()
+				// The receiver holds the request until the test releases it, so
+				// the configured budget is the only thing that can end the call.
+				release := make(chan struct{})
+				srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+				t.Cleanup(srv.Close)
+				t.Cleanup(func() { close(release) })
+				cfg := baseConfig(srv.URL + suffix)
+				cfg["timeout"] = "200ms"
+				return cfg
+			},
+			run:  notify,
+			want: plugin.ClassTransient,
+		},
+		"the response body is truncated": {
+			cfg: func(t *testing.T) map[string]any {
+				t.Helper()
+				return serve(t, func(w http.ResponseWriter, _ *http.Request) {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					_, _ = conn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4096\r\n\r\nshort"))
+				})
+			},
+			run:  notify,
+			want: plugin.ClassTransient,
+		},
+		"the response headers are malformed": {
+			cfg: func(t *testing.T) map[string]any {
+				t.Helper()
+				return serve(t, func(w http.ResponseWriter, r *http.Request) {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nno-colon " + r.URL.RequestURI() + "\r\n\r\n"))
+				})
+			},
+			run:  notify,
+			want: plugin.ClassTransient,
+		},
+		"the response trailer is malformed": {
+			cfg: func(t *testing.T) map[string]any {
+				t.Helper()
+				return serve(t, func(w http.ResponseWriter, r *http.Request) {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					_, _ = conn.Write([]byte("HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" + r.URL.RequestURI() + "\r\n\r\n"))
+				})
+			},
+			run:  notify,
+			want: plugin.ClassTransient,
+		},
+		"the status echoes the whole URI": {
+			cfg: func(t *testing.T) map[string]any {
+				return withLimit(t, echo(func(uri string) string { return uri }), "4KiB")
+			},
+			run:  notify,
+			want: plugin.ClassPermanent,
+		},
+		"the status echoes a truncated URI": {
+			cfg: func(t *testing.T) map[string]any {
+				return withLimit(t, echo(func(uri string) string { return uri }), 10)
+			},
+			run:  notify,
+			want: plugin.ClassPermanent,
+		},
+		"the status echoes an escaped URI": {
+			cfg:  func(t *testing.T) map[string]any { return withLimit(t, echo(url.PathEscape), "4KiB") },
+			run:  notify,
+			want: plugin.ClassPermanent,
+		},
+		"a retryable status": {
+			cfg:  func(t *testing.T) map[string]any { return serve(t, status(http.StatusServiceUnavailable)) },
+			run:  notify,
+			want: plugin.ClassTransient,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := tc.run(t, tc.cfg(t))
+			if err == nil {
+				t.Fatal("the delivery was accepted")
+			}
+			for _, secret := range []string{"SECRET", "TOKEN"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("the diagnosis leaked the endpoint: %v", err)
+				}
+			}
+			if class, _ := plugin.ClassOf(err); class != tc.want {
+				t.Fatalf("class = %q, want %q (%v)", class, tc.want, err)
+			}
+		})
+	}
+}
+
+// TestACancelledResponseBodyReturnsTheContextError: a caller that gives up
+// while the body is being read gets its own context error, not a delivery
+// diagnosis built from a truncated stream.
+func TestACancelledResponseBodyReturnsTheContextError(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("x"))
+		w.(http.Flusher).Flush()
+		close(entered)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- build(t, baseConfig(srv.URL)).Notify(ctx, notifiertest.Event()) }()
+	<-entered
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Notify under a cancelled body read returned %v, want context.Canceled", err)
+	}
+}
+
+// TestReviewResponseReadUsesConfiguredBound: the read stops at
+// max_response_bytes, observed without the error text — a receiver sends a
+// prefix, flushes and holds the connection; a bound below the prefix ends the
+// attempt at once with the status, a bound above it waits for bytes that never
+// come until the configured timeout. A plain io.ReadAll never finishes the
+// former and only the timeout ends it.
+func TestReviewResponseReadUsesConfiguredBound(t *testing.T) {
+	run := func(t *testing.T, limit any) error {
+		t.Helper()
+		// The receiver sends a prefix, flushes it and holds the tail until the
+		// test releases it: only the read bound or the configured budget can
+		// end the attempt.
+		release := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(strings.Repeat("x", 1024)))
+			w.(http.Flusher).Flush()
+			<-release
+		}))
+		t.Cleanup(srv.Close)
+		t.Cleanup(func() { close(release) })
+		cfg := baseConfig(srv.URL)
+		cfg["max_response_bytes"] = limit
+		cfg["timeout"] = "300ms"
+		return build(t, cfg).Notify(context.Background(), notifiertest.Event())
+	}
+	if err := run(t, 10); err == nil {
+		t.Fatal("no error below the held prefix")
+	} else if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		t.Fatalf("the read passed the configured bound: %v", err)
+	}
+	if err := run(t, "2KiB"); err == nil {
+		t.Fatal("no error above the held prefix")
+	} else if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("a read waiting for the held tail classified %q, want transient (%v)", class, err)
 	}
 }
 

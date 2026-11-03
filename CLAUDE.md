@@ -67,10 +67,11 @@ tools/                                             the pinned lint/vuln/chart to
 
 ## Releasing
 
-Releases are computed from Conventional Commits: the publish job runs git-cliff
-(`cliff.toml`) for the bumped version, claims the tag `v<version>`, builds the
-image and chart with that version, and publishes git-cliff's notes as the GitHub
-Release.
+Releases are computed from Conventional Commits: the `image` job builds and
+pushes the per-architecture images by digest; the publish job merges them under
+`master`, runs git-cliff (`cliff.toml`) for the bumped version, claims the tag
+`v<version>`, tags the image and packages the chart with that version, and
+publishes git-cliff's notes as the GitHub Release.
 
 - **Chart.yaml holds placeholders** (`0.0.0`, image tag `master`); the publish
   job sets the real version at packaging. Never bump either by hand.
@@ -208,7 +209,11 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
 - **The byte cap belongs to the engine, on the storage envelope.** A storage's
   `max_total_bytes` covers every kind at once; a manual run is admitted against
   it before each object write and refuses, a scheduled run never fails on it and
-  frees room instead. No retention policy carries a byte budget.
+  frees room instead. While an object is still produced its write reserves
+  `run.max_artifact_bytes`; a manual run refuses only on the exact size. A
+  multipart upload may start while its artifact is produced; `CompleteMultipart`
+  only after the producer exited 0 and every part was accepted. No retention
+  policy carries a byte budget.
 - **Cross-process writes are serialised by a lease the catalog owns.** The
   single-writer claim is an optional catalog capability (`catalog.Leaser`,
   discovered by call, `errors.ErrUnsupported` meaning absent); the engine takes
@@ -272,9 +277,9 @@ make test-gate   # gate an existing coverage.out — no second test run
 make cover       # gate the unit+e2e union (needs coverage.out and coverage-e2e.out)
 make lint        # golangci-lint, then the hard `//nolint` grep gate
 make vuln        # govulncheck, pinned in tools/go.mod
-make chart       # helm lint --strict, kubeconform (1.31 and 1.36), helm-docs drift
+make chart       # helm lint --strict, kubeconform (1.31, 1.36 and 1.37), helm-docs drift
 make docs        # regenerate charts/go-cluster-backup/README.md from values.yaml
-make e2e         # k3d end-to-end suite: E2E_IMAGE=<image loaded into the cluster>
+make e2e         # k3d end-to-end suite: E2E_IMAGE=<image in the local docker daemon>
 make image       # docker build -t go-cluster-backup .
 make hooks       # opt in to .githooks/commit-msg, the commit-message check
 ```
@@ -287,15 +292,15 @@ Each job keeps its own Go cache; the e2e image build keeps its `go-mod` and
 `go-build` cache mounts through buildkit-cache-dance, whose `cache-map` in
 `ci.yml` must match the Dockerfile's cache-mount ids.
 `make e2e` builds `go-cluster-backup:e2e` with `--build-arg COVER=1` unless
-`E2E_IMAGE` names an image already loaded, and the suite creates and deletes its
-own k3d cluster (k3d v5.9.0, `rancher/k3s:v1.37.1-k3s1`, name `E2E_CLUSTER`,
-default `gcb-e2e`). It runs 7 scenarios — install + validate hook, manual run,
-restore round-trip, previous-run failure, writer lease, rejected upgrade,
-k3s_state — writes counters to `coverage-e2e/` and converts them to
-`coverage-e2e.out`; `make cover` then gates the unit+e2e union at 100%.
-Each run first deletes the cluster of its name, so concurrent runs need distinct
-`E2E_CLUSTER` names. Prerequisites: `docker`, `k3d`, `kubectl`. Details in
-`test/e2e/README.md`.
+`E2E_IMAGE` names an image already in the local docker daemon, and the suite
+creates and deletes its own k3d cluster (k3d v5.9.0, `rancher/k3s:v1.37.1-k3s1`,
+name `E2E_CLUSTER`, default `gcb-e2e`). It runs 7 scenarios — install +
+validate hook, manual run, restore round-trip, previous-run failure, writer
+lease, rejected upgrade, k3s_state — writes counters to `coverage-e2e/` and
+converts them to `coverage-e2e.out`; `make cover` then gates the unit+e2e
+union at 100%. Each run first deletes the cluster of its name, so concurrent
+runs need distinct `E2E_CLUSTER` names. Prerequisites: `docker`, `k3d`,
+`kubectl`. Details in `test/e2e/README.md`.
 
 Narrow a fix cycle to the affected package (`go test -race ./internal/<pkg>/...`),
 then run `make check` once before handing the work over.

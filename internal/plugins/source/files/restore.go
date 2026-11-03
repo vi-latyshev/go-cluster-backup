@@ -40,8 +40,26 @@ type renderedOptions struct {
 // The stream is validated by Probe before the first write, then rewound: the
 // artifact is read in place, never copied into the process temp dir. Every path
 // is resolved through one os.Root handle, so no entry — a name, a symlink target
-// or a hard link source — can address anything outside the restore root,
-// whatever the live tree holds.
+// or a hard link source — can address anything outside the restore root.
+//
+// The confinement is an induction over every link a later resolution can meet,
+// created or live, and it rests on one lexical rule: after skipping "" and ".",
+// a target is a leading run of ".." no deeper than the link's own directory,
+// followed only by descending names. A created link lies at its cleaned path —
+// Apply never replaces a directory — so its climbs walk real directories and the
+// rest only descends; a live link in an in_place tree lies at its walked path
+// for the same reason, and the live pre-pass refuses one whose target breaks the
+// rule there, because a following ".." would climb from wherever an earlier name
+// points. An archive may replace a live link, but what replaces it obeys the
+// rule too. A side_by_side target is fresh, so it holds no live links. The root
+// path itself may be a symlink — the operator's choice, already followed when
+// the root is opened — so the walk judges only links inside it.
+//
+// Probe decides the archive's lexical class before the first write; a live link
+// that breaks the rule, an entry whose parent in the restored tree is a symlink,
+// and a hard link whose target is not a regular file there, are refused as they
+// are reached — in_place is not atomic and a side_by_side target is then
+// partial, as with any unpack error.
 func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Reader) (source.ApplyReport, error) {
 	if err := ctx.Err(); err != nil {
 		return source.ApplyReport{}, err
@@ -84,11 +102,16 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	if err := os.MkdirAll(rootPath, 0o755); err != nil {
 		return source.ApplyReport{}, plugin.Transient(err)
 	}
-	root, err := os.OpenRoot(rootPath)
+	root, err := openRoot(rootPath)
 	if err != nil {
 		return source.ApplyReport{}, plugin.Transient(err)
 	}
 	defer func() { _ = root.Close() }()
+	if req.Mode == source.ApplyInPlace {
+		if err := checkLiveLinks(ctx, root); err != nil {
+			return source.ApplyReport{}, err
+		}
+	}
 
 	written, err := extract(ctx, root, seeker, opts.preserveOwner)
 	if err != nil {
@@ -149,11 +172,95 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 	return report, nil
 }
 
+// lstatRoot reads one path through the restore root. It is a variable so a test
+// can make a path answer with an error no filesystem produces on demand.
+var lstatRoot = func(root *os.Root, name string) (fs.FileInfo, error) { return root.Lstat(name) }
+
+// parentRefusal answers why an entry may not be written where its name says: a
+// parent of the entry's cleaned name exists through the root and is a symlink,
+// so os.Root would resolve the operation through it. Its physical location,
+// not the archive's spelling of the name, is what counts — that is why a
+// case-insensitive filesystem and a live alias are caught here and no longer
+// need a pre-pass over names.
+//
+// verified caches the prefixes already seen as real directories. The cache is
+// sound because Apply never replaces or removes a directory: replaceEntry
+// refuses one, ensureDir refuses a symlink or a non-directory. A missing parent
+// or a non-directory one stops the walk: the operation below creates the
+// directory or fails exactly as it does today.
+func parentRefusal(root *os.Root, name string, verified map[string]struct{}) error {
+	var prefixes []string
+	for dir := path.Dir(name); dir != "."; dir = path.Dir(dir) {
+		prefixes = append(prefixes, dir)
+	}
+	for i := len(prefixes) - 1; i >= 0; i-- {
+		dir := prefixes[i]
+		if _, ok := verified[dir]; ok {
+			continue
+		}
+		info, err := lstatRoot(root, dir)
+		switch {
+		case err == nil && info.Mode()&fs.ModeSymlink != 0:
+			return plugin.Permanent(fmt.Errorf("tar entry %q is written through the symlink %q", name, dir))
+		case err == nil && info.IsDir():
+			verified[dir] = struct{}{}
+		case err == nil:
+			return nil
+		case errors.Is(err, fs.ErrNotExist):
+			return nil
+		default:
+			return plugin.Transient(err)
+		}
+	}
+	return nil
+}
+
+// readlinkRoot reads one link through the opened restore root. It is a variable
+// so a test can make a link it cannot read.
+var readlinkRoot = func(root *os.Root, name string) (string, error) { return root.Readlink(name) }
+
+// openRoot opens the restore root. It is a variable so a test can make the open
+// itself fail: after MkdirAll that is otherwise a race.
+var openRoot = os.OpenRoot
+
+// checkLiveLinks refuses an in_place restore into a tree holding a live symlink
+// whose target the archive rule would refuse at that link's own path: the same
+// entryRefusal decides, so no second copy of the rule exists. A live link that
+// walks ".." after a name, climbs deeper than its own directory, or points at an
+// absolute path is one a restore may not depend on — the caller restores
+// side_by_side into a fresh directory instead.
+//
+// The walk is over the opened root's own FS, so the root path may itself be a
+// symlink — that is the operator's choice and os.OpenRoot followed it — while
+// only links inside the root are judged. The FS walk never follows a link and
+// every name it yields is the link's own.
+func checkLiveLinks(ctx context.Context, root *os.Root) error {
+	return fs.WalkDir(root.FS(), ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return plugin.Transient(err)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink == 0 || name == "." {
+			return nil
+		}
+		target, err := readlinkRoot(root, name)
+		if err != nil {
+			return plugin.Transient(err)
+		}
+		if why := entryRefusal(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: target}); why != "" {
+			return plugin.Permanent(fmt.Errorf("live symlink %q is not one a restore may depend on: %s; restore side_by_side into a fresh directory", name, why))
+		}
+		return nil
+	})
+}
+
 // entryRefusal is the one rule about what this package carries, and both
 // directions ask it: a Dump leaves out an entry it refuses and counts it, an
 // Apply refuses the whole archive for one. Nothing else decides, so an archive
 // this package wrote is always one it accepts: every name is relative and
-// ".."-free after Clean, every link target resolves lexically inside the root,
+// ".."-free after Clean, every symlink target stays lexically inside the root,
 // and every entry has a type this package can materialise. The returned string
 // is the reason, "" when the entry is carried.
 func entryRefusal(hdr *tar.Header) string {
@@ -179,8 +286,28 @@ func entryRefusal(hdr *tar.Header) string {
 		if path.IsAbs(target) {
 			return fmt.Sprintf("the symlink points at the absolute path %q", target)
 		}
-		joined := path.Clean(path.Join(path.Dir(clean), target))
-		if joined == ".." || strings.HasPrefix(joined, "../") {
+		// A target may climb with a leading run of "..", but no deeper than
+		// the directory the link itself sits in, and a ".." after a name is
+		// refused: the kernel resolves ".." physically, so once a name on the
+		// way may be a symlink, ".." climbs from wherever that link points.
+		// With a leading ".." run bound by the link's own depth, every climb
+		// walks a real directory of the restored tree, and everything after it
+		// only descends. Extraction additionally refuses to write through a
+		// symlink parent, so a name here is a directory, not a link.
+		up, named := 0, false
+		for _, component := range strings.Split(target, "/") {
+			switch component {
+			case "", ".":
+			case "..":
+				if named {
+					return fmt.Sprintf("the symlink target %q climbs after descending", target)
+				}
+				up++
+			default:
+				named = true
+			}
+		}
+		if up > targetDepth(path.Dir(clean)) {
 			return fmt.Sprintf("the symlink points at %q, outside the restore root", target)
 		}
 	case tar.TypeLink:
@@ -192,10 +319,18 @@ func entryRefusal(hdr *tar.Header) string {
 	return ""
 }
 
+// targetDepth is how many ".." a link directly under dir may carry, "." being
+// the restore root itself.
+func targetDepth(dir string) int {
+	if dir == "." {
+		return 0
+	}
+	return strings.Count(dir, "/") + 1
+}
+
 // validateEntry says why an archive cannot be unpacked, nil when it can: the
 // same rule Dump writes with, so an archive that passes here can be unpacked
-// without a mid-extraction refusal and no entry of it can address anything
-// outside the root.
+// without a lexical refusal.
 func validateEntry(hdr *tar.Header) error {
 	if why := entryRefusal(hdr); why != "" {
 		return fmt.Errorf("tar entry %q: %s", hdr.Name, why)
@@ -221,6 +356,10 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 	tr := tar.NewReader(src)
 	var written int64
 	var dirs []dirMode
+	// verified is parentRefusal's cache of directory prefixes. It stays sound
+	// because Apply never replaces a directory: replaceEntry refuses one and
+	// ensureDir refuses a symlink or a non-directory.
+	verified := make(map[string]struct{})
 	for {
 		if err := ctx.Err(); err != nil {
 			return written, err
@@ -233,12 +372,16 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 			return written, plugin.Transient(fmt.Errorf("reading the tar stream: %w", err))
 		}
 		name := path.Clean(hdr.Name)
+		if err := parentRefusal(root, name, verified); err != nil {
+			return written, err
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			mode := fs.FileMode(hdr.Mode) & 0o777
 			if err := ensureDir(root, name, mode); err != nil {
 				return written, err
 			}
+			verified[name] = struct{}{}
 			dirs = append(dirs, dirMode{name: name, mode: mode, uid: hdr.Uid, gid: hdr.Gid})
 			continue
 		case tar.TypeSymlink:
@@ -249,19 +392,26 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 				return written, plugin.Transient(err)
 			}
 		case tar.TypeLink:
+			// Only a regular file in the restored tree may be linked. Lstat does
+			// not follow the final component, so a symlink — archived or live —
+			// is seen as what it is and refused: a hard link to it would carry
+			// its relative target to another depth, possibly out of the root.
+			target := path.Clean(hdr.Linkname)
+			info, err := lstatRoot(root, target)
+			if err != nil || !info.Mode().IsRegular() {
+				return written, plugin.Permanent(fmt.Errorf("tar entry %q is a hard link to %q, which is not a regular file in the restored tree", hdr.Name, target))
+			}
 			if err := replaceEntry(root, name); err != nil {
 				return written, err
 			}
-			// The link source is resolved through the same root: a symlink
-			// planted in the tree cannot point it at a file outside.
-			if err := root.Link(path.Clean(hdr.Linkname), name); err != nil {
+			if err := root.Link(target, name); err != nil {
 				return written, plugin.Transient(err)
 			}
 		case tar.TypeReg:
 			if err := replaceEntry(root, name); err != nil {
 				return written, err
 			}
-			n, err := writeFile(root, name, fs.FileMode(hdr.Mode)&0o777, tr)
+			n, err := writeFile(ctx, root, name, fs.FileMode(hdr.Mode)&0o777, tr)
 			if err != nil {
 				return written, err
 			}
@@ -299,16 +449,19 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 }
 
 // writeFile creates one regular file and streams its content into it.
-func writeFile(root *os.Root, name string, mode fs.FileMode, src io.Reader) (int64, error) {
+func writeFile(ctx context.Context, root *os.Root, name string, mode fs.FileMode, src io.Reader) (int64, error) {
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
 		return 0, plugin.Transient(err)
 	}
-	n, copyErr := io.Copy(f, src)
+	n, copyErr := plugin.CopyContext(ctx, f, src)
 	if closeErr := f.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
 	if copyErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return n, ctxErr
+		}
 		return n, plugin.Transient(copyErr)
 	}
 	if err := chmodRoot(root, name, mode); err != nil {

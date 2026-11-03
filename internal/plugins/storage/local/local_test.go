@@ -52,7 +52,7 @@ func TestGeneralConformance(t *testing.T) {
 func TestStorageConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storage.Storage {
 		return newStorageIn(t, t.TempDir())
-	})
+	}, storagetest.Options{})
 }
 
 func TestKeyEscapesRoot(t *testing.T) {

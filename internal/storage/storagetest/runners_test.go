@@ -24,7 +24,7 @@ func TestKitChildRunReportsAFailedCheck(t *testing.T) {
 	if os.Getenv(kitChildEnv) != "1" {
 		t.Skip("runs in the child process of TestKitReportsFailuresByFailing")
 	}
-	Run(t, func(*testing.T) storage.Storage { return broken{Fake: NewFake(), mode: "puterr"} })
+	Run(t, func(*testing.T) storage.Storage { return broken{Fake: NewFake(), mode: "puterr"} }, Options{})
 }
 
 func TestKitChildRunMultipartReportsABadPartSize(t *testing.T) {

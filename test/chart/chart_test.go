@@ -72,9 +72,18 @@ func helmBinary(t *testing.T) string {
 }
 
 // runHelm runs one helm command in the repository root and returns its stdout,
-// or the error helm reported with its stderr.
+// or the error helm reported with its stderr. Every file the command is given
+// through `-f`/`--values` and `--set-file key=path` is read first: Go's test
+// cache only notices a changed input through the file calls the test itself
+// makes, so a render that shelled out to helm alone would report a cached pass
+// after examples/values/minimal.yaml changed.
 func runHelm(t *testing.T, dir string, args ...string) (string, error) {
 	t.Helper()
+	for _, path := range inputFiles(dir, args) {
+		if _, err := os.ReadFile(path); err != nil {
+			return "", fmt.Errorf("reading helm input %s: %w", path, err)
+		}
+	}
 	cmd := exec.Command(helmBinary(t), args...)
 	cmd.Dir = dir
 	var stdout, stderr bytes.Buffer
@@ -84,6 +93,74 @@ func runHelm(t *testing.T, dir string, args ...string) (string, error) {
 		return stdout.String(), fmt.Errorf("helm %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// inputFiles names every file a helm command line passes through `-f`/
+// `--values` and `--set-file key=path`, resolved against dir.
+func inputFiles(dir string, args []string) []string {
+	var files []string
+	add := func(path string) {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(dir, path)
+		}
+		files = append(files, path)
+	}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--values":
+			if i+1 < len(args) {
+				i++
+				add(args[i])
+			}
+		case "--set-file":
+			if i+1 < len(args) {
+				i++
+				if _, path, ok := strings.Cut(args[i], "="); ok {
+					add(path)
+				}
+			}
+		}
+	}
+	return files
+}
+
+// TestHelmInputsAreRead: the test cache tracks the files the test itself reads,
+// so runHelm must read each of its inputs. A missing file is the observable
+// case: the read fails before helm runs.
+func TestHelmInputsAreRead(t *testing.T) {
+	root := repoRoot(t)
+	missing := filepath.Join(t.TempDir(), "absent.yaml")
+	_, err := runHelm(t, root, "template", releaseName, filepath.Join(root, chartPath), "-f", missing)
+	if err == nil || !strings.Contains(err.Error(), "reading helm input") {
+		t.Fatalf("runHelm with a missing -f file returned %v, want the input read to fail first", err)
+	}
+}
+
+// TestInputFiles pins the argument forms the cache tracking depends on.
+func TestInputFiles(t *testing.T) {
+	dir := t.TempDir()
+	const absolute = "/inputs/absolute.yaml"
+	got := inputFiles(dir, []string{
+		"template", releaseName, chartPath,
+		"-f", "relative.yaml",
+		"--values", "second.yaml",
+		"--set-file", "config=" + absolute,
+		"--set-file", "no-equals",
+		"--set", "config=" + absolute,
+	})
+	want := []string{
+		filepath.Join(dir, "relative.yaml"),
+		filepath.Join(dir, "second.yaml"),
+		absolute,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("inputFiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("inputFiles[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
 }
 
 // render runs `helm template` and returns the manifest, or the error helm
@@ -813,12 +890,23 @@ func notesHeredoc(t *testing.T, notes string) string {
 	return ""
 }
 
-// kubeconform validates one rendered manifest with the tool the chart target
-// uses.
+// kubeconform validates one rendered manifest with the tool, schema pin and
+// cache the chart target uses. The Makefile exports both, so a test run outside
+// make fails here instead of quietly validating against the default upstream.
 func kubeconform(t *testing.T, root, manifest string) {
 	t.Helper()
+	location, cache := os.Getenv("KUBECONFORM_SCHEMA_LOCATION"), os.Getenv("KUBECONFORM_CACHE")
+	if location == "" || cache == "" {
+		t.Fatal("run through make: KUBECONFORM_SCHEMA_LOCATION/KUBECONFORM_CACHE unset")
+	}
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatalf("creating the kubeconform cache: %v", err)
+	}
 	cmd := exec.Command("go", "tool", "-modfile=tools/go.mod", "kubeconform",
-		"-strict", "-summary", "-kubernetes-version", "1.31.0", "-")
+		"-strict", "-summary",
+		"-cache", cache,
+		"-schema-location", location,
+		"-kubernetes-version", "1.31.0", "-")
 	cmd.Dir = root
 	cmd.Stdin = strings.NewReader(manifest)
 	if out, err := cmd.CombinedOutput(); err != nil {

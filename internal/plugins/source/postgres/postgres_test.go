@@ -206,7 +206,7 @@ func TestDumpArgsCarryNoPassword(t *testing.T) {
 		t.Errorf("dumped %q", buf.String())
 	}
 	host, port, _ := net.SplitHostPort(addr)
-	want := []string{"-h", host, "-p", port, "-U", "app", "--no-password", "-Fc", "--compress=none", "app"}
+	want := []string{"-h", host, "-p", port, "-U", "app", "--no-password", "-Fc", "--compress=none", "--dbname=dbname='app'"}
 	got := strings.Split(strings.TrimSpace(stubLog(t, "argv.pg_dump")), "\n")
 	if len(got) != len(want) {
 		t.Fatalf("argv = %q, want %q", got, want)
@@ -227,6 +227,46 @@ func TestDumpArgsCarryNoPassword(t *testing.T) {
 	}
 	if !strings.Contains(env, "PGCONNECT_TIMEOUT=1") {
 		t.Errorf("PGCONNECT_TIMEOUT not derived from connect_interval: %q", env)
+	}
+}
+
+// TestDumpPassesTheDatabaseNameAsAValue: a database name is the value of the
+// dbname keyword, never a bare argument. A bare "host=..." is read by libpq as
+// another keyword, and a bare "--file=/tmp/x" is read by pg_dump as an option;
+// either one reaches the wrong server or writes a file. The host stays the
+// instance's own.
+func TestDumpPassesTheDatabaseNameAsAValue(t *testing.T) {
+	for _, tc := range []struct{ label, name string }{
+		{"a conninfo keyword", "host=192.0.2.1"},
+		{"an option", "--file=/tmp/x"},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			name := tc.name
+			stubs(t, "pg_dump", "psql", "pg_restore")
+			stubSet(t, "out.pg_dump", "dump-bytes")
+			addr := listener(t)
+			s, err := build(t, configDB(t, addr, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			if err := s.Dump(context.Background(), &buf); err != nil {
+				t.Fatal(err)
+			}
+			host, _, _ := net.SplitHostPort(addr)
+			got := strings.Split(strings.TrimSpace(stubLog(t, "argv.pg_dump")), "\n")
+			if last := got[len(got)-1]; last != "--dbname=dbname='"+name+"'" {
+				t.Fatalf("argv = %q, want the name as a quoted dbname value", got)
+			}
+			for _, arg := range got {
+				if arg == name {
+					t.Fatalf("the name appears as a bare argument: %q", got)
+				}
+			}
+			if got[0] != "-h" || got[1] != host {
+				t.Fatalf("argv = %q, want the instance's own host %q", got, host)
+			}
+		})
 	}
 }
 
@@ -350,6 +390,9 @@ func TestCheckComparesMajors(t *testing.T) {
 		t.Fatalf("Check: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(stubLog(t, "argv.psql")), "\n")
+	if !strings.Contains(strings.Join(got, " "), "--dbname=dbname='app'") {
+		t.Fatalf("psql argv = %q, want the database as a dbname value", got)
+	}
 	if got[len(got)-1] != "select current_setting('server_version_num')" {
 		t.Fatalf("psql argv = %q", got)
 	}
@@ -454,13 +497,16 @@ func TestApplySideBySide(t *testing.T) {
 	if last := psqlArgv[len(psqlArgv)-1]; last != `CREATE DATABASE "app_restore_20261012T042000Z"` {
 		t.Fatalf("psql argv = %q", psqlArgv)
 	}
+	if !strings.Contains(strings.Join(psqlArgv, " "), "--dbname=dbname='app'") {
+		t.Fatalf("psql argv = %q, want the configured database as a dbname value", psqlArgv)
+	}
 	for _, arg := range psqlArgv {
 		if strings.Contains(arg, "s3cret-pw") {
 			t.Fatalf("the password appears on psql argv: %q", psqlArgv)
 		}
 	}
 	restoreArgv := strings.Split(strings.TrimSpace(stubLog(t, "argv.pg_restore")), "\n")
-	if !strings.Contains(strings.Join(restoreArgv, " "), "--exit-on-error -d app_restore_20261012T042000Z") {
+	if !strings.Contains(strings.Join(restoreArgv, " "), "--exit-on-error --dbname=dbname='app_restore_20261012T042000Z'") {
 		t.Fatalf("pg_restore argv = %q", restoreArgv)
 	}
 	if strings.Contains(strings.Join(restoreArgv, " "), "--clean") {
@@ -488,7 +534,7 @@ func TestApplyInPlace(t *testing.T) {
 		t.Fatalf("report = %+v", rep)
 	}
 	argv := strings.Join(strings.Split(strings.TrimSpace(stubLog(t, "argv.pg_restore")), "\n"), " ")
-	want := "--no-password --no-owner --no-acl --clean --if-exists --single-transaction -d app"
+	want := "--no-password --no-owner --no-acl --clean --if-exists --single-transaction --dbname=dbname='app'"
 	if !strings.Contains(argv, want) {
 		t.Fatalf("pg_restore argv = %q, want it to contain %q", argv, want)
 	}

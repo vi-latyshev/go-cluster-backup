@@ -2,11 +2,15 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"encoding/json/jsontext"
@@ -112,7 +116,11 @@ type VerifyResult struct {
 	OK      bool
 	Storage string
 	Bytes   int64
-	Error   string
+	// ApplySpoolBytes is what an apply of this record would need on the restore
+	// spool before the reserve — the stored object plus its decoded copy — for
+	// a decoded or probed check that read the manifest. Zero otherwise.
+	ApplySpoolBytes int64
+	Error           string
 }
 
 // StorageHold says whether one storage holds the object a fetch would read, and
@@ -268,14 +276,14 @@ func joinHolds(holds []StorageHold) string {
 // manifest — size and SHA-256 — before a single byte reaches dst or a decoder.
 // A decode reverses the chain straight from that verified spool file into dst:
 // the plaintext of a secret artifact never lands on the spool, which only Apply
-// and a probed verification need as a re-readable file.
+// needs as a re-readable file.
 func (e *Engine) Fetch(ctx context.Context, req FetchRequest, dst io.Writer) (FetchReport, error) {
 	if err := checkFetchRequest(req); err != nil {
 		return FetchReport{}, err
 	}
 	stored := req
 	stored.Decode = false
-	rep, ar, file, sp, err := e.fetchToFile(ctx, stored)
+	rep, ar, file, sp, err := e.fetchToFile(ctx, stored, 0)
 	if err != nil {
 		return rep, err
 	}
@@ -308,17 +316,25 @@ func (e *Engine) decodeTo(ctx context.Context, sp *spool.Spool, file string, ar 
 		return err
 	}
 	defer func() { _ = src.Close() }()
+	return decodeInto(ctx, ar, stages, dst, src)
+}
+
+// decodeInto reverses the manifest's chain from src into dst. It is the one
+// decode helper: a fetch's spool decode, an apply's decode into its second
+// spool file and both streaming verifications go through it, so the two
+// refusal texts live in one place.
+func decodeInto(ctx context.Context, ar model.ArtifactResult, stages []func(ctx context.Context, dst io.Writer, src io.Reader) error, dst io.Writer, src io.Reader) error {
 	cerr := chain(ctx, dst, func(ctx context.Context, w io.Writer) error {
 		_, err := plugin.CopyContext(ctx, w, src)
 		return err
 	}, stages)
-	if cerr != nil {
-		if errors.Is(cerr, errors.ErrUnsupported) {
-			return fmt.Errorf("fetch: this config cannot decode the artifact: %w", cerr)
-		}
-		return fmt.Errorf("fetch: decoding %s: %w", ar.Key, cerr)
+	if cerr == nil {
+		return nil
 	}
-	return nil
+	if errors.Is(cerr, errors.ErrUnsupported) {
+		return plugin.Permanent(fmt.Errorf("fetch: this config cannot decode the artifact: %w", cerr))
+	}
+	return plugin.Permanent(fmt.Errorf("fetch: decoding %s: %w", ar.Key, cerr))
 }
 
 func checkFetchRequest(req FetchRequest) error {
@@ -347,25 +363,177 @@ func checkFetchRequest(req FetchRequest) error {
 	return nil
 }
 
-// seekSpoolStart rewinds one spool file to its first byte. It is a seam: a Seek
-// on a regular file this process just opened is an OS failure no test can
-// provoke, and a probe retry that skipped it would read the tail of a file the
-// previous attempt already consumed.
-var seekSpoolStart = func(f io.Seeker) error {
-	_, err := f.Seek(0, io.SeekStart)
-	return err
-}
-
 // spoolFreeBytes reads the free space of the restore spool. It is a seam: the
 // call underneath is a statfs, and a filesystem error is not something a
 // configuration can reach, so a test replaces it to prove the engine reports one
 // rather than carrying on with a spool it cannot measure.
 var spoolFreeBytes = func(sp *spool.Spool) (int64, error) { return sp.FreeBytes() }
 
+// errOverflow stops a download the moment it delivers more than the manifest
+// recorded: the bytes beyond the recorded size can neither be hashed nor kept.
+var errOverflow = errors.New("the object is longer than the manifest says")
+
+// meter counts and hashes a download as it passes, and refuses a byte beyond
+// the manifest's recorded size before it reaches any sink. Both sinks have one.
+type meter struct {
+	w        io.Writer
+	hash     hash.Hash
+	n        int64
+	limit    int64
+	overflow bool
+	// over is how many bytes the download had delivered when it crossed the
+	// limit, for the skip's reason.
+	over int64
+}
+
+func (m *meter) Write(p []byte) (int, error) {
+	if m.overflow {
+		return 0, errOverflow
+	}
+	if m.n+int64(len(p)) > m.limit {
+		m.overflow = true
+		m.over = m.n + int64(len(p))
+		return 0, errOverflow
+	}
+	n, err := m.w.Write(p)
+	m.n += int64(n)
+	m.hash.Write(p[:n])
+	return n, err
+}
+
+func (m *meter) sum() string { return hex.EncodeToString(m.hash.Sum(nil)) }
+
+// Close closes the sink underneath, so a storage that closes the writer it was
+// handed ends the spool file the engine then closes again and reports.
+func (m *meter) Close() error {
+	if c, ok := m.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// detachWriter keeps a download moving after its downstream stopped reading: the
+// first write error is swallowed and every later write is accounted for, so the
+// meter still hashes the whole stream and the storage's Get can finish. A
+// decoder therefore never receives a write error the engine created.
+type detachWriter struct {
+	w      io.Writer
+	failed bool
+}
+
+func (d *detachWriter) Write(p []byte) (int, error) {
+	if !d.failed {
+		if _, err := d.w.Write(p); err != nil {
+			d.failed = true
+		}
+	}
+	return len(p), nil
+}
+
+// spoolSpaceError is the one refusal a spool write reports when it would eat
+// into the reserve: every number a deployment needs to size the spool is on it.
+type spoolSpaceError struct {
+	free, need, reserve, written int64
+	cause                        error
+}
+
+func (s *spoolSpaceError) Error() string {
+	msg := fmt.Sprintf("restore spool: free %d bytes, need %d, reserve %d, written %d", s.free, s.need, s.reserve, s.written)
+	if s.cause != nil {
+		msg += ": " + s.cause.Error()
+	}
+	return msg
+}
+
+func (s *spoolSpaceError) Unwrap() error { return s.cause }
+
+func isNoSpace(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}
+
+// copyError is one copy's failure and what the walk does with it: a skip names
+// the storage passed over; a hard error stops the walk. The wrapped error keeps
+// its own class, so the attempt loop still retries a transient one.
+type copyError struct {
+	err    error
+	skip   bool
+	reason string
+}
+
+func (c *copyError) Error() string { return c.err.Error() }
+func (c *copyError) Unwrap() error { return c.err }
+
+// spaceGuard refuses a spool write that would eat into the restore reserve. It
+// measures the filesystem again only after half the previous headroom has been
+// written, so a statfs per chunk stays cheap even on a network spool.
+type spaceGuard struct {
+	w       io.WriteCloser
+	sp      *spool.Spool
+	reserve int64
+	budget  int64
+	written int64
+	// err is the guard's own terminal verdict — a statfs failure or a space
+	// refusal — checked after the Get because a storage may recolor a write
+	// error into its own class.
+	err error
+}
+
+func (g *spaceGuard) Write(p []byte) (int, error) {
+	if g.err != nil {
+		return 0, g.err
+	}
+	if g.budget < int64(len(p)) {
+		free, err := spoolFreeBytes(g.sp)
+		if err != nil {
+			g.err = plugin.Permanent(fmt.Errorf("restore spool: %w", err))
+			return 0, g.err
+		}
+		headroom := free - g.reserve
+		if headroom < int64(len(p)) {
+			g.err = plugin.Permanent(&spoolSpaceError{free: free, need: g.written + int64(len(p)), reserve: g.reserve, written: g.written})
+			return 0, g.err
+		}
+		g.budget = headroom / 2
+		if g.budget < int64(len(p)) {
+			g.budget = int64(len(p))
+		}
+	}
+	g.budget -= int64(len(p))
+	n, err := g.w.Write(p)
+	g.written += int64(n)
+	if err != nil {
+		if isNoSpace(err) {
+			g.err = plugin.Permanent(&spoolSpaceError{need: g.written, reserve: g.reserve, written: g.written, cause: err})
+			return n, g.err
+		}
+		return n, err
+	}
+	return n, nil
+}
+
+// Close closes the spool file, and a shortage the filesystem only reports on
+// close is a space refusal like any other.
+func (g *spaceGuard) Close() error {
+	err := g.w.Close()
+	if err != nil && isNoSpace(err) {
+		g.err = plugin.Permanent(&spoolSpaceError{need: g.written, reserve: g.reserve, written: g.written, cause: err})
+	}
+	return err
+}
+
+// copyResult is what one verified copy hands back: the manifest's record and the
+// sink's own answer — the spool file to read, or the probe report.
+type copyResult struct {
+	ar    model.ArtifactResult
+	file  string
+	probe source.ProbeReport
+}
+
 // fetchToFile is the shared engine body of Fetch and Apply: it resolves the
-// object, downloads it to a verified spool file per attempt, and decodes it into
-// a second file when asked.
-func (e *Engine) fetchToFile(ctx context.Context, req FetchRequest) (FetchReport, model.ArtifactResult, string, *spool.Spool, error) {
+// object and downloads it to a verified spool file. extra is the space one copy
+// needs on the spool beyond its own bytes — an apply that decodes into a second
+// spool file asks for the artifact's raw size before the first byte.
+func (e *Engine) fetchToFile(ctx context.Context, req FetchRequest, extra int64) (FetchReport, model.ArtifactResult, string, *spool.Spool, error) {
 	if e.cfg.Restore == nil {
 		return FetchReport{}, model.ArtifactResult{}, "", nil, errors.New("restore: config has no restore section")
 	}
@@ -391,7 +559,7 @@ func (e *Engine) fetchToFile(ctx context.Context, req FetchRequest) (FetchReport
 		rep, file, err := e.fetchRaw(ctx, req, sp)
 		return rep, model.ArtifactResult{}, file, sp, err
 	}
-	return e.fetchArtifact(ctx, req, sp)
+	return e.fetchArtifact(ctx, req, sp, extra)
 }
 
 func (e *Engine) fetchRaw(ctx context.Context, req FetchRequest, sp *spool.Spool) (FetchReport, string, error) {
@@ -400,23 +568,32 @@ func (e *Engine) fetchRaw(ctx context.Context, req FetchRequest, sp *spool.Spool
 		return FetchReport{}, "", fmt.Errorf("fetch: unknown storage %q (known: %v)", req.RawStorage, e.storageNames())
 	}
 	ro := readOnlyStorage{sb.inst}
-	var w *spool.Writer
-	_, err := attempt(ctx, e.restoreRetry, "get "+req.RawKey, func(ctx context.Context, _ int) (struct{}, error) {
+	w, err := attempt(ctx, e.restoreRetry, "get "+req.RawKey, func(ctx context.Context, _ int) (*spool.Writer, error) {
 		f, err := sp.Create("raw")
 		if err != nil {
-			return struct{}{}, plugin.Permanent(err)
+			return nil, plugin.Permanent(err)
 		}
-		if err := safeCall(func() error { return ro.Get(ctx, req.RawKey, f) }); err != nil {
+		g := &spaceGuard{w: f, sp: sp, reserve: e.restoreReserve}
+		if err := safeCall(func() error { return ro.Get(ctx, req.RawKey, g) }); err != nil {
 			_ = f.Close()
 			_ = sp.Remove(f.Name())
-			return struct{}{}, err
+			if g.err != nil {
+				return nil, g.err
+			}
+			return nil, err
 		}
-		if err := f.Close(); err != nil {
+		if err := g.Close(); err != nil {
 			_ = sp.Remove(f.Name())
-			return struct{}{}, plugin.Transient(err)
+			if g.err != nil {
+				return nil, g.err
+			}
+			return nil, plugin.Transient(err)
 		}
-		w = f
-		return struct{}{}, nil
+		if g.err != nil {
+			_ = sp.Remove(f.Name())
+			return nil, g.err
+		}
+		return f, nil
 	})
 	if err != nil {
 		return FetchReport{}, "", fmt.Errorf("fetch: raw object %s on %s: %w", req.RawKey, sb.name, err)
@@ -424,7 +601,7 @@ func (e *Engine) fetchRaw(ctx context.Context, req FetchRequest, sp *spool.Spool
 	return FetchReport{Storage: sb.name, Key: req.RawKey, Bytes: w.Size(), SHA256: w.SHA256(), Verified: false}, w.Name(), nil
 }
 
-func (e *Engine) fetchArtifact(ctx context.Context, req FetchRequest, sp *spool.Spool) (FetchReport, model.ArtifactResult, string, *spool.Spool, error) {
+func (e *Engine) fetchArtifact(ctx context.Context, req FetchRequest, sp *spool.Spool, extra int64) (FetchReport, model.ArtifactResult, string, *spool.Spool, error) {
 	fail := func(rep FetchReport, err error) (FetchReport, model.ArtifactResult, string, *spool.Spool, error) {
 		return rep, model.ArtifactResult{}, "", sp, err
 	}
@@ -442,41 +619,23 @@ func (e *Engine) fetchArtifact(ctx context.Context, req FetchRequest, sp *spool.
 	surveys := map[string]survey{}
 	getSurvey := e.surveyFunc(ctx, prefix, surveys)
 
-	candidates, err := e.fetchCandidates(ctx, req, storages, getSurvey)
+	runID, sb, out, skips, err := walkDownload(ctx, e, req, storages, getSurvey,
+		func(ctx context.Context, sb *storageBinding, ar *model.ArtifactResult) (copyResult, *StorageSkip, error) {
+			file, skip, err := e.downloadSpool(ctx, sb, ar, sp, extra)
+			return copyResult{ar: *ar, file: file}, skip, err
+		})
+	rep := FetchReport{RunID: runID, Artifact: req.Artifact, Skipped: skips}
 	if err != nil {
-		return fail(FetchReport{}, fmt.Errorf("fetch: %w", err))
+		return fail(rep, err)
 	}
-
-	var lastSkips []StorageSkip
-	for _, runID := range candidates {
-		rep := FetchReport{RunID: runID, Artifact: req.Artifact}
-		var skips []StorageSkip
-		for _, sb := range storages {
-			out, ar, skip, err := e.fetchCandidate(ctx, sb, getSurvey, runID, req.Artifact, req.Decode, sp)
-			if err != nil {
-				return fail(rep, err)
-			}
-			if skip != nil {
-				skips = append(skips, *skip)
-				continue
-			}
-			rep.Storage = sb.name
-			rep.Key = ar.Key
-			rep.Bytes = ar.Bytes
-			rep.RawBytes = ar.RawBytes
-			rep.SHA256 = ar.SHA256
-			rep.Sensitivity = ar.Artifact.Sensitivity
-			rep.Verified = true
-			rep.Skipped = skips
-			return rep, ar, out, sp, nil
-		}
-		lastSkips = skips
-		if req.RunID != "" {
-			break
-		}
-	}
-	rep := FetchReport{RunID: candidates[0], Artifact: req.Artifact, Skipped: lastSkips}
-	return fail(rep, fmt.Errorf("fetch: artifact %q is not fetchable: %s", req.Artifact, joinSkips(lastSkips)))
+	rep.Storage = sb.name
+	rep.Key = out.ar.Key
+	rep.Bytes = out.ar.Bytes
+	rep.RawBytes = out.ar.RawBytes
+	rep.SHA256 = out.ar.SHA256
+	rep.Sensitivity = out.ar.Artifact.Sensitivity
+	rep.Verified = true
+	return rep, out.ar, out.file, sp, nil
 }
 
 // surveyFunc memoizes one storage survey per call group, so every path of one
@@ -587,103 +746,257 @@ func inspectRun(sur survey, runID, artifact string) (*model.ArtifactResult, stri
 	return ar, ""
 }
 
-// fetchCandidate tries one run on one storage. It returns either an outcome
-// (a verified spool file), a skip with its reason, or a hard error — a config
-// that cannot decode the recorded chain is never "skip and try elsewhere".
-func (e *Engine) fetchCandidate(ctx context.Context, sb *storageBinding, getSurvey func(*storageBinding) (survey, bool),
-	runID, artifact string, decode bool, sp *spool.Spool) (string, model.ArtifactResult, *StorageSkip, error) {
-	skip := func(reason string) (string, model.ArtifactResult, *StorageSkip, error) {
-		return "", model.ArtifactResult{}, &StorageSkip{Storage: sb.name, Reason: reason}, nil
+// walkDownload walks the runs and storages one download tries. For each copy it
+// runs the preflight — the survey's record, the Stat, the size — and hands the
+// record to take, which downloads and verdicts the copy. A skip passes to the
+// next storage; a hard error stops the walk. It is the one walk Fetch, Apply
+// and a verification use.
+func walkDownload(ctx context.Context, e *Engine, req FetchRequest, storages []*storageBinding,
+	getSurvey func(*storageBinding) (survey, bool),
+	take func(ctx context.Context, sb *storageBinding, ar *model.ArtifactResult) (copyResult, *StorageSkip, error),
+) (string, *storageBinding, copyResult, []StorageSkip, error) {
+	var zero copyResult
+	candidates, err := e.fetchCandidates(ctx, req, storages, getSurvey)
+	if err != nil {
+		return "", nil, zero, nil, fmt.Errorf("fetch: %w", err)
 	}
-	sur, ok := getSurvey(sb)
-	if !ok {
-		return skip("the storage survey failed")
+	var lastSkips []StorageSkip
+	for _, runID := range candidates {
+		var skips []StorageSkip
+		for _, sb := range storages {
+			sur, ok := getSurvey(sb)
+			if !ok {
+				skips = append(skips, StorageSkip{Storage: sb.name, Reason: "the storage survey failed"})
+				continue
+			}
+			ar, reason := inspectRun(sur, runID, req.Artifact)
+			if ar == nil {
+				skips = append(skips, StorageSkip{Storage: sb.name, Reason: reason})
+				continue
+			}
+			ro := readOnlyStorage{sb.inst}
+			st, err := attempt(ctx, e.restoreRetry, "stat "+ar.Artifact.Name, func(ctx context.Context, _ int) (model.ObjectInfo, error) {
+				return safeValue(func() (model.ObjectInfo, error) { return ro.Stat(ctx, ar.Key) })
+			})
+			if err != nil {
+				if class, _ := plugin.ClassOf(err); class == plugin.ClassNotFound {
+					skips = append(skips, StorageSkip{Storage: sb.name, Reason: "the object is not found"})
+				} else {
+					skips = append(skips, StorageSkip{Storage: sb.name, Reason: fmt.Sprintf("stat: %v", err)})
+				}
+				continue
+			}
+			if st.Size != ar.Bytes {
+				skips = append(skips, StorageSkip{Storage: sb.name,
+					Reason: fmt.Sprintf("the object is %d bytes, the manifest says %d", st.Size, ar.Bytes)})
+				continue
+			}
+			out, skip, err := take(ctx, sb, ar)
+			if err != nil {
+				return runID, sb, zero, skips, err
+			}
+			if skip != nil {
+				skips = append(skips, *skip)
+				continue
+			}
+			return runID, sb, out, skips, nil
+		}
+		lastSkips = skips
+		if req.RunID != "" {
+			break
+		}
 	}
-	ar, reason := inspectRun(sur, runID, artifact)
-	if ar == nil {
-		return skip(reason)
+	return candidates[0], nil, zero, lastSkips,
+		fmt.Errorf("fetch: artifact %q is not fetchable: %s", req.Artifact, joinSkips(lastSkips))
+}
+
+// downloadSpool downloads one copy into a verified spool file. extra is the
+// space the copy needs beyond its own bytes. A space refusal is hard: the same
+// spool serves every storage, so the walk never falls back on an older run or
+// another storage.
+func (e *Engine) downloadSpool(ctx context.Context, sb *storageBinding, ar *model.ArtifactResult, sp *spool.Spool, extra int64) (string, *StorageSkip, error) {
+	need := ar.Bytes + extra
+	free, err := spoolFreeBytes(sp)
+	if err != nil {
+		return "", nil, plugin.Permanent(fmt.Errorf("restore spool: %w", err))
+	}
+	if free-e.restoreReserve < need {
+		return "", nil, plugin.Permanent(&spoolSpaceError{free: free, need: need, reserve: e.restoreReserve})
 	}
 	ro := readOnlyStorage{sb.inst}
-	st, err := attempt(ctx, e.restoreRetry, "stat "+ar.Artifact.Name, func(ctx context.Context, _ int) (model.ObjectInfo, error) {
-		return safeValue(func() (model.ObjectInfo, error) { return ro.Stat(ctx, ar.Key) })
+	file, err := attempt(ctx, e.restoreRetry, "get "+ar.Key, func(ctx context.Context, _ int) (string, error) {
+		return spoolCopy(ctx, ro, ar, sp, e.restoreReserve)
 	})
 	if err != nil {
-		if class, _ := plugin.ClassOf(err); class == plugin.ClassNotFound {
-			return skip("the object is not found")
+		if ce, ok := errors.AsType[*copyError](err); ok {
+			if ce.skip {
+				return "", &StorageSkip{Storage: sb.name, Reason: ce.reason}, nil
+			}
+			err = ce.err
 		}
-		return skip(fmt.Sprintf("stat: %v", err))
+		return "", nil, err
 	}
-	if st.Size != ar.Bytes {
-		return skip(fmt.Sprintf("the object is %d bytes, the manifest says %d", st.Size, ar.Bytes))
+	return file, nil, nil
+}
+
+// spoolCopy is one attempt of a spool copy: the download is measured, hashed and
+// held to the manifest's size and SHA-256 before the file is handed back.
+func spoolCopy(ctx context.Context, ro storage.Storage, ar *model.ArtifactResult, sp *spool.Spool, reserve int64) (string, error) {
+	f, err := sp.Create("fetch")
+	if err != nil {
+		return "", &copyError{skip: true, reason: "download: " + err.Error(), err: plugin.Permanent(err)}
 	}
-	var w *spool.Writer
-	_, err = attempt(ctx, e.restoreRetry, "get "+ar.Key, func(ctx context.Context, _ int) (struct{}, error) {
-		f, err := sp.Create("fetch")
-		if err != nil {
-			return struct{}{}, plugin.Permanent(err)
-		}
-		if err := safeCall(func() error { return ro.Get(ctx, ar.Key, f) }); err != nil {
-			_ = f.Close()
-			_ = sp.Remove(f.Name())
-			return struct{}{}, err
-		}
-		if err := f.Close(); err != nil {
-			_ = sp.Remove(f.Name())
-			return struct{}{}, plugin.Transient(err)
-		}
-		w = f
-		return struct{}{}, nil
+	name := f.Name()
+	fail := func(err error) (string, error) {
+		_ = sp.Remove(name)
+		return "", err
+	}
+	g := &spaceGuard{w: f, sp: sp, reserve: reserve}
+	m := &meter{w: g, hash: sha256.New(), limit: ar.Bytes}
+	getErr := safeCall(func() error { return ro.Get(ctx, ar.Key, m) })
+	closeErr := g.Close()
+	switch {
+	case m.overflow:
+		return fail(&copyError{skip: true, reason: overflowReason(m.over, ar.Bytes), err: plugin.Permanent(errOverflow)})
+	case g.err != nil:
+		return fail(&copyError{err: g.err})
+	case getErr != nil:
+		return fail(&copyError{skip: true, reason: "download: " + getErr.Error(), err: getErr})
+	case closeErr != nil:
+		return fail(&copyError{skip: true, reason: "download: " + closeErr.Error(), err: closeErr})
+	case m.n != ar.Bytes:
+		return fail(&copyError{skip: true, reason: overflowReason(m.n, ar.Bytes),
+			err: plugin.Permanent(errors.New(overflowReason(m.n, ar.Bytes)))})
+	case m.sum() != ar.SHA256:
+		reason := fmt.Sprintf("sha256 is %s, the manifest says %s", m.sum(), ar.SHA256)
+		return fail(&copyError{skip: true, reason: reason, err: plugin.Permanent(errors.New(reason))})
+	}
+	return name, nil
+}
+
+func overflowReason(got, want int64) string {
+	return fmt.Sprintf("downloaded %d bytes, the manifest says %d", got, want)
+}
+
+// streamProbe consumes a decoded artifact as it flows: the probe a verification
+// runs, or a read that proves the chain alone.
+type streamProbe func(ctx context.Context, src io.Reader) (source.ProbeReport, error)
+
+// discardProbe reads the decoded stream and keeps nothing: what a decoded
+// verification needs to prove the chain without touching the disk.
+func discardProbe(ctx context.Context, src io.Reader) (source.ProbeReport, error) {
+	n, err := plugin.CopyContext(ctx, io.Discard, src)
+	return source.ProbeReport{Bytes: n}, err
+}
+
+// downloadStream downloads one copy and decodes it as it flows into consume.
+// Every attempt downloads again — there is no spool file to rewind — so a
+// consumer retried after a transient failure sees the stream from its start.
+func (e *Engine) downloadStream(ctx context.Context, sb *storageBinding, ar *model.ArtifactResult,
+	stages []func(ctx context.Context, dst io.Writer, src io.Reader) error, consume streamProbe) (source.ProbeReport, *StorageSkip, error) {
+	ro := readOnlyStorage{sb.inst}
+	probe, err := attempt(ctx, e.restoreRetry, "get "+ar.Key, func(ctx context.Context, _ int) (source.ProbeReport, error) {
+		return streamCopy(ctx, ro, ar, stages, consume)
 	})
 	if err != nil {
-		return skip(fmt.Sprintf("download: %v", err))
-	}
-	name := w.Name()
-	if w.Size() != ar.Bytes {
-		_ = sp.Remove(name)
-		return skip(fmt.Sprintf("downloaded %d bytes, the manifest says %d", w.Size(), ar.Bytes))
-	}
-	if w.SHA256() != ar.SHA256 {
-		_ = sp.Remove(name)
-		return skip(fmt.Sprintf("sha256 is %s, the manifest says %s", w.SHA256(), ar.SHA256))
-	}
-	if !decode {
-		return name, *ar, nil, nil
-	}
-	stages, err := e.decodeStages(ctx, ar.Chain)
-	if err != nil {
-		_ = sp.Remove(name)
-		return "", model.ArtifactResult{}, nil, err
-	}
-	dw, err := sp.Create("decoded")
-	if err != nil {
-		_ = sp.Remove(name)
-		return "", model.ArtifactResult{}, nil, err
-	}
-	decName := dw.Name()
-	src, err := sp.Open(name)
-	if err != nil {
-		_ = sp.Remove(name)
-		_ = sp.Remove(decName)
-		return "", model.ArtifactResult{}, nil, err
-	}
-	cerr := chain(ctx, dw, func(ctx context.Context, w io.Writer) error {
-		_, err := plugin.CopyContext(ctx, w, src)
-		return err
-	}, stages)
-	_ = src.Close()
-	if closeErr := dw.Close(); cerr == nil {
-		cerr = closeErr
-	}
-	_ = sp.Remove(name)
-	if cerr != nil {
-		_ = sp.Remove(decName)
-		if errors.Is(cerr, errors.ErrUnsupported) {
-			return "", model.ArtifactResult{}, nil,
-				fmt.Errorf("fetch: this config cannot decode the artifact: %w", cerr)
+		if ce, ok := errors.AsType[*copyError](err); ok {
+			if ce.skip {
+				return source.ProbeReport{}, &StorageSkip{Storage: sb.name, Reason: ce.reason}, nil
+			}
+			err = ce.err
 		}
-		return "", model.ArtifactResult{}, nil, fmt.Errorf("fetch: decoding %s: %w", ar.Key, cerr)
+		return source.ProbeReport{}, nil, err
 	}
-	return decName, *ar, nil, nil
+	return probe, nil, nil
+}
+
+// streamCopy is one attempt of a streaming copy. The download feeds a meter and
+// a pipe; a decoder drains that pipe into a second; the consumer reads the
+// second. The download closes the first pipe with the stream's verdict — a Get
+// error, an overflow, a size or a SHA-256 mismatch — and a clean EOF only when
+// the bytes matched the manifest. The stream's verdict is decided before the
+// consumer's own error, so a consumer that refused a corrupt copy early cannot
+// hide the corruption from the walk.
+func streamCopy(ctx context.Context, ro storage.Storage, ar *model.ArtifactResult,
+	stages []func(ctx context.Context, dst io.Writer, src io.Reader) error, consume streamProbe) (source.ProbeReport, error) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	m := &meter{w: &detachWriter{w: inW}, hash: sha256.New(), limit: ar.Bytes}
+
+	gdone := make(chan struct{})
+	var getErr error
+	go func() {
+		defer close(gdone)
+		getErr = safeCall(func() error { return ro.Get(attemptCtx, ar.Key, m) })
+		var stop error
+		switch {
+		case m.overflow:
+			stop = errOverflow
+		case getErr != nil:
+			stop = getErr
+		case m.n != ar.Bytes:
+			stop = errors.New(overflowReason(m.n, ar.Bytes))
+		case m.sum() != ar.SHA256:
+			stop = fmt.Errorf("sha256 is %s, the manifest says %s", m.sum(), ar.SHA256)
+		}
+		_ = inW.CloseWithError(stop)
+	}()
+
+	ddone := make(chan struct{})
+	var decodeErr error
+	go func() {
+		defer close(ddone)
+		decodeErr = decodeInto(attemptCtx, *ar, stages, outW, inR)
+		// A decode that stopped early must not leave the download blocked on a
+		// pipe nobody reads.
+		_ = inR.CloseWithError(decodeErr)
+		_ = outW.CloseWithError(decodeErr)
+	}()
+
+	probe, consumerErr := safeValue(func() (source.ProbeReport, error) { return consume(attemptCtx, outR) })
+	if errors.Is(consumerErr, errors.ErrUnsupported) {
+		cancel()
+		// No drain: cancel, and close both pipes so the decoder and the
+		// download are released wherever they are blocked.
+		_ = inR.CloseWithError(consumerErr)
+		_ = outR.CloseWithError(consumerErr)
+	} else {
+		// The consumer may have left before the stream ended: draining is what
+		// lets the decoder and the download finish, and it keeps a processor's
+		// own write error from being mistaken for a decode failure.
+		_, _ = io.Copy(io.Discard, outR)
+		_ = outR.Close()
+	}
+	<-gdone
+	<-ddone
+
+	// The stream's own verdict comes first, every time: a consumer that refused
+	// a corrupt copy early must not hide its SHA-256 mismatch and cost the walk
+	// the healthy copy on another storage. Only a stream that finished exactly
+	// as the manifest records it leaves the consumer's own error to be retried
+	// by its class.
+	switch {
+	case errors.Is(consumerErr, errors.ErrUnsupported):
+		return source.ProbeReport{}, &copyError{err: plugin.Permanent(consumerErr)}
+	case m.overflow:
+		return source.ProbeReport{}, &copyError{skip: true, reason: overflowReason(m.over, ar.Bytes), err: plugin.Permanent(errOverflow)}
+	case getErr != nil:
+		return source.ProbeReport{}, &copyError{skip: true, reason: "download: " + getErr.Error(), err: getErr}
+	case m.n != ar.Bytes:
+		reason := overflowReason(m.n, ar.Bytes)
+		return source.ProbeReport{}, &copyError{skip: true, reason: reason, err: plugin.Permanent(errors.New(reason))}
+	case m.sum() != ar.SHA256:
+		reason := fmt.Sprintf("sha256 is %s, the manifest says %s", m.sum(), ar.SHA256)
+		return source.ProbeReport{}, &copyError{skip: true, reason: reason, err: plugin.Permanent(errors.New(reason))}
+	case decodeErr != nil:
+		return source.ProbeReport{}, &copyError{err: decodeErr}
+	case consumerErr != nil:
+		return source.ProbeReport{}, &copyError{err: consumerErr}
+	}
+	return probe, nil
 }
 
 // nearestOK names the newest other run of the same storage where the artifact is ok.
@@ -831,7 +1144,7 @@ func (e *Engine) Apply(ctx context.Context, req ApplyRunRequest) (source.ApplyRe
 	if req.Mode == source.ApplyInPlace && !ok {
 		return source.ApplyReport{}, fmt.Errorf("apply: in_place needs a target that can probe the artifact before the first write, and type %q has no Prober", typ)
 	}
-	req.Fetch.Decode = true
+	req.Fetch.Decode = false
 	// The origin and the type were checked against the run the plan picked:
 	// the download must stay on that run. Left to Newest, the fetch would fall
 	// back to an older run whose recorded origin was never validated against
@@ -839,12 +1152,21 @@ func (e *Engine) Apply(ctx context.Context, req ApplyRunRequest) (source.ApplyRe
 	// run that was validated, instead of silently restoring another one's data.
 	req.Fetch.RunID = plan.RunID
 	req.Fetch.Newest = false
-	rep, _, file, sp, err := e.fetchToFile(ctx, req.Fetch)
+	// The decode into a second spool file needs the artifact's raw size kept
+	// free before the first byte of the copy arrives.
+	rep, ar, file, sp, err := e.fetchToFile(ctx, req.Fetch, plan.RawBytes)
 	if err != nil {
 		return source.ApplyReport{}, fmt.Errorf("apply: the validated run %s is not restorable: %w", plan.RunID, err)
 	}
 	defer func() { _ = sp.Remove(file) }()
-	src, err := sp.Open(file)
+	// The decode happens after the copy verified, into its own guarded spool
+	// file: the restorer and the in-place probe both need a re-readable stream.
+	decoded, err := e.decodeSpool(ctx, sp, file, ar)
+	if err != nil {
+		return source.ApplyReport{}, err
+	}
+	defer func() { _ = sp.Remove(decoded) }()
+	src, err := sp.Open(decoded)
 	if err != nil {
 		return source.ApplyReport{}, err
 	}
@@ -864,6 +1186,44 @@ func (e *Engine) Apply(ctx context.Context, req ApplyRunRequest) (source.ApplyRe
 	return safeValue(func() (source.ApplyReport, error) {
 		return restorer.Apply(ctx, source.ApplyRequest{Mode: req.Mode, Label: rep.RunID, Options: options}, src)
 	})
+}
+
+// decodeSpool decodes a verified spool file into a second spool file the probe
+// or the restorer reads. The second file is written under the reserve too: its
+// size is the manifest's raw size, which a staged artifact can understate.
+func (e *Engine) decodeSpool(ctx context.Context, sp *spool.Spool, file string, ar model.ArtifactResult) (string, error) {
+	stages, err := e.decodeStages(ctx, ar.Chain)
+	if err != nil {
+		return "", err
+	}
+	dw, err := sp.Create("decoded")
+	if err != nil {
+		return "", err
+	}
+	name := dw.Name()
+	fail := func(err error) (string, error) {
+		_ = sp.Remove(name)
+		return "", err
+	}
+	g := &spaceGuard{w: dw, sp: sp, reserve: e.restoreReserve}
+	src, err := sp.Open(file)
+	if err != nil {
+		_ = g.Close()
+		return fail(err)
+	}
+	derr := decodeInto(ctx, ar, stages, g, src)
+	_ = src.Close()
+	cerr := g.Close()
+	if g.err != nil {
+		return fail(g.err)
+	}
+	if derr != nil {
+		return fail(derr)
+	}
+	if cerr != nil {
+		return fail(cerr)
+	}
+	return name, nil
 }
 
 // resolveTarget builds the source an apply or a probe writes to: a static source
@@ -999,80 +1359,87 @@ func (e *Engine) verifyArtifacts(ctx context.Context, req VerifyRequest, storage
 }
 
 func (e *Engine) verifyOne(ctx context.Context, req VerifyRequest, storages []*storageBinding, artifact string) VerifyResult {
-	res := VerifyResult{Artifact: artifact, Depth: req.Depth}
-	switch req.Depth {
-	case "stored":
-		res = e.verifyStored(ctx, req, storages, artifact)
+	if req.Depth == "stored" {
+		res := e.verifyStored(ctx, req, storages, artifact)
 		res.Depth = req.Depth
-	case "decoded":
-		sub := req.Fetch
-		sub.Artifact = artifact
-		sub.Decode = false
-		rep, ar, file, sp, err := e.fetchToFile(ctx, sub)
-		if err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		defer func() { _ = sp.Remove(file) }()
-		if err := e.decodeTo(ctx, sp, file, ar, io.Discard); err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		res.OK, res.Storage, res.Bytes, res.RunID = true, rep.Storage, rep.RawBytes, rep.RunID
-	case "probed":
-		// A discovered target is built for this artifact of the walk: it is
-		// closed when this verify call returns, error paths included.
-		scope := &closerScope{}
-		defer func() {
-			if err := scope.close(); err != nil {
-				e.event(human.Failure("target.close.failed", human.Text("reason", err.Error())))
-			}
-		}()
-		sub := req.Fetch
-		sub.Artifact = artifact
-		sub.Decode = true
-		rep, ar, file, sp, err := e.fetchToFile(ctx, sub)
-		if err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		defer func() { _ = sp.Remove(file) }()
-		target, typ, err := e.resolveTarget(ctx, req.Target, artifact, scope)
-		if err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		if ar.Source.Type != "" && typ != ar.Source.Type {
-			res.Error = fmt.Sprintf("the target is type %q, the manifest's source is type %q", typ, ar.Source.Type)
-			return res
-		}
-		prober, ok := target.(source.Prober)
-		if !ok {
-			res.Error = fmt.Sprintf("target type %q has no Prober", typ)
-			return res
-		}
-		f, err := sp.Open(file)
-		if err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		defer func() { _ = f.Close() }()
-		probe, err := attempt(ctx, e.restoreRetry, "probe "+artifact, func(ctx context.Context, _ int) (source.ProbeReport, error) {
-			// A Prober consumes the stream, and every attempt gets the same
-			// descriptor: rewind first, or a retry would probe the tail of a
-			// file the previous attempt already read — and a Prober that takes
-			// EOF for an empty archive would call a corrupt artifact sound.
-			if err := seekSpoolStart(f); err != nil {
-				return source.ProbeReport{}, plugin.Permanent(err)
-			}
-			return safeValue(func() (source.ProbeReport, error) { return prober.Probe(ctx, f) })
-		})
-		if err != nil {
-			res.Error = err.Error()
-			return res
-		}
-		res.OK, res.Storage, res.Bytes, res.RunID = true, rep.Storage, probe.Bytes, rep.RunID
+		return res
 	}
+	if req.Depth == "decoded" {
+		return e.verifyStream(ctx, req, storages, artifact, "", discardProbe)
+	}
+	// A discovered target is built for this artifact of the walk: it is closed
+	// when this verify call returns, error paths included.
+	scope := &closerScope{}
+	defer func() {
+		if err := scope.close(); err != nil {
+			e.event(human.Failure("target.close.failed", human.Text("reason", err.Error())))
+		}
+	}()
+	res := VerifyResult{Artifact: artifact, Depth: req.Depth}
+	target, typ, err := e.resolveTarget(ctx, req.Target, artifact, scope)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	prober, ok := target.(source.Prober)
+	if !ok {
+		res.Error = fmt.Sprintf("target type %q has no Prober", typ)
+		return res
+	}
+	return e.verifyStream(ctx, req, storages, artifact, typ,
+		func(ctx context.Context, src io.Reader) (source.ProbeReport, error) {
+			return safeValue(func() (source.ProbeReport, error) { return prober.Probe(ctx, src) })
+		})
+}
+
+// verifyStream verifies one artifact without leaving the decoded plaintext on
+// the engine's disk: the download is decoded as it streams into consume. The
+// walk, the preflight and the verdicts are the download path's own.
+func (e *Engine) verifyStream(ctx context.Context, req VerifyRequest, storages []*storageBinding, artifact, typ string, consume streamProbe) VerifyResult {
+	res := VerifyResult{Artifact: artifact, Depth: req.Depth}
+	if e.cfg.Layout.RunPrefix.Text() == "" {
+		res.Error = "config has no layout section"
+		return res
+	}
+	prefix, err := runPrefixLiteral(e.cfg.Layout.RunPrefix.Text())
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	surveys := map[string]survey{}
+	getSurvey := e.surveyFunc(ctx, prefix, surveys)
+	sub := req.Fetch
+	sub.Artifact = artifact
+	sub.Decode = false
+	take := func(ctx context.Context, sb *storageBinding, ar *model.ArtifactResult) (copyResult, *StorageSkip, error) {
+		// The manifest's own record is the only thing the target's type may be
+		// checked against, and it is checked before the copy's first byte.
+		if typ != "" && ar.Source.Type != "" && typ != ar.Source.Type {
+			return copyResult{}, nil, fmt.Errorf("the target is type %q, the manifest's source is type %q", typ, ar.Source.Type)
+		}
+		stages, err := e.decodeStages(ctx, ar.Chain)
+		if err != nil {
+			return copyResult{}, nil, err
+		}
+		probe, skip, err := e.downloadStream(ctx, sb, ar, stages, consume)
+		return copyResult{ar: *ar, probe: probe}, skip, err
+	}
+	runID, sb, out, _, err := walkDownload(ctx, e, sub, storages, getSurvey, take)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	res.RunID = runID
+	res.OK = true
+	res.Storage = sb.name
+	if req.Depth == "probed" {
+		res.Bytes = out.probe.Bytes
+	} else {
+		res.Bytes = out.ar.RawBytes
+	}
+	// What an apply of this record would need on the restore spool: the stored
+	// object plus its decoded copy, before the reserve.
+	res.ApplySpoolBytes = out.ar.Bytes + out.ar.RawBytes
 	return res
 }
 

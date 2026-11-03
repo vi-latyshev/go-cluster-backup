@@ -116,7 +116,7 @@ func TestOptOutCoverageTable(t *testing.T) {
 			name: "a declared claim is read at the path of its volume",
 			seed: func(srv *kubeapitest.Server) {
 				srv.AddPVC(boundPVC("ns", "media", files, "Bound", "pv-media"))
-				srv.AddPV(`{"metadata":{"name":"pv-media"},"spec":{"local":{"path":"/var/lib/rancher/k3s/storage/pvc-media"}}}`)
+				srv.AddPV(`{"metadata":{"name":"pv-media"},"spec":{"local":{"path":"/var/lib/rancher/k3s/storage/pvc-media"},"claimRef":{"namespace":"ns","name":"media","uid":"uid-ns-media"}}}`)
 			},
 			rules: []ruleFixture{declared("backup.example/engine=files")},
 			want:  []foundWant{{instance: "volumes/ns/media", artifact: "ns/media", verdict: "ok"}},
@@ -249,8 +249,8 @@ func TestVolumePathReadsTheVolumeListingOnce(t *testing.T) {
 	srv := kubeapitest.New(t)
 	srv.AddPVC(boundPVC("ns", "media", map[string]string{"backup.example/engine": "files"}, "Bound", "pv-media"))
 	srv.AddPVC(boundPVC("ns", "other", map[string]string{"backup.example/engine": "files"}, "Bound", "pv-hostpath"))
-	srv.AddPV(`{"metadata":{"name":"pv-media"},"spec":{"local":{"path":"/var/lib/rancher/k3s/storage/pvc-media"}}}`)
-	srv.AddPV(`{"metadata":{"name":"pv-hostpath"},"spec":{"hostPath":{"path":"/srv/host"}}}`)
+	srv.AddPV(`{"metadata":{"name":"pv-media"},"spec":{"local":{"path":"/var/lib/rancher/k3s/storage/pvc-media"},"claimRef":{"namespace":"ns","name":"media","uid":"uid-ns-media"}}}`)
+	srv.AddPV(`{"metadata":{"name":"pv-hostpath"},"spec":{"hostPath":{"path":"/srv/host"},"claimRef":{"namespace":"ns","name":"other","uid":"uid-ns-other"}}}`)
 	rule := simpleRule("volumes", "persistentvolumeclaims", "backup.example/engine=files", "Bound")
 	rule.Source.Config = map[string]any{"root": "{{ volumePath }}", "ignore_vanished": true}
 
@@ -297,10 +297,26 @@ func TestVolumePathProblemsStayWithTheClaim(t *testing.T) {
 			want: `the cluster has no persistentvolume named "pv-gone"`,
 		},
 		{
+			name: "bound to another claim",
+			seed: func(srv *kubeapitest.Server) {
+				srv.AddPVC(boundPVC("ns", "media", map[string]string{"backup.example/engine": "files"}, "Bound", "pv-other"))
+				srv.AddPV(`{"metadata":{"name":"pv-other"},"spec":{"local":{"path":"/srv/other"},"claimRef":{"namespace":"ns","name":"database","uid":"uid-ns-database"}}}`)
+			},
+			want: "persistentvolume \"pv-other\" is bound to claim ns/database, not to this claim",
+		},
+		{
+			name: "bound to no claim",
+			seed: func(srv *kubeapitest.Server) {
+				srv.AddPVC(boundPVC("ns", "media", map[string]string{"backup.example/engine": "files"}, "Bound", "pv-free"))
+				srv.AddPV(`{"metadata":{"name":"pv-free"},"spec":{"local":{"path":"/srv/free"}}}`)
+			},
+			want: "persistentvolume \"pv-free\" is bound to no claim",
+		},
+		{
 			name: "not a volume on a node",
 			seed: func(srv *kubeapitest.Server) {
 				srv.AddPVC(boundPVC("ns", "media", map[string]string{"backup.example/engine": "files"}, "Bound", "pv-csi"))
-				srv.AddPV(`{"metadata":{"name":"pv-csi"},"spec":{}}`)
+				srv.AddPV(`{"metadata":{"name":"pv-csi"},"spec":{"claimRef":{"namespace":"ns","name":"media","uid":"uid-ns-media"}}}`)
 			},
 			want: "is not a volume on a node",
 		},
@@ -349,6 +365,31 @@ func TestVolumePathProblemsStayWithTheClaim(t *testing.T) {
 				t.Fatalf("ProblemRetryable = %v, want %v", claimFound.ProblemRetryable, tc.retryable)
 			}
 		})
+	}
+}
+
+// TestReviewVolumeBindingUsesUID: deleting and recreating a claim of the same
+// namespace and name leaves the old volume's claimRef naming the deleted
+// incarnation. The binding is the uid, not the name, so the recreated claim
+// must not be read from the old claim's volume.
+func TestReviewVolumeBindingUsesUID(t *testing.T) {
+	srv := kubeapitest.New(t)
+	srv.AddPVC(`{"metadata":{"name":"media","namespace":"ns","uid":"new-claim","labels":{"backup.example/engine":"files"}},"spec":{"volumeName":"pv-old"},"status":{"phase":"Pending"}}`)
+	srv.AddPV(`{"metadata":{"name":"pv-old"},"spec":{"local":{"path":"/srv/old-claim"},"claimRef":{"namespace":"ns","name":"media","uid":"deleted-claim"}}}`)
+	rule := simpleRule("volumes", "persistentvolumeclaims", "backup.example/engine=files", "Pending")
+	rule.Source.Config = map[string]any{"root": "{{ volumePath }}", "ignore_vanished": true}
+
+	found := discover(t, newDiscoverer(t, srv, rule))
+	if len(found) != 1 || found[0].Problem == "" {
+		t.Fatalf("a reused name accepted another claim's volume: %+v", found)
+	}
+	for _, want := range []string{`uid "deleted-claim"`, `uid "new-claim"`} {
+		if !strings.Contains(found[0].Problem, want) {
+			t.Fatalf("the problem %q does not name %q", found[0].Problem, want)
+		}
+	}
+	if strings.Contains(string(found[0].Config), "/srv/old-claim") {
+		t.Fatalf("the claim was given the old incarnation's volume: %s", found[0].Config)
 	}
 }
 

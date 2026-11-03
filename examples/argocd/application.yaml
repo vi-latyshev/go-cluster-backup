@@ -14,7 +14,7 @@ spec:
     # A Helm chart from an OCI registry: Argo CD pulls it as a Helm chart.
     repoURL: ghcr.io/vi-latyshev/charts
     chart: go-cluster-backup
-    targetRevision: 1.0.0
+    targetRevision: 1.1.4
     helm:
       # The `config` below is byte-identical to examples/config/minimal.yaml;
       # a test in test/chart asserts the equality, so the two cannot drift.

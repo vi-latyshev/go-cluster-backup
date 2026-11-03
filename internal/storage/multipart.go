@@ -60,6 +60,12 @@ type MultipartUploader interface {
 	// permanent error; a size that needs no parts is errors.ErrUnsupported,
 	// answered without touching the service, and the engine then uses Put. The
 	// returned PartSize is the size the caller must slice the object into.
+	//
+	// While the engine is still producing the object, Size is the bytes produced
+	// so far — a lower bound — and SHA256 is empty; the engine asks again as the
+	// object grows, so a size that needs no parts must be answered
+	// errors.ErrUnsupported without touching the service. Parts may be sent
+	// while the object grows; CompleteMultipart is called only once it is whole.
 	BeginMultipart(ctx context.Context, req PutRequest) (MultipartSession, error)
 	// PutPart sends one part. Sending a number again replaces the part the
 	// service already holds under it — which is what a retry of one part is.

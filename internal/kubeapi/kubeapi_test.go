@@ -117,7 +117,7 @@ func TestListPVCsCarriesEveryPhase(t *testing.T) {
 // rule can turn a claim into a readable directory with.
 func TestListPVs(t *testing.T) {
 	srv := kubeapitest.New(t)
-	srv.AddPV(`{"metadata":{"name":"pv-1","labels":{"type":"local"}},"spec":{"local":{"path":"/var/lib/rancher/k3s/storage/pvc-1"}}}`)
+	srv.AddPV(`{"metadata":{"name":"pv-1","labels":{"type":"local"}},"spec":{"local":{"path":"/var/lib/rancher/k3s/storage/pvc-1"},"claimRef":{"namespace":"media","name":"media","uid":"uid-media-media"}}}`)
 	srv.AddPV(`{"metadata":{"name":"pv-2"},"spec":{"hostPath":{"path":"/srv/data"}}}`)
 	c := client(t, srv)
 	pvs, err := c.ListPVs(context.Background(), kubeapi.ListRequest{Selector: "type=local", PageSize: 500})
@@ -126,6 +126,11 @@ func TestListPVs(t *testing.T) {
 	}
 	if len(pvs) != 1 || pvs[0].Spec.Local == nil || pvs[0].Spec.Local.Path != "/var/lib/rancher/k3s/storage/pvc-1" {
 		t.Fatalf("pvs = %+v", pvs)
+	}
+	// The binding is what makes a claim's volumeName trustworthy: a claim
+	// pointed at another claim's volume must be refused by the caller.
+	if ref := pvs[0].Spec.ClaimRef; ref == nil || ref.Namespace != "media" || ref.Name != "media" || ref.UID != "uid-media-media" {
+		t.Fatalf("claimRef = %+v, want media/media uid-media-media", pvs[0].Spec.ClaimRef)
 	}
 	if _, err := c.ListPVs(context.Background(), kubeapi.ListRequest{PageSize: 0}); err == nil {
 		t.Fatal("a listing without a page size was accepted")

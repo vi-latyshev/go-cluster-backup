@@ -75,7 +75,10 @@ func TestProduceSpoolFreeBytesFails(t *testing.T) {
 	plan := artifactPlan{instance: "x", srcType: "fake", src: &fakeSource{data: []byte("z")},
 		artifact: model.Artifact{Group: "g", Name: "n"}}
 
-	_, err = e.produce(context.Background(), sp, plan)
+	if err := e.resolveTraits(context.Background(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.produce(context.Background(), sp, plan, nil)
 	if err == nil || !strings.Contains(err.Error(), "statfs") {
 		t.Fatalf("err = %v, want the statfs failure", err)
 	}
@@ -102,7 +105,10 @@ func TestProduceSpoolCreateFails(t *testing.T) {
 	plan := artifactPlan{instance: "x", srcType: "fake", src: &fakeSource{data: []byte("z")},
 		artifact: model.Artifact{Group: "g", Name: "n"}}
 
-	_, err = e.produce(context.Background(), sp, plan)
+	if err := e.resolveTraits(context.Background(), &plan); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.produce(context.Background(), sp, plan, nil)
 	if err == nil || !strings.Contains(err.Error(), "spool") {
 		t.Fatalf("err = %v, want the spool create failure", err)
 	}

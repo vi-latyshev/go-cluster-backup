@@ -100,7 +100,7 @@ func TestUnitsEnumeratesEveryDatabase(t *testing.T) {
 	// The enumeration is the server's own answer: the query asks for the
 	// databases a dump can reach, and the password travels in the environment.
 	argv := stubLog(t, "argv.psql")
-	if !strings.Contains(argv, "datallowconn") || !strings.Contains(argv, "-d\napp") {
+	if !strings.Contains(argv, "datallowconn") || !strings.Contains(argv, "--dbname=dbname='app'") {
 		t.Fatalf("psql argv = %q, want the enumeration query against the configured database", argv)
 	}
 	if env := stubLog(t, "env.psql"); !strings.Contains(env, "PGPASSWORD=s3cret-pw") {

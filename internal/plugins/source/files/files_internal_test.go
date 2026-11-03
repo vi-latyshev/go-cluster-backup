@@ -15,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"encoding/json/jsontext"
+
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/source"
 )
 
 // fakeEntry stands in for a directory entry whose file vanished between the
@@ -619,6 +622,131 @@ func TestExtractReturnsOnCancellation(t *testing.T) {
 	cancel()
 	if _, err := extract(ctx, extractRoot(t, t.TempDir()), bytes.NewReader(nil), false); !errors.Is(err, context.Canceled) {
 		t.Fatalf("extract = %v, want context.Canceled", err)
+	}
+}
+
+// TestCheckLiveLinksAcceptsAConformingTree: a live tree whose links all obey
+// the archive rule is what an in_place restore may depend on.
+func TestCheckLiveLinksAcceptsAConformingTree(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{"a/up": "..", "a/down": "b", "top": "a"} {
+		if err := os.Symlink(target, filepath.Join(root, filepath.FromSlash(name))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := checkLiveLinks(context.Background(), extractRoot(t, root)); err != nil {
+		t.Fatalf("checkLiveLinks = %v", err)
+	}
+}
+
+// TestCheckLiveLinksReturnsOnCancellation: the caller's stop ends the walk.
+func TestCheckLiveLinksReturnsOnCancellation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := checkLiveLinks(ctx, extractRoot(t, root)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkLiveLinks = %v, want context.Canceled", err)
+	}
+}
+
+// TestCheckLiveLinksReportsALinkItCannotRead: a link whose target cannot be
+// read is transient, never silently accepted.
+func TestCheckLiveLinksReportsALinkItCannotRead(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Symlink("nowhere", filepath.Join(root, "l")); err != nil {
+		t.Fatal(err)
+	}
+	withSeam(t, &readlinkRoot, func(*os.Root, string) (string, error) {
+		return "", errors.New("injected readlink failure")
+	})
+	err := checkLiveLinks(context.Background(), extractRoot(t, root))
+	if err == nil {
+		t.Fatal("checkLiveLinks accepted a link it could not read")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("class = %q, want transient (%v)", class, err)
+	}
+}
+
+// TestCheckLiveLinksReportsADirectoryItCannotWalk: an unreadable directory
+// under the root is a transient walk failure, not a pass.
+func TestCheckLiveLinksReportsADirectoryItCannotWalk(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads a directory whatever its mode")
+	}
+	root := t.TempDir()
+	locked := filepath.Join(root, "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	err := checkLiveLinks(context.Background(), extractRoot(t, root))
+	if err == nil {
+		t.Fatal("checkLiveLinks walked through an unreadable directory")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("class = %q, want transient (%v)", class, err)
+	}
+}
+
+// TestApplyReportsARootItCannotOpen: the walk and MkdirAll make the open a
+// race, so the failure is bound through the seam and classified transient.
+func TestApplyReportsARootItCannotOpen(t *testing.T) {
+	withSeam(t, &openRoot, func(string) (*os.Root, error) {
+		return nil, errors.New("injected open failure")
+	})
+	root := t.TempDir()
+	s := &Source{cfg: Config{Root: root}, log: slog.New(slog.DiscardHandler)}
+	archive := tarStream(t, []tar.Header{{Name: "a.txt", Typeflag: tar.TypeReg, Mode: 0o644}}, []string{"x"})
+	_, err := s.Apply(context.Background(), source.ApplyRequest{
+		Mode: source.ApplyInPlace, Label: "l",
+		Options: jsontext.Value(`{"preserve_owner": false, "side_by_side_dir": ".restore-{{ .Label }}"}`),
+	}, bytes.NewReader(archive))
+	if err == nil {
+		t.Fatal("Apply accepted a root it could not open")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("class = %q, want transient (%v)", class, err)
+	}
+}
+
+// TestParentRefusalReportsALookupItCannotFinish: an Lstat failure that is not
+// absence is transient — the pass cannot tell what the parent is.
+func TestParentRefusalReportsALookupItCannotFinish(t *testing.T) {
+	withSeam(t, &lstatRoot, func(*os.Root, string) (fs.FileInfo, error) {
+		return nil, errors.New("injected lstat failure")
+	})
+	err := parentRefusal(extractRoot(t, t.TempDir()), "a/b", map[string]struct{}{})
+	if err == nil {
+		t.Fatal("parentRefusal accepted a parent it could not read")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("class = %q, want transient (%v)", class, err)
+	}
+}
+
+// TestExtractRefusesAHardLinkItCannotInspect: a target the pass cannot read is
+// never linked.
+func TestExtractRefusesAHardLinkItCannotInspect(t *testing.T) {
+	withSeam(t, &lstatRoot, func(*os.Root, string) (fs.FileInfo, error) {
+		return nil, errors.New("injected lstat failure")
+	})
+	archive := tarStream(t, []tar.Header{{Name: "h", Typeflag: tar.TypeLink, Linkname: "t"}}, []string{""})
+	_, err := extract(context.Background(), extractRoot(t, t.TempDir()), bytes.NewReader(archive), false)
+	if err == nil {
+		t.Fatal("extract linked a target it could not inspect")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
 

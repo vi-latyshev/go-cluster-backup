@@ -63,6 +63,75 @@ arrive already encoded — `staged`, reading what `stage` left — declares no
 pipeline: it carries the chain of the process that produced its bytes, and the
 manifest records that chain.
 
+### Sizing
+
+The processor knobs trade CPU, memory and stored size, and nothing else here
+costs as much as a badly chosen `zstd` window. These are measured numbers, not
+estimates: the tool on one CPU, window 8 MiB, PostgreSQL 18 client, median of
+three runs — stored size, the tool's own CPU seconds and wall seconds while
+producing, and peak RSS. The wall includes `pg_dump`, so it moves with the
+server as much as with the level.
+
+| Corpus | Compressor | Stored MiB | CPU s | Wall s | RSS MiB |
+|---|---|---|---|---|---|
+| synthetic, 3.6 GiB, 8M-row COPY text | `fastest` | 885.6 | 13.46 | 14.37 | 36.1 |
+| | `default` | 932.9 | 16.54 | 17.42 | 36.1 |
+| | `better` | 766.6 | 21.76 | 22.28 | 40.1 |
+| | native `zstd:1` | 863.4 | 8.51 | 9.09 | 16.8 |
+| | native `zstd:6` | 882.4 | 30.16 | 30.67 | 17.0 |
+| real, 2.1 GiB | `fastest` | 38.5 | 4.42 | 8.53 | 34.1 |
+| | `default` | 36.4 | 4.01 | 8.12 | 37.9 |
+| | `better` | 30.0 | 5.24 | 8.32 | 40.0 |
+| | native `zstd:1` | 64.4 | 2.73 | 8.14 | 18.9 |
+| | native `zstd:6` | 39.7 | 4.35 | 8.33 | 16.8 |
+| real, 161 MiB | `fastest` | 136.5 | 0.54 | 0.82 | 36.0 |
+| | `default` | 72.1 | 0.98 | 1.23 | 36.0 |
+| | `better` | 70.6 | 1.24 | 1.43 | 40.1 |
+| | native `zstd:1` | 70.6 | 0.42 | 0.62 | 16.8 |
+| | native `zstd:6` | 74.7 | 1.91 | 2.04 | 16.8 |
+
+`fastest` and `default` are different heuristics, not neighbouring points on
+one scale: on the 161 MiB dump `fastest` produced about twice the bytes of
+`default`, on the synthetic one fewer. `better` was smallest on every corpus,
+at 1.3 to 2.3 times the cheapest level's CPU. The corpus reorders the middle
+rows, so measure your own dump the same way — compress the same raw file at
+each level and compare size and CPU — before changing a level.
+
+- **`window_bytes`** — the encoder's memory is roughly `window_bytes` times
+  `concurrency`, so a bigger window costs memory before it buys anything. Past
+  8 MiB the gain on a database dump is small; the examples ship 8 MiB.
+  `decode_window_bytes` is the restore's own ceiling: set it to the largest
+  window any run still in retention was written with, and never lower it to
+  match a later reduction.
+- **`concurrency`** — above 1 it overlaps encoding with reading and writing;
+  the match search inside a frame stays serial, so on one CPU it buys little
+  and costs memory. Keep it no higher than the CPU the pod really gets (the
+  chart's limit is one CPU). The writer is CPU-bound — its dump and its
+  compression share the container's CPU limit — so on a busy node raise
+  `resources.requests.cpu` toward the limit, and raise the limit itself to
+  finish a run sooner.
+- **Native `pg_dump` compression** — the `postgres` source passes
+  `compression` to `pg_dump --compress`, and it defaults to `none` because the
+  pipeline compresses. A deployment may let `pg_dump` compress instead
+  (`zstd:3`, `lz4`, …) and declare no `zstd` processor for that artifact: one
+  compressor, never both. The stored object is then already compressed, so its
+  recorded raw size is the compressed size and a message's ratio reads about
+  1.0×. No native setting dominated every corpus — `zstd:1` beat `fastest` on
+  the synthetic and the 161 MiB dumps and lost badly on the 2.1 GiB one, and
+  `zstd:6` stayed larger than `better` everywhere — so it is a choice, not a
+  default.
+- **Upload fan-out** — after the producers, uploads bound a run: they are
+  network-bound, so `run.storage_parallelism` (4 by default) sends objects to
+  several storages at once. With two storages across an emulated 400 Mbit/s
+  link per storage, uploading one at a time left the second storage's time on
+  the wall; running them together cut measured wall time by 34–39% on the
+  synthetic dump and 8–13% on the 2.1 GiB one.
+- **Storage scheme** — point an `s3` endpoint at `https://`. The plugin accepts
+  `http://`, so nothing refuses it, but the credentials and every artifact byte
+  then cross the network in clear text. `pg_dump` speaks TLS through libpq's
+  own `PGSSLMODE`, set in the chart's `extraEnv`; the `postgres` source has no
+  TLS field of its own.
+
 ### Artifact
 
 One logical unit: a database dump, a cache snapshot, a file tree as one tar
@@ -236,8 +305,9 @@ storage's `CapExceeded`, `CapLimitBytes` and `CapUsedBytes` and a lease refusal
 | `run.finish_allowance` | the ending beyond that deadline; the manifests take its first half and are written together, so a storage that stalls on its own manifest costs only its own record, while the finished notification and the catalog entry keep the second half |
 | `run.max_artifact_bytes` | one artifact: a source that would produce more is stopped and that artifact fails, so one oversized volume cannot fill the spool |
 | `run.spool_reserve_bytes` | free space kept free in the spool; below it an artifact fails rather than filling the filesystem |
+| `restore.spool_reserve_bytes` | free space kept beyond the object being written to the restore spool, checked before the first byte and during every write |
 | `storages.<name>.time_budget` | the time spent inside that storage's own calls in one run — uploads, listings, deletes, the survey — never a source's dump or a processor's compression |
-| `run.storage_parallelism` | how many storages upload at once; with `1` the per-storage budgets add up against the same wall clock, so `run.deadline` must sit above their sum plus production |
+| `run.storage_parallelism` | how many storages upload at once, `4` by default. Overlapping holds one `run.storage_parallelism` slot from the storage's first call to its last; a storage that gets no slot, or has no multipart capability, uploads after produce on the finished file. With overlap, `run.deadline` must sit above max(production, upload) plus the finishing tail, not above their sum |
 | `run.lease_wait`, `run.lease_poll` | how long a scheduled run waits for a live writer lease, and how often it asks again; a manual run never waits |
 | `run.retry`, `run.unclassified_error` | the engine's retry policy for every plugin call, including the class an error a plugin did not classify gets |
 | `run.notifier_failure_is_fatal` | with the flag, a finished event no notifier delivered makes the outcome `failed`; a failed started notification only degrades it, a notifier that skips an event counts as neither delivered nor failed, and with the flag off neither event's failure changes the outcome |
@@ -248,12 +318,31 @@ through a storage that uploads in parts: the engine sends one part per call, so
 a failed part is re-sent and the parts already accepted are not, and an upload
 that keeps failing is aborted rather than left billed — on a context of its own,
 bounded by a tenth of the storage's `request_timeout`, because an abort fires
-exactly when the run's ending needs its seconds. A run starts by sweeping what a
-killed predecessor left behind: every incomplete multipart upload under the
-storage's own prefix, begun before `now − (run.deadline + run.finish_allowance)`
-— older than the longest a live run can last, so an upload an overlapping run is
-still writing is never taken — is aborted once per storage per run, and a sweep
-that fails leaves the storage's occupancy unknown instead of guessing it.
+exactly when the run's ending needs its seconds. An object past 10,000 parts is
+refused at part 10,001 — more than 156 GiB at the default 16 MiB part. A run
+starts by sweeping what a killed predecessor left behind: every incomplete
+multipart upload under the storage's own prefix, begun before `now −
+(run.deadline + run.finish_allowance)` — older than the longest a live run can
+last, so an upload an overlapping run is still writing is never taken — is
+aborted once per storage per run, and a sweep that fails leaves the storage's
+occupancy unknown instead of guessing it. A SIGKILL during produce can leave an
+incomplete multipart upload, and this sweep is what removes it.
+
+An artifact is not held back until its dump ends: a storage with the multipart
+capability begins sending parts as the spool grows past one part and sends
+Complete only when the artifact is whole, while `local` and `yandex_disk`
+upload after produce, on the finished file. The spool still holds the whole
+artifact either way — a failed storage is replayed from it and the later
+storages read it — so `run.spool_dir` must hold `run.max_artifact_bytes`
+whatever the overlap. While the size is unknown, an overlapping upload reserves
+`run.max_artifact_bytes` against the storage's `max_total_bytes`; when the
+artifact is whole the reservation is lowered to the exact size before Complete.
+A manual run whose bound does not fit does not overlap: it uploads after
+produce and is admitted or refused on the exact size, as before. Overlapping
+holds one `run.storage_parallelism` slot from the storage's first call to its
+last; a storage that gets no slot, or has no multipart capability, uploads
+after produce on the finished file. With overlap, `run.deadline` must sit above
+max(production, upload) plus the finishing tail, not above their sum.
 
 ### One writer
 

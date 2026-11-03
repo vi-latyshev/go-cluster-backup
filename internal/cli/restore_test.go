@@ -654,6 +654,11 @@ func TestRestoreVerifyDepths(t *testing.T) {
 			if !strings.Contains(stdout, "run="+testRunID) {
 				t.Fatalf("verify %s does not name the run it checked:\n%s", tc.name, stdout)
 			}
+			// A depth that read the manifest says what an apply would need on the
+			// restore spool; a stored check never touched the bytes.
+			if got := strings.Contains(stdout, "apply needs ≥"); got != (tc.name != "stored") {
+				t.Fatalf("verify %s spool line = %v:\n%s", tc.name, got, stdout)
+			}
 		})
 	}
 

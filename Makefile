@@ -20,7 +20,20 @@ TOOLS := -modfile=tools/go.mod
 CHART := charts/go-cluster-backup
 HELM_RELEASE ?= check
 CHART_EXAMPLES := minimal k3s-single-node
-KUBERNETES_VERSIONS := 1.31.0 1.36.0
+KUBERNETES_VERSIONS := 1.31.0 1.36.0 1.37.0
+
+# kubeconform downloads a schema per kind and version. The schemas are pinned to
+# one commit of yannh/kubernetes-json-schema, so a tag moving under the upstream
+# `master` branch cannot change what CI validated against, and a local cache
+# makes a warm run work offline. CI caches the same directory.
+KUBECONFORM_CACHE ?= $(HOME)/.cache/kubeconform
+KUBECONFORM_SCHEMAS := e0c72a1bc5f409d1685c0e1323460c8a98cd7459
+KUBECONFORM_SCHEMA_LOCATION := https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$(KUBECONFORM_SCHEMAS)/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json
+
+# The chart tests validate with the same pinned schemas and cache as the chart
+# target; exporting the pair keeps the pin in one place for every recipe that
+# runs `go test`, `test/chart` included.
+export KUBECONFORM_SCHEMA_LOCATION KUBECONFORM_CACHE
 
 # Coverage: `make test` gates the unit profile, `make cover` gates the union of
 # the unit and e2e profiles. Both use the same reporter and the same threshold.
@@ -38,8 +51,9 @@ COVERAGE_REPORT := scripts/coverage-report.sh
 #
 #   E2E_IMAGE   an image already in the local docker daemon; unset builds
 #               go-cluster-backup:e2e with COVER=1 so coverage can be collected
-#   E2E_DOCKER  the build command, so CI can pass buildx through with a layer
-#               cache: `E2E_DOCKER="docker buildx build --load --cache-from …"`
+#   E2E_DOCKER  the build command, so CI can load the image through buildx:
+#               `E2E_DOCKER="docker buildx build --load"`; the BuildKit cache
+#               mounts travel separately, through buildkit-cache-dance
 #
 # The cover directory must exist when the cluster is created and must not be
 # replaced while the cluster lives — the node's bind mount names the inode — so
@@ -111,26 +125,32 @@ lint:
 vuln:
 	$(GO) tool $(TOOLS) govulncheck ./...
 
-# chart lints and renders both examples, validates every rendered object
-# against the Kubernetes API schema of each version the chart claims
-# (kubeVersion >=1.31.0-0), and proves the generated README is not stale.
+# chart lints both examples, renders each of them once, validates every rendered
+# object against the Kubernetes API schema of each version the chart claims
+# (kubeVersion >=1.31.0-0), and proves the generated README is not stale. A kind
+# no pinned schema carries is an error: -ignore-missing-schemas is not passed.
 chart:
 	@set -e; \
 	helm="$$($(GO) tool $(TOOLS) -n helm)"; \
+	tmp="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	mkdir -p $(KUBECONFORM_CACHE); \
 	for example in $(CHART_EXAMPLES); do \
 		echo "helm lint --strict ($(CHART), $$example)"; \
 		"$$helm" lint --strict $(CHART) \
 			-f examples/values/$$example.yaml \
 			--set-file config=examples/config/$$example.yaml || exit 1; \
+		"$$helm" template $(HELM_RELEASE) $(CHART) \
+			-f examples/values/$$example.yaml \
+			--set-file config=examples/config/$$example.yaml \
+			> "$$tmp/$$example.yaml" || exit 1; \
 	done; \
 	for version in $(KUBERNETES_VERSIONS); do \
-		for example in $(CHART_EXAMPLES); do \
-			echo "kubeconform ($$example, kubernetes $$version)"; \
-			"$$helm" template $(HELM_RELEASE) $(CHART) \
-				-f examples/values/$$example.yaml \
-				--set-file config=examples/config/$$example.yaml \
-			| $(GO) tool $(TOOLS) kubeconform -strict -summary -kubernetes-version $$version - || exit 1; \
-		done; \
+		echo "kubeconform (both examples, kubernetes $$version)"; \
+		$(GO) tool $(TOOLS) kubeconform -strict -summary \
+			-cache $(KUBECONFORM_CACHE) \
+			-schema-location '$(KUBECONFORM_SCHEMA_LOCATION)' \
+			-kubernetes-version $$version "$$tmp" || exit 1; \
 	done
 	@$(GO) tool $(TOOLS) helm-docs --chart-search-root charts --sort-values-order file --dry-run \
 		| diff -u $(CHART)/README.md - > /dev/null \
@@ -140,8 +160,9 @@ chart:
 docs:
 	$(GO) tool $(TOOLS) helm-docs --chart-search-root charts --sort-values-order file
 
-# e2e runs the end-to-end suite against a cluster the CI job (or a developer)
-# created and loaded E2E_IMAGE into. The suite reads:
+# e2e builds the image under test (unless E2E_IMAGE names one already in the
+# docker daemon) and runs the end-to-end suite, which creates and deletes its
+# own cluster and loads the image into it. The suite reads:
 #
 #   GCB_E2E=1                enables it; without it the package skips
 #   GCB_E2E_IMAGE            the image reference loaded into the cluster
@@ -166,7 +187,7 @@ e2e:
 	GCB_E2E_IMAGE=$(E2E_IMAGE_NAME) \
 	GCB_E2E_CLUSTER=$(E2E_CLUSTER) \
 	GCB_E2E_COVERDIR=$(abspath $(E2E_COVERDIR)) \
-		$(GO) test -count=1 -timeout=20m ./test/e2e/...
+		$(GO) test -count=1 -timeout=20m -v ./test/e2e/...
 	@if [ -n "$$(ls -A $(E2E_COVERDIR) 2>/dev/null)" ]; then \
 		$(GO) tool covdata textfmt -i=$(E2E_COVERDIR) -o=$(E2E_COVERAGE_PROFILE); \
 	else \

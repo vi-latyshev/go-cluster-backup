@@ -298,7 +298,7 @@ func TestLiveYandex(t *testing.T) {
 	})
 
 	t.Run("conformance", func(t *testing.T) {
-		storagetest.Run(t, func(t *testing.T) storage.Storage { return build() })
+		storagetest.Run(t, func(t *testing.T) storage.Storage { return build() }, storagetest.Options{})
 	})
 
 	t.Run("paging", func(t *testing.T) {

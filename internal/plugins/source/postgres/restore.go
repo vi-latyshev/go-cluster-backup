@@ -124,7 +124,7 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 // a refusal, never a second restore over whatever is inside it.
 func (s *Source) createDatabase(ctx context.Context, pass, target string) error {
 	cmd := exec.CommandContext(ctx, "psql", append(s.connArgs(),
-		"--no-password", "-d", s.cfg.Database, "-At",
+		"--no-password", dbnameArg(s.cfg.Database), "-At",
 		"-c", "CREATE DATABASE "+quoteIdent(target),
 	)...)
 	cmd.Env = s.pgEnv(pass)
@@ -141,6 +141,15 @@ func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
+// dbnameArg passes a database name as a libpq conninfo value, never as a bare
+// argument: a server's own database name may contain '=', a space or a leading
+// '--', and a bare one either becomes another keyword's value or another
+// option. Inside a quoted conninfo value a backslash escapes the next byte, so
+// both it and the closing quote are escaped before the value is wrapped.
+func dbnameArg(name string) string {
+	return "--dbname=dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(name) + "'"
+}
+
 func (s *Source) restore(ctx context.Context, pass, target string, mode source.ApplyMode, opts ApplyOptions, src io.Reader) (int64, error) {
 	args := s.connArgs()
 	args = append(args, "--no-password")
@@ -154,10 +163,10 @@ func (s *Source) restore(ctx context.Context, pass, target string, mode source.A
 	case source.ApplySideBySide:
 		// --exit-on-error: a failed statement in the new database must fail the
 		// restore, not be counted and skipped.
-		args = append(args, "--exit-on-error", "-d", target)
+		args = append(args, "--exit-on-error", dbnameArg(target))
 	case source.ApplyInPlace:
 		// One transaction: either every statement lands or none does.
-		args = append(args, "--clean", "--if-exists", "--single-transaction", "-d", target)
+		args = append(args, "--clean", "--if-exists", "--single-transaction", dbnameArg(target))
 	}
 	cmd := exec.CommandContext(ctx, "pg_restore", args...)
 	cmd.Env = s.pgEnv(pass)

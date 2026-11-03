@@ -114,7 +114,7 @@ type StageConfig struct {
 // options map is optional because fetching needs none.
 type RestoreConfig struct {
 	SpoolDir          string                    `json:"spool_dir" required:"true" doc:"directory restore paths buffer objects in"`
-	SpoolReserveBytes model.ByteSize            `json:"spool_reserve_bytes" required:"true" doc:"free space kept free before every download"`
+	SpoolReserveBytes model.ByteSize            `json:"spool_reserve_bytes" required:"true" doc:"free space kept beyond the object being written to the restore spool, checked before the first byte and during every write"`
 	StorageOrder      []string                  `json:"storage_order" required:"true" doc:"storages tried in this order on every restore path"`
 	UnclassifiedError plugin.Class              `json:"unclassified_error" doc:"class applied to an error a plugin did not classify: transient or permanent"`
 	Retry             RetryConfig               `json:"retry" doc:"engine retry policy for every plugin call on restore paths"`

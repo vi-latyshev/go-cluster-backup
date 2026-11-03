@@ -178,20 +178,16 @@ func TestRequestBodyHeadersAndMethod(t *testing.T) {
 }
 
 // TestMaxResponseBytesTakesAUnit pins the field's type: a byte count accepts the
-// unit form a deployment writes for a size.
+// unit form a deployment writes for a size, and a value without one is refused.
 func TestMaxResponseBytesTakesAUnit(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, strings.Repeat("x", 4096), http.StatusBadRequest)
-	}))
-	t.Cleanup(srv.Close)
-	cfg := baseConfig(srv.URL)
+	cfg := baseConfig("http://127.0.0.1:1/never")
 	cfg["max_response_bytes"] = "1KiB"
-	err := build(t, cfg).Notify(context.Background(), notifiertest.Event())
-	if err == nil {
-		t.Fatal("a 400 was accepted")
+	if err := check(t, cfg); err != nil {
+		t.Fatalf("1KiB was refused: %v", err)
 	}
-	if len(err.Error()) < 1000 {
-		t.Errorf("the error carries %d bytes of the response; 1KiB was the limit", len(err.Error()))
+	cfg["max_response_bytes"] = "1XiB"
+	if err := check(t, cfg); err == nil {
+		t.Fatal("a byte count without a known unit was accepted")
 	}
 }
 
@@ -261,7 +257,8 @@ func TestStatusClasses(t *testing.T) {
 }
 
 // TestResponseBodyIsBounded checks the two properties of a failing receiver's
-// body: a bounded amount of it may reach the error, and none of it reaches the log.
+// body: none of it reaches the error or the log, whatever the receiver writes.
+// The read bound itself is observed by TestReviewResponseReadUsesConfiguredBound.
 func TestResponseBodyIsBounded(t *testing.T) {
 	const filler = "SECRET-RECEIVER-INTERNAL-DUMP"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -283,11 +280,8 @@ func TestResponseBodyIsBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 400 was accepted")
 	}
-	// max_response_bytes is 64; the receiver sent 32000 bytes, so the error
-	// may carry 64 of them and no more.
-	const maxResponseBytes = 64
-	if got := strings.Count(err.Error(), filler) * len(filler); got > maxResponseBytes {
-		t.Errorf("the error carries %d bytes of the response body, want at most %d", got, maxResponseBytes)
+	if strings.Contains(err.Error(), filler) {
+		t.Errorf("the error carries the receiver's body: %v", err)
 	}
 	if len(err.Error()) > 512 {
 		t.Errorf("the error is %d bytes long; a failing receiver must not be able to fill the log", len(err.Error()))
