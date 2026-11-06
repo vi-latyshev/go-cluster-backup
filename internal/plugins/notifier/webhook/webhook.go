@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -56,9 +57,11 @@ type Config struct {
 	// SuccessStatus is the accepted code list; a code outside it fails the
 	// attempt, so there is no "accept anything" mode.
 	SuccessStatus []int `json:"success_status" doc:"HTTP status codes that count as delivered; every other code fails the attempt"`
-	// MaxResponseBytes caps how much of a failing receiver's response body may
-	// reach an error message.
-	MaxResponseBytes model.ByteSize `json:"max_response_bytes" doc:"most bytes of the response body that may be echoed into an error, so a failing receiver cannot fill the log with a dump"`
+	// MaxResponseBytes caps how much of a failing receiver's response body is
+	// read, so a receiver cannot stream forever. The body is never echoed into
+	// an error: it may reflect the endpoint's path or query, which is a
+	// credential.
+	MaxResponseBytes model.ByteSize `json:"max_response_bytes" doc:"most bytes of a failing receiver's response body that are read, so a receiver cannot stream forever; the body is never echoed into an error, because it may carry the endpoint's own path or query"`
 
 	// Events is the message of every event this notifier delivers, keyed by
 	// event name. An event with no entry here is "not subscribed": Notify
@@ -72,6 +75,16 @@ type Config struct {
 	// the engine sent it). The receiver's own key names live here and nowhere
 	// else.
 	Payload plugin.Template `json:"payload" required:"true" doc:"one request body template for every event, executed with .Title, .Lines (each .Text and .Code), .Text (the whole message, title included) and .Event (the engine event); whatever keys the receiver takes are written here"`
+}
+
+// readFailure is the diagnosis of a response body that could not be read: the
+// caller's own cancellation when it gave up, otherwise the read stage and its
+// class — never net/http's text, which can quote the request URI back.
+func readFailure(ctx context.Context, event string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return plugin.Transient(fmt.Errorf("reading the %s response: the receiver's answer could not be read", event))
 }
 
 // eventNames is every event the engine delivers, in the order a refusal names
@@ -94,7 +107,7 @@ func (c Config) Validate() error {
 	case c.URL == "":
 		errs = append(errs, errors.New("url is empty"))
 	case !strings.HasPrefix(c.URL, "http://") && !strings.HasPrefix(c.URL, "https://"):
-		errs = append(errs, fmt.Errorf("url %q must start with http:// or https://", c.URL))
+		errs = append(errs, errors.New("url must start with http:// or https://"))
 	}
 	switch c.Method {
 	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch:
@@ -290,7 +303,11 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, n.cfg.Method, n.cfg.URL, bytes.NewReader(body))
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("building the %s request: %w", ev.Name, err))
+		// The cause is net/http's own text, and its *url.Error spells out the
+		// endpoint — a credential in the path or query for the receivers this
+		// plugin exists for. The delivery error carries the stage and the
+		// event, never a cause.
+		return plugin.Permanent(fmt.Errorf("building the %s request: the configured endpoint cannot be used", ev.Name))
 	}
 	for name, value := range n.cfg.Headers {
 		req.Header.Set(name, value)
@@ -300,18 +317,26 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(fmt.Errorf("posting %s: %w", ev.Name, err))
+		// A transport error's text is net/http's and may quote the request URL,
+		// which is a credential here. Stage, event and class, never a cause —
+		// a timeout is the one word errors.As can name without it.
+		var nerr net.Error
+		if errors.As(err, &nerr) && nerr.Timeout() {
+			return plugin.Transient(fmt.Errorf("posting %s: timed out", ev.Name))
+		}
+		return plugin.Transient(fmt.Errorf("posting %s: the receiver did not answer", ev.Name))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	notice, err := io.ReadAll(io.LimitReader(resp.Body, n.cfg.MaxResponseBytes.Int64()))
-	if err != nil {
-		return plugin.Transient(fmt.Errorf("reading the %s response: %w", ev.Name, err))
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, n.cfg.MaxResponseBytes.Int64())); err != nil {
+		// A malformed header, a broken trailer or a truncated body is net/http's
+		// text too, and it can carry the request URI back. Never echoed.
+		return readFailure(ctx, ev.Name)
 	}
 	if n.accepted[resp.StatusCode] {
 		n.log.Debug("event delivered", "event", ev.Name, "status", resp.StatusCode)
 		return nil
 	}
-	err = fmt.Errorf("posted %s: HTTP %d %s", ev.Name, resp.StatusCode, strings.TrimSpace(string(notice)))
+	err = fmt.Errorf("posted %s: HTTP %d", ev.Name, resp.StatusCode)
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return plugin.Transient(err)
 	}

@@ -122,11 +122,16 @@ kubectl -n backup logs -f "job/$job"
 [Configuration](docs/configuration.md) · [restore procedures](docs/restore.md) ·
 [chart values](charts/go-cluster-backup/README.md) · [security](SECURITY.md).
 
+Both the image and the chart are signed keyless by this repository's CI.
 Replace `X.Y.Z` with the release you install:
 
 ```console
 cosign verify ghcr.io/vi-latyshev/go-cluster-backup:X.Y.Z \
-  --certificate-identity-regexp '^https://github.com/vi-latyshev/go-cluster-backup/' \
+  --certificate-identity https://github.com/vi-latyshev/go-cluster-backup/.github/workflows/ci.yml@refs/heads/master \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+cosign verify ghcr.io/vi-latyshev/charts/go-cluster-backup:X.Y.Z \
+  --certificate-identity https://github.com/vi-latyshev/go-cluster-backup/.github/workflows/ci.yml@refs/heads/master \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 

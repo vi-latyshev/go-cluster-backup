@@ -94,6 +94,18 @@ func (s *Storage) PutPart(ctx context.Context, session storage.MultipartSession,
 		return storage.PartResult{}, plugin.Permanent(fmt.Errorf(
 			"part %d is %d bytes, and a part carries between 1 and %d", part.Number, part.Size, s.cfg.PartBytes))
 	}
+	// The object's final size is not known while it is produced: BeginMultipart's
+	// Size is only a lower bound (the bytes produced so far), and no later call
+	// hands the session the real one. The part number and size bound the object
+	// from below — every earlier part is at least one byte, and under this
+	// plugin's own slicing it is exactly one part_bytes — so a part that pushes
+	// even that bound past the endpoint's limit is refused before it is sent.
+	limit := s.cfg.MaxObjectBytes.Int64()
+	if part.Size > limit || int64(part.Number-1) > (limit-part.Size)/s.cfg.PartBytes.Int64() {
+		return storage.PartResult{}, plugin.Permanent(fmt.Errorf(
+			"part %d of %s: a part of %d bytes at part size %d crosses max_object_bytes %d",
+			part.Number, session.Key, part.Size, s.cfg.PartBytes.Int64(), limit))
+	}
 	c, err := s.client()
 	if err != nil {
 		return storage.PartResult{}, err

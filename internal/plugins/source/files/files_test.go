@@ -363,6 +363,8 @@ func TestApplyInPlaceReplacesFilesAndKeepsOthers(t *testing.T) {
 	}
 }
 
+// TestApplyRefusesEscapingArchivesBeforeWriting: every macro is a whole archive
+// that names something outside the root; none of them may write a byte.
 func TestApplyRefusesEscapingArchivesBeforeWriting(t *testing.T) {
 	attacks := map[string][]tar.Header{
 		"absolute":          {{Name: "/etc/passwd", Typeflag: tar.TypeReg, Mode: 0o644}},
@@ -400,6 +402,817 @@ func TestApplyRefusesEscapingArchivesBeforeWriting(t *testing.T) {
 				t.Fatal("an entry escaped the root")
 			}
 		})
+	}
+}
+
+// TestReviewCreatedSymlinkThroughInitiallySafeLiveChain: a live link is safe
+// only if its own target obeys the archive rule at its own path. A live
+// `a/live -> x/../marker` resolves inside while `a/x` points down, but the
+// archive may replace `a/x`, and the ".." after the name then climbs from
+// wherever it points. The live pre-pass refuses it, so no created link reads
+// outside the root.
+func TestReviewCreatedSymlinkThroughInitiallySafeLiveChain(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.MkdirAll(filepath.Join(root, "a", "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		filepath.Join(root, "a", "marker"): "inside",
+		filepath.Join(base, "marker"):      "outside",
+	} {
+		if err := os.WriteFile(name, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{"a/x": "d", "a/live": "x/../marker"} {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "a/live")); err != nil || string(got) != "inside" {
+		t.Fatalf("live chain before Apply = %q, %v", got, err)
+	}
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"},
+		{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+	}, []string{"", ""})
+	if class, _ := plugin.ClassOf(err); err == nil || class != plugin.ClassPermanent {
+		t.Fatalf("Apply = %v, want a permanent refusal of the live link", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "restored")); err == nil {
+		t.Fatal("the refused archive still wrote the created link")
+	}
+	if got, readErr := os.ReadFile(filepath.Join(root, "restored")); readErr == nil && string(got) == "outside" {
+		t.Fatalf("created symlink reads outside root: %q", got)
+	}
+}
+
+// TestLifecycleL15LiveLinkTargetClosure is the closure of the induction over
+// live links: a live link whose target obeys the rule stays inside whatever the
+// archive replaces around it (both entry orders), a live link whose target
+// breaks it is refused whether or not the name it climbs through exists yet,
+// and a cancellation never leaves a created link pointing out.
+func TestLifecycleL15LiveLinkTargetClosure(t *testing.T) {
+	live := func(t *testing.T, root string, withX bool) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(root, "a", "d"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "a", "d", "marker"), []byte("inside"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "marker"), []byte("root-inside"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if withX {
+			if err := os.Symlink("d", filepath.Join(root, "a", "x")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	unsafeLive := func(t *testing.T, root string, withX bool) {
+		live(t, root, withX)
+		if err := os.Symlink("x/../marker", filepath.Join(root, "a", "live")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	safeLive := func(t *testing.T, root string, withX bool) {
+		live(t, root, withX)
+		if err := os.Symlink("x/marker", filepath.Join(root, "a", "live")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]struct {
+		live    func(*testing.T, string, bool)
+		headers []tar.Header
+		wantErr bool
+	}{
+		"a safe live link, the created link first": {
+			live: safeLive,
+			headers: []tar.Header{
+				{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"},
+				{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+			},
+		},
+		"a safe live link, the replacement first": {
+			live: safeLive,
+			headers: []tar.Header{
+				{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+				{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"},
+			},
+		},
+		"a live link that climbs after a name": {
+			live:    unsafeLive,
+			headers: []tar.Header{{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"}},
+			wantErr: true,
+		},
+		"a live link that climbs after a name that does not exist yet": {
+			live: func(t *testing.T, root string, _ bool) { unsafeLive(t, root, false) },
+			headers: []tar.Header{
+				{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+				{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"},
+			},
+			wantErr: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "root")
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			tc.live(t, root, true)
+			err := applyAs(t, root, source.ApplyInPlace, tc.headers, make([]string, len(tc.headers)))
+			if tc.wantErr {
+				if class, _ := plugin.ClassOf(err); err == nil || class != plugin.ClassPermanent {
+					t.Fatalf("Apply = %v, want a permanent refusal", err)
+				}
+				if _, statErr := os.Lstat(filepath.Join(root, "restored")); statErr == nil {
+					t.Fatal("the refused archive still wrote the created link")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Everything the created link reads now lies inside the root.
+			if got, readErr := os.ReadFile(filepath.Join(root, "restored")); readErr != nil || string(got) != "root-inside" {
+				t.Fatalf("created link reads %q, %v, want the in-root marker", got, readErr)
+			}
+		})
+	}
+}
+
+// TestLifecycleL15CancelLeavesLiveLinksAlone: cancellation before the archive
+// replaces anything leaves every live link as it was, and the created link
+// still resolves inside the root.
+func TestLifecycleL15CancelLeavesLiveLinksAlone(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	if err := os.MkdirAll(filepath.Join(root, "a", "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a", "d", "marker"), []byte("inside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("d", filepath.Join(root, "a", "x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("x/marker", filepath.Join(root, "a", "live")); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("x", 1<<20)
+	archive := applyTar(t, []tar.Header{
+		{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"},
+		{Name: "big.bin", Typeflag: tar.TypeReg, Mode: 0o644},
+		{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+	}, []string{"", body, ""})
+	s, err := build(t, config(root, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = s.(source.Restorer).Apply(ctx, source.ApplyRequest{
+		Mode: source.ApplyInPlace, Label: "l", Options: jsontext.Value(applyOptions),
+	}, &cancelMidBody{Reader: bytes.NewReader(archive), cancel: cancel, armAt: 300 << 10})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Apply = %v, want context.Canceled", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "restored")); err != nil || string(got) != "inside" {
+		t.Fatalf("created link after cancel reads %q, %v, want the live chain inside", got, err)
+	}
+}
+
+// TestLifecycleL16SymlinkedRootIsTheOperatorsChoice: the root path may itself
+// be a symlink — opening it already followed it — so only links inside the root
+// are judged. A safe tree restores as before; an inner link that breaks the
+// rule refuses, naming it and the side_by_side remedy.
+func TestLifecycleL16SymlinkedRootIsTheOperatorsChoice(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(base, "root")); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "root")
+	if err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "a.txt", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, []string{"x"}); err != nil {
+		t.Fatalf("Apply through a symlinked root = %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(real, "a.txt")); err != nil || string(got) != "x" {
+		t.Fatalf("the restore did not land in the root's real directory: %q, %v", got, err)
+	}
+	if err := os.Symlink("x/../marker", filepath.Join(real, "bad")); err != nil {
+		t.Fatal(err)
+	}
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "b.txt", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, []string{"y"})
+	if class, _ := plugin.ClassOf(err); err == nil || class != plugin.ClassPermanent {
+		t.Fatalf("Apply with a nonconforming inner link = %v, want permanent", err)
+	}
+	if !strings.Contains(err.Error(), `live symlink "bad"`) || !strings.Contains(err.Error(), "side_by_side") {
+		t.Fatalf("the refusal does not name the link and the remedy: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(real, "b.txt")); err == nil {
+		t.Fatal("the refused restore still wrote")
+	}
+}
+
+// The lifecycle matrix of the symlink/hard-link rule: one row per L1–L14 of
+// the redesign. The rule decides nothing by the archive's spelling of a name
+// when the filesystem may disagree with it — identity comes from Lstat through
+// os.Root — so alias rows ask their own filesystem what it treats as one name.
+
+var bothApplyModes = []source.ApplyMode{source.ApplyInPlace, source.ApplySideBySide}
+
+// applyAs runs one archive through the real restorer in the given mode.
+func applyAs(t *testing.T, root string, mode source.ApplyMode, headers []tar.Header, bodies []string) error {
+	t.Helper()
+	s, err := build(t, config(root, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
+		Mode: mode, Label: "l", Options: jsontext.Value(applyOptions),
+	}, bytes.NewReader(applyTar(t, headers, bodies)))
+	return err
+}
+
+// applyTarget is where a mode unpacks: the root itself or its labelled subdir.
+func applyTarget(root string, mode source.ApplyMode) string {
+	if mode == source.ApplySideBySide {
+		return filepath.Join(root, ".restore-l")
+	}
+	return root
+}
+
+// fsAliasesNames reports whether the filesystem holding root treats probe and
+// probeAlias as one name — a case-insensitive or Unicode-normalizing volume
+// does, a plain case-sensitive one does not. The rows that depend on it assert
+// only what their own filesystem actually does.
+func fsAliasesNames(t *testing.T, root, probe, probeAlias string) bool {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, probe), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Lstat(filepath.Join(root, probeAlias))
+	return err == nil
+}
+
+// TestLifecycleL1EntryBelowAnArchivedSymlink: a link entry is materialised
+// first, so a later entry whose parent in the tree is that link is refused at
+// itself — the earlier entries stay, and the write never lands where the link
+// points.
+func TestLifecycleL1EntryBelowAnArchivedSymlink(t *testing.T) {
+	for _, mode := range bothApplyModes {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			err := applyAs(t, root, mode, []tar.Header{
+				{Name: "a/", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+				{Name: "a/x/s", Typeflag: tar.TypeSymlink, Linkname: "../../q"},
+			}, []string{"", "", ""})
+			if err == nil {
+				t.Fatal("an entry below an archived symlink was applied")
+			}
+			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+				t.Fatalf("class = %q, want permanent (%v)", class, err)
+			}
+			target := applyTarget(root, mode)
+			if link, err := os.Readlink(filepath.Join(target, "a", "x")); err != nil || link != ".." {
+				t.Fatalf("a/x = %q, %v, want the link inside the root", link, err)
+			}
+			for _, name := range []string{"s", "q"} {
+				if _, err := os.Lstat(filepath.Join(target, name)); err == nil {
+					t.Fatalf("the refused entry still created %s", name)
+				}
+			}
+		})
+	}
+}
+
+// TestLifecycleL2TargetThatClimbsAfterAName: a ".." after a name is refused
+// lexically, before the first write, in both modes.
+func TestLifecycleL2TargetThatClimbsAfterAName(t *testing.T) {
+	for _, mode := range bothApplyModes {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			err := applyAs(t, root, mode, []tar.Header{
+				{Name: "a/", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+				{Name: "a/s", Typeflag: tar.TypeSymlink, Linkname: "x/../../q"},
+				{Name: "h", Typeflag: tar.TypeLink, Linkname: "missing"},
+			}, []string{"", "", "", ""})
+			if err == nil || !strings.Contains(err.Error(), "climbs after descending") {
+				t.Fatalf("Apply = %v, want the lexical refusal", err)
+			}
+			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+				t.Fatalf("class = %q, want permanent", class)
+			}
+			entries, readErr := os.ReadDir(applyTarget(root, mode))
+			if readErr == nil && len(entries) != 0 {
+				t.Fatalf("the lexical refusal still wrote %d entries", len(entries))
+			}
+		})
+	}
+}
+
+// TestLifecycleL2bHardLinkToANonRegularTarget: a link whose target is not a
+// regular file in the restored tree is refused at that entry; what came before
+// stays and no link to a missing path exists.
+func TestLifecycleL2bHardLinkToANonRegularTarget(t *testing.T) {
+	for _, mode := range bothApplyModes {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			err := applyAs(t, root, mode, []tar.Header{
+				{Name: "a/", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+				{Name: "a/s", Typeflag: tar.TypeSymlink, Linkname: "x/q"},
+				{Name: "h", Typeflag: tar.TypeLink, Linkname: "missing"},
+			}, []string{"", "", "", ""})
+			if err == nil {
+				t.Fatal("a hard link to a missing target was created")
+			}
+			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+				t.Fatalf("class = %q, want permanent (%v)", class, err)
+			}
+			target := applyTarget(root, mode)
+			for name, want := range map[string]string{"a/x": "..", "a/s": "x/q"} {
+				if link, err := os.Readlink(filepath.Join(target, filepath.FromSlash(name))); err != nil || link != want {
+					t.Fatalf("%s = %q, %v, want %q", name, link, err, want)
+				}
+			}
+			if _, err := os.Lstat(filepath.Join(target, "h")); err == nil {
+				t.Fatal("the refused hard link still landed in the root")
+			}
+		})
+	}
+}
+
+// TestLifecycleL3HardLinkThroughANameAlias: the target is looked up through
+// the filesystem, so an alias of an archived symlink is seen as the symlink it
+// is. On a case-sensitive volume the alias is a different name and the link is
+// an ordinary hard link to the regular file.
+func TestLifecycleL3HardLinkThroughANameAlias(t *testing.T) {
+	root := t.TempDir()
+	aliases := fsAliasesNames(t, root, "probe", "PROBE")
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "deep/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "deep/x", Typeflag: tar.TypeReg, Mode: 0o644},
+		{Name: "deep/X", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		{Name: "escape", Typeflag: tar.TypeLink, Linkname: "deep/x"},
+	}, []string{"", "x", "", ""})
+	// Where the volume merges the two names, the target is the aliased
+	// symlink and the link is refused; where they are distinct, it is the
+	// regular file and the link is created.
+	wantClass := plugin.ClassPermanent
+	if !aliases {
+		wantClass = ""
+	}
+	if class, _ := plugin.ClassOf(err); class != wantClass {
+		t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
+	}
+	_, statErr := os.Lstat(filepath.Join(root, "escape"))
+	if linked := statErr == nil; linked != !aliases {
+		t.Fatalf("escape exists = %v, want %v", linked, !aliases)
+	}
+}
+
+// TestLifecycleL4EntryThroughANameAlias: the same name rule decides, not the
+// archive's spelling — an entry whose parent is an alias of an archived
+// symlink is refused; on a case-sensitive volume the parent is absent and the
+// write fails as it always has.
+func TestLifecycleL4EntryThroughANameAlias(t *testing.T) {
+	for _, mode := range bothApplyModes {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			aliases := fsAliasesNames(t, root, "probe", "PROBE")
+			err := applyAs(t, root, mode, []tar.Header{
+				{Name: "deep/", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "deep/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+				{Name: "deep/X/foo", Typeflag: tar.TypeSymlink, Linkname: "../../bar"},
+			}, []string{"", "", ""})
+			if err == nil {
+				t.Fatal("an entry under a name alias of a symlink was applied")
+			}
+			// The merged name is refused at the archived symlink; a distinct
+			// parent is simply absent, as it always was.
+			wantClass := plugin.ClassTransient
+			if aliases {
+				wantClass = plugin.ClassPermanent
+			}
+			if class, _ := plugin.ClassOf(err); class != wantClass {
+				t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
+			}
+			if _, err := os.Lstat(filepath.Join(applyTarget(root, mode), "foo")); err == nil {
+				t.Fatal("the refused entry still created the escape link")
+			}
+		})
+	}
+}
+
+// TestLifecycleL5EntryThroughANormalizationAlias: a Unicode-equivalent
+// spelling of a directory is the same directory where the volume normalizes;
+// the entry is refused at the archived symlink inside it, and nowhere else.
+func TestLifecycleL5EntryThroughANormalizationAlias(t *testing.T) {
+	const nfc, nfd = "café", "café"
+	root := t.TempDir()
+	aliases := fsAliasesNames(t, root, "xé", "xé")
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: nfc + "/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: nfc + "/up", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		{Name: nfd + "/up/foo", Typeflag: tar.TypeSymlink, Linkname: "../../bar"},
+	}, []string{"", "", ""})
+	if err == nil {
+		t.Fatal("an entry under a normalized alias was applied")
+	}
+	// Normalized names meet the archived symlink; distinct ones leave an
+	// absent parent and the same transient fault as any missing directory.
+	wantClass := plugin.ClassTransient
+	if aliases {
+		wantClass = plugin.ClassPermanent
+	}
+	if class, _ := plugin.ClassOf(err); class != wantClass {
+		t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "foo")); err == nil {
+		t.Fatal("the refused entry still created the escape link")
+	}
+}
+
+// TestLifecycleL6LiveSymlinkParent: a live symlink parent inside the root
+// refuses the entry at itself, and no link appears where it would have
+// written.
+func TestLifecycleL6LiveSymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", filepath.Join(root, "a", "d")); err != nil {
+		t.Fatal(err)
+	}
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "a/d/s", Typeflag: tar.TypeSymlink, Linkname: "../../x"},
+	}, []string{""})
+	if err == nil {
+		t.Fatal("an entry below a live symlink was applied")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "x")); err == nil {
+		t.Fatal("the refused entry still created the escape link")
+	}
+}
+
+// TestLifecycleL8CancelLeavesNoDangerousState: cancellation in the middle of a
+// large body ends the apply with the caller's error, and every link the apply
+// already created stays inside — no post-check runs on the way out.
+func TestLifecycleL8CancelLeavesNoDangerousState(t *testing.T) {
+	root := t.TempDir()
+	body := strings.Repeat("x", 1<<20)
+	archive := applyTar(t, []tar.Header{
+		{Name: "b/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "b/q", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		{Name: "b/s", Typeflag: tar.TypeSymlink, Linkname: "q/z"},
+		{Name: "big.bin", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, []string{"", "", "", body})
+	s, err := build(t, config(root, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err = s.(source.Restorer).Apply(ctx, source.ApplyRequest{
+		Mode: source.ApplyInPlace, Label: "l", Options: jsontext.Value(applyOptions),
+	}, &cancelMidBody{Reader: bytes.NewReader(archive), cancel: cancel, armAt: 300 << 10})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Apply = %v, want context.Canceled", err)
+	}
+	for name, want := range map[string]string{"b/q": "..", "b/s": "q/z"} {
+		if link, err := os.Readlink(filepath.Join(root, name)); err != nil || link != want {
+			t.Fatalf("%s = %q, %v, want %q", name, link, err, want)
+		}
+	}
+}
+
+// cancelMidBody cancels when the stream has read armAt bytes after Apply's
+// own rewind: the caller's stop lands inside the body of the large file.
+type cancelMidBody struct {
+	*bytes.Reader
+	cancel   context.CancelFunc
+	armAt    int64
+	armed    bool
+	consumed int64
+}
+
+func (r *cancelMidBody) Seek(offset int64, whence int) (int64, error) {
+	// Only the caller's rewind arms: tar.Reader probes a seeker with
+	// SeekCurrent while it discards a stream it walks.
+	if offset == 0 && whence == io.SeekStart {
+		r.armed = true
+		r.consumed = 0
+	}
+	return r.Reader.Seek(offset, whence)
+}
+
+func (r *cancelMidBody) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if r.armed {
+		r.consumed += int64(n)
+		if r.consumed > r.armAt {
+			r.cancel()
+		}
+	}
+	return n, err
+}
+
+// TestLifecycleL9TheTargetRuleIsSharedByProbeAndDump: one lexical rule decides
+// both directions — a leading climb within the link's own depth is carried,
+// everything else is refused by Probe and left out (and counted) by Dump.
+func TestLifecycleL9TheTargetRuleIsSharedByProbeAndDump(t *testing.T) {
+	cases := map[string]struct {
+		name, target string
+		carried      bool
+	}{
+		"a leading climb within the link's depth": {name: "releases/1/log", target: "../../shared/log", carried: true},
+		"a single climb above a nested link":      {name: "node_modules/.bin/a", target: "../a/cli.js", carried: true},
+		"a dot component":                         {name: "a/s", target: "./x", carried: true},
+		"an empty component":                      {name: "a/s", target: "a//b", carried: true},
+		"a plain relative target":                 {name: "a/s", target: "b", carried: true},
+		"a climb after a name":                    {name: "a/s", target: "x/../y", carried: false},
+		"a climb deeper than the link":            {name: "a/s", target: "../../x", carried: false},
+		"a climb at the root":                     {name: "s", target: "..", carried: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			hdr := tar.Header{Name: tc.name, Typeflag: tar.TypeSymlink, Linkname: tc.target}
+			archive := applyTar(t, []tar.Header{hdr}, []string{""})
+			s, err := build(t, config(t.TempDir(), true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.(source.Prober).Probe(context.Background(), bytes.NewReader(archive))
+			if tc.carried != (err == nil) {
+				t.Fatalf("Probe = %v, want carried=%v", err, tc.carried)
+			}
+			// Dump the same shape from a real tree: a refused link must not
+			// fail the dump, only be counted.
+			dumpRoot := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(dumpRoot, filepath.FromSlash(filepath.Dir(tc.name))), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(tc.target, filepath.Join(dumpRoot, filepath.FromSlash(tc.name))); err != nil {
+				t.Fatal(err)
+			}
+			dumper, err := build(t, config(dumpRoot, true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			if err := dumper.Dump(context.Background(), &buf); err != nil {
+				t.Fatalf("Dump failed on a link it must only leave out: %v", err)
+			}
+			stats, err := dumper.(source.DumpStatsReporter).DumpStats(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantSkipped := int64(0)
+			if !tc.carried {
+				wantSkipped = 1
+			}
+			if stats.SkippedEntries != wantSkipped {
+				t.Fatalf("SkippedEntries = %d, want %d", stats.SkippedEntries, wantSkipped)
+			}
+			carried := dumpedName(t, &buf, filepath.ToSlash(tc.name))
+			if carried != tc.carried {
+				t.Fatalf("the dumped archive carries %q = %v, want %v", tc.name, carried, tc.carried)
+			}
+		})
+	}
+}
+
+// dumpedName reports whether the archive bytes carry an entry of name.
+func dumpedName(t *testing.T, archive *bytes.Buffer, name string) bool {
+	t.Helper()
+	tr := tar.NewReader(bytes.NewReader(archive.Bytes()))
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			return false
+		}
+		if hdr.Name == name || hdr.Name == name+"/" {
+			return true
+		}
+	}
+}
+
+// TestLifecycleL10RoundTrip: what Dump writes, Apply restores — nested "../"
+// links, a broken link and hard links survive the round trip; a link with a
+// climb after a name never enters the stream and is counted.
+func TestLifecycleL10RoundTrip(t *testing.T) {
+	src := t.TempDir()
+	for _, dir := range []string{"releases/1", "node_modules/.bin", "a2"} {
+		if err := os.MkdirAll(filepath.Join(src, filepath.FromSlash(dir)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links := map[string]string{
+		"releases/1/log":      "../../shared/log",
+		"node_modules/.bin/a": "../a/cli.js",
+		"broken":              "nowhere",
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(src, filepath.FromSlash(name))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("x/../q", filepath.Join(src, "a2", "s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("linked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filepath.Join(src, "a.txt"), filepath.Join(src, "b.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	dumper, err := build(t, config(src, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := dumper.Dump(context.Background(), &buf); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := dumper.(source.DumpStatsReporter).DumpStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SkippedEntries != 1 {
+		t.Fatalf("SkippedEntries = %d, want the one climb-after-a-name link", stats.SkippedEntries)
+	}
+
+	dst := t.TempDir()
+	restorer, err := build(t, config(dst, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restorer.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
+		Mode: source.ApplySideBySide, Label: "l", Options: jsontext.Value(applyOptions),
+	}, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	target := applyTarget(dst, source.ApplySideBySide)
+	for name, want := range links {
+		got, err := os.Readlink(filepath.Join(target, filepath.FromSlash(name)))
+		if err != nil || got != want {
+			t.Fatalf("%s = %q, %v, want %q", name, got, err, want)
+		}
+	}
+	a, err := os.Stat(filepath.Join(target, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(filepath.Join(target, "b.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(a, b) {
+		t.Fatal("b.txt is not a hard link to a.txt after the round trip")
+	}
+	if _, err := os.Lstat(filepath.Join(target, "a2", "s")); err == nil {
+		t.Fatal("the refused link entered the restored tree")
+	}
+}
+
+// TestLifecycleL11ALateSymlinkChangesAnEarlyOne: links are created in archive
+// order and each stays inside the root whatever a later entry does.
+func TestLifecycleL11ALateSymlinkChangesAnEarlyOne(t *testing.T) {
+	root := t.TempDir()
+	if err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "b/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "b/s", Typeflag: tar.TypeSymlink, Linkname: "q/z"},
+		{Name: "b/q", Typeflag: tar.TypeSymlink, Linkname: ".."},
+	}, []string{"", "", ""}); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"b/s": "q/z", "b/q": ".."} {
+		if got, err := os.Readlink(filepath.Join(root, name)); err != nil || got != want {
+			t.Fatalf("%s = %q, %v, want %q", name, got, err, want)
+		}
+	}
+}
+
+// TestLifecycleL12ADirectoryIsNeverReplaced: a link entry on an existing
+// directory is refused and the directory with its children stays.
+func TestLifecycleL12ADirectoryIsNeverReplaced(t *testing.T) {
+	cases := []struct {
+		name  string
+		alias bool
+	}{
+		{name: "a"},
+		{name: "A", alias: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			aliases := fsAliasesNames(t, root, "probe", "PROBE")
+			err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+				{Name: "a/", Typeflag: tar.TypeDir, Mode: 0o755},
+				{Name: "a/kid", Typeflag: tar.TypeReg, Mode: 0o644},
+				{Name: tc.name, Typeflag: tar.TypeSymlink, Linkname: "x"},
+			}, []string{"", "x", ""})
+			// "a" is a directory the link may not replace; "A" is that same
+			// directory where the volume merges the names, and a fresh link
+			// where it does not.
+			refused := !tc.alias || aliases
+			wantClass := plugin.Class("")
+			if refused {
+				wantClass = plugin.ClassPermanent
+			}
+			if class, _ := plugin.ClassOf(err); class != wantClass {
+				t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
+			}
+			if refused && !strings.Contains(err.Error(), "is a directory") {
+				t.Fatalf("error = %v, want it to name the directory", err)
+			}
+			if got, err := os.ReadFile(filepath.Join(root, "a", "kid")); err != nil || string(got) != "x" {
+				t.Fatalf("the directory's child = %q, %v", got, err)
+			}
+			info, statErr := os.Lstat(filepath.Join(root, tc.name))
+			if gotDir := statErr == nil && info.IsDir(); gotDir != refused {
+				t.Fatalf("%s is a directory = %v, want %v", tc.name, gotDir, refused)
+			}
+		})
+	}
+}
+
+// TestLifecycleL13HardLinkToAnArchivedSymlink: a link entry on a symlink
+// already materialised is refused — its relative target is never moved to
+// another depth.
+func TestLifecycleL13HardLinkToAnArchivedSymlink(t *testing.T) {
+	root := t.TempDir()
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "d/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "d/s", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		{Name: "h", Typeflag: tar.TypeLink, Linkname: "d/s"},
+	}, []string{"", "", ""})
+	if err == nil {
+		t.Fatal("a hard link to an archived symlink was created")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "h")); err == nil {
+		t.Fatal("the refused link still landed in the root")
+	}
+}
+
+// TestLifecycleL14HardLinkToALiveRegularFile: a regular file already in the
+// root is a legitimate target — the link is created and shares its inode.
+func TestLifecycleL14HardLinkToALiveRegularFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "t"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "h", Typeflag: tar.TypeLink, Linkname: "t"},
+	}, []string{""}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := os.Stat(filepath.Join(root, "t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(filepath.Join(root, "h"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(a, b) {
+		t.Fatal("h is not a hard link to the live regular file t")
+	}
+}
+
+// TestLifecycleLHardLinkOnItsOwnName: the target is read before the entry's own
+// name is replaced, so link-on-itself fails at the link, never writes, and the
+// transient class stays what it was.
+func TestLifecycleLHardLinkOnItsOwnName(t *testing.T) {
+	root := t.TempDir()
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "a", Typeflag: tar.TypeReg, Mode: 0o644},
+		{Name: "a", Typeflag: tar.TypeLink, Linkname: "a"},
+	}, []string{"x", ""})
+	if err == nil {
+		t.Fatal("a hard link onto its own name was created")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "a")); err == nil {
+		t.Fatal("the entry remained after the failed link")
 	}
 }
 
@@ -925,6 +1738,45 @@ func TestApplyRefusesACancelledContext(t *testing.T) {
 		Mode: source.ApplyInPlace, Label: "l", Options: jsontext.Value(applyOptions),
 	}, bytes.NewReader(nil)); err == nil {
 		t.Fatal("Apply accepted a cancelled context")
+	}
+}
+
+// TestApplyReportsARootItCannotCreate: an in_place restore whose root is a
+// plain file cannot make a directory of it, and the failure is transient.
+func TestApplyReportsARootItCannotCreate(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := applyAs(t, file, source.ApplyInPlace, []tar.Header{
+		{Name: "a.txt", Typeflag: tar.TypeReg, Mode: 0o644},
+	}, []string{"x"})
+	if err == nil {
+		t.Fatal("Apply made a restore root of a plain file")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		t.Fatalf("class = %q, want transient (%v)", class, err)
+	}
+}
+
+// TestLifecycleL12bDirectoryEntryOnAnArchivedSymlink: a directory entry sitting
+// on a symlink an earlier entry materialised is refused, the same rule that
+// keeps the link's own location stable.
+func TestLifecycleL12bDirectoryEntryOnAnArchivedSymlink(t *testing.T) {
+	root := t.TempDir()
+	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
+		{Name: "a/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
+		{Name: "a/x/", Typeflag: tar.TypeDir, Mode: 0o755},
+	}, []string{"", "", ""})
+	if err == nil {
+		t.Fatal("a directory entry was materialised through an archived symlink")
+	}
+	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
+	}
+	if link, err := os.Readlink(filepath.Join(root, "a", "x")); err != nil || link != ".." {
+		t.Fatalf("a/x = %q, %v, want the archived link", link, err)
 	}
 }
 

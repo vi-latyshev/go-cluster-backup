@@ -641,6 +641,7 @@ func (d *Discoverer) objects(ctx context.Context, client *kubeapi.Client, r rule
 			resource:   "persistentvolumeclaim",
 			namespace:  p.Metadata.Namespace,
 			name:       p.Metadata.Name,
+			uid:        p.Metadata.UID,
 			labels:     p.Metadata.Labels,
 			phase:      p.Status.Phase,
 			volumeName: p.Spec.VolumeName,

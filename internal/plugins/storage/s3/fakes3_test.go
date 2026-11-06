@@ -43,19 +43,19 @@ type fakeS3 struct {
 	// it was asked for, echoing them: a page that never moves forward.
 	stuckUploads    bool
 	head403         bool // HEAD answers 403 instead of 404 — a proxy hiding existence
-	headWrongSize   bool // HEAD reports one byte more than was stored
 	listForeign     bool // a listing answer carries a key outside the storage root
 	createNoID      bool // CreateMultipartUpload answers without an upload id
 	partNoETag      bool // UploadPart answers 200 without an ETag
 	uploadsForeign  bool // ListMultipartUploads answers with a foreign upload
 	getStall        bool // GetObject sends half the body, then waits for the client to go
 	hang            map[string]bool
-	putDrops        bool // PutObject answers 200 and stores nothing
 	completeDrop    bool // CompleteMultipartUpload answers 200 and commits nothing
 	sawChunked      bool
 	sawStorage      string
 	sawUnsigned     int
-	sawUploadPrefix string // the prefix ListMultipartUploads was asked for
+	sawUploadPrefix string          // the prefix ListMultipartUploads was asked for
+	addrs           map[string]bool // one entry per client connection the server saw
+	auths           []string        // the Authorization header of every signed request, in order
 	srv             *httptest.Server
 }
 
@@ -87,9 +87,14 @@ func newFakeS3(t *testing.T, bucket string) *fakeS3Server {
 		failNext:   map[string]int{},
 		retryAfter: map[string]int{},
 		hang:       map[string]bool{},
+		addrs:      map[string]bool{},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
+		f.addrs[r.RemoteAddr] = true
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			f.auths = append(f.auths, auth)
+		}
 		if r.Header.Get("Authorization") == "" {
 			f.sawUnsigned++
 		}
@@ -226,6 +231,22 @@ func (f *fakeS3) Parts() []int32 {
 	return append([]int32(nil), f.partNumbers...)
 }
 
+// Connections reports how many client connections reached the server: a storage
+// that pools its transport keeps this at one across sequential calls.
+func (f *fakeS3) Connections() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.addrs)
+}
+
+// Authorizations returns the Authorization header of every signed request, in
+// the order the server saw them.
+func (f *fakeS3) Authorizations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.auths...)
+}
+
 func (f *fakeS3) putObject(key string, body []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -277,9 +298,7 @@ func (f *fakeS3) put(w http.ResponseWriter, key string, r *http.Request) {
 	if sc := r.Header.Get("X-Amz-Storage-Class"); sc != "" {
 		f.sawStorage = sc
 	}
-	if !f.putDrops {
-		f.objects[key] = &fakeObject{body: body, etag: etag, modified: time.Now().UTC()}
-	}
+	f.objects[key] = &fakeObject{body: body, etag: etag, modified: time.Now().UTC()}
 	f.mu.Unlock()
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
@@ -289,7 +308,6 @@ func (f *fakeS3) head(w http.ResponseWriter, key string) {
 	f.mu.Lock()
 	o, ok := f.objects[key]
 	hide := f.head403
-	wrong := f.headWrongSize
 	f.mu.Unlock()
 	if hide {
 		f.writeErrorCode(w, http.StatusForbidden, "AccessDenied", "hidden")
@@ -300,9 +318,6 @@ func (f *fakeS3) head(w http.ResponseWriter, key string) {
 		return
 	}
 	size := len(o.body)
-	if wrong {
-		size++
-	}
 	w.Header().Set("Content-Length", strconv.Itoa(size))
 	w.Header().Set("ETag", o.etag)
 	w.Header().Set("Last-Modified", o.modified.Format(http.TimeFormat))

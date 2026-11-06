@@ -36,6 +36,13 @@ func TestMain(m *testing.M) {
 	e, err := setup()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "e2e setup:", err)
+		// A setup that failed after creating the cluster still owns it: a failed
+		// pull or a missed import must not leave a k3d cluster behind.
+		if e != nil {
+			if terr := e.teardown(); terr != nil {
+				fmt.Fprintln(os.Stderr, "e2e teardown:", terr)
+			}
+		}
 		os.Exit(1)
 	}
 	env = e
@@ -129,21 +136,54 @@ func setup() (*Env, error) {
 	// reconfigure its runner.
 	e.homeKubeconfig = kubeconfigFingerprint()
 
-	if !e.clusterExists() {
-		if err := e.createCluster(); err != nil {
-			return nil, err
+	// The dependency pull and the cluster boot share no resource, so they run
+	// side by side: the registry pull used to be paid in series after the
+	// cluster was ready, and on a cold runner it is the slower half. Both
+	// branches are waited for, so a failed pull never leaves a half-created
+	// cluster unobserved; the first failure is the one setup reports.
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	record := func(err error) {
+		if err == nil {
+			return
 		}
+		errMu.Lock()
+		defer errMu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		record(timed("pull dependencies", e.pullDependencies))
+	}()
+	if !e.clusterExists() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			record(timed("create cluster", e.createCluster))
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return e, firstErr
 	}
 
 	// The kubeconfig is a temp file, never the caller's: this suite must not be
 	// able to touch any other context.
 	kubeconfig := filepath.Join(os.TempDir(), "gcb-e2e-"+e.Cluster+".kubeconfig")
-	out, err := e.k3d("kubeconfig", "get", e.Cluster)
-	if err != nil {
-		return nil, fmt.Errorf("k3d kubeconfig get: %w\n%s", err, out)
-	}
-	if err := os.WriteFile(kubeconfig, []byte(out), 0o600); err != nil {
-		return nil, err
+	if err := timed("kubeconfig", func() error {
+		out, err := e.k3d("kubeconfig", "get", e.Cluster)
+		if err != nil {
+			return fmt.Errorf("k3d kubeconfig get: %w\n%s", err, out)
+		}
+		return os.WriteFile(kubeconfig, []byte(out), 0o600)
+	}); err != nil {
+		return e, err
 	}
 	e.Kubeconfig = kubeconfig
 
@@ -153,29 +193,56 @@ func setup() (*Env, error) {
 	// from a registry and are pulled by their pinned digest, then re-tagged: a
 	// digest is not a reference the pods can ask for. The image under test is
 	// built locally and must not be pulled.
-	for i, pin := range dependencyPins {
-		if out, err := e.exec("", "docker", "pull", "-q", pin); err != nil {
-			return nil, fmt.Errorf("docker pull %s: %w\n%s", pin, err, out)
-		}
-		if out, err := e.exec("", "docker", "tag", pin, dependencyImages[i]); err != nil {
-			return nil, fmt.Errorf("docker tag %s %s: %w\n%s", pin, dependencyImages[i], err, out)
-		}
-	}
 	images := append([]string{e.Image}, dependencyImages...)
-	if err := e.loadImages(images...); err != nil {
-		return nil, err
+	if err := timed("load images", func() error { return e.loadImages(images...) }); err != nil {
+		return e, err
 	}
 	// The load is confirmed against the store the kubelet reads: a load that
 	// returns zero and leaves nothing behind is the failure this suite already
 	// met once, and a run without its images fails minutes later with a
 	// different, misleading error.
-	if err := e.verifyImported(images...); err != nil {
-		return nil, err
+	if err := timed("verify images", func() error { return e.verifyImported(images...) }); err != nil {
+		return e, err
 	}
-	if out, err := e.exec("", "kubectl", "get", "nodes"); err != nil {
-		return nil, fmt.Errorf("cluster not reachable: %w\n%s", err, out)
+	if err := timed("reach the cluster", func() error {
+		out, err := e.exec("", "kubectl", "get", "nodes")
+		if err != nil {
+			return fmt.Errorf("cluster not reachable: %w\n%s", err, out)
+		}
+		return nil
+	}); err != nil {
+		return e, err
 	}
 	return e, nil
+}
+
+// timed runs one setup phase and reports its duration on stderr: CI keeps the
+// suite's log, and "timed out" without the phase that ate the minutes is the
+// failure this suite met once.
+func timed(name string, fn func() error) error {
+	start := time.Now()
+	err := fn()
+	status := "ok"
+	if err != nil {
+		status = "failed"
+	}
+	fmt.Fprintf(os.Stderr, "e2e setup: %-18s %8s %s\n", name, time.Since(start).Round(time.Millisecond), status)
+	return err
+}
+
+// pullDependencies pulls every pinned dependency by digest and re-tags it with
+// the name the pods ask for. It runs beside the cluster creation: a registry
+// pull and a cluster boot share no resource.
+func (e *Env) pullDependencies() error {
+	for i, pin := range dependencyPins {
+		if out, err := e.exec("", "docker", "pull", "-q", pin); err != nil {
+			return fmt.Errorf("docker pull %s: %w\n%s", pin, err, out)
+		}
+		if out, err := e.exec("", "docker", "tag", pin, dependencyImages[i]); err != nil {
+			return fmt.Errorf("docker tag %s %s: %w\n%s", pin, dependencyImages[i], err, out)
+		}
+	}
+	return nil
 }
 
 // teardown removes the cluster the suite created and proves the caller's
@@ -245,17 +312,18 @@ func (e *Env) loadImages(refs ...string) error {
 		return fmt.Errorf("create image dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	// One file, rewritten per image: each is imported into every node before the
-	// next save overwrites it, so only one tarball is ever on disk.
-	tar := filepath.Join(dir, "image.tar")
-	for _, ref := range refs {
-		if out, err := e.exec("", "docker", "save", "-o", tar, ref); err != nil {
-			return fmt.Errorf("docker save %s: %w\n%s", ref, err, out)
-		}
-		for _, node := range nodes {
-			if err := importInto(tar, node); err != nil {
-				return fmt.Errorf("load %s into %s: %w", ref, node, err)
-			}
+	// One save for every image: `docker save` reads each image's layers out of
+	// the daemon and that export is the expensive half, so a per-image save paid
+	// it once per ref. The one tarball is then streamed into each node's
+	// containerd.
+	tar := filepath.Join(dir, "images.tar")
+	save := append([]string{"save", "-o", tar}, refs...)
+	if out, err := e.exec("", "docker", save...); err != nil {
+		return fmt.Errorf("docker save: %w\n%s", err, out)
+	}
+	for _, node := range nodes {
+		if err := importInto(tar, node); err != nil {
+			return fmt.Errorf("load images into %s: %w", node, err)
 		}
 	}
 	return nil

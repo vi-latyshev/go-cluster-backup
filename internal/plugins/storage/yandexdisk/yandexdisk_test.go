@@ -118,9 +118,9 @@ func TestGeneralConformance(t *testing.T) {
 
 func TestStorageConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storage.Storage {
-		s, _ := newStorage(t, nil)
+		s, _ := newStorage(t, func(raw map[string]any) { raw["request_timeout"] = "100ms" })
 		return s
-	})
+	}, storagetest.Options{SlowWrite: 300 * time.Millisecond})
 }
 
 func TestDescribeTraits(t *testing.T) {

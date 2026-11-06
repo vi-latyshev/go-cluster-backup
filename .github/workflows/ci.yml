@@ -37,19 +37,29 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # setup-go's shared key would race; the cache below is per job.
           cache: false
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The cache is restored only: a save at the end of the job writes one entry
+      # per commit on a push, so concurrent PRs never race on the same key and a
+      # fork's read-only token can still restore. A prefix match from an earlier
+      # commit serves as the starting point; the save at the end of the job
+      # extends it.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: go-cache
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
             ~/.cache/golangci-lint
-          key: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.golangci.yml') }}
-          restore-keys: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
+            ~/.cache/kubeconform
+          key: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.golangci.yml') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.golangci.yml') }}-
+            go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
       - name: commit messages
         run: |
           range="${{ github.event.pull_request.base.sha || github.event.before }}..${{ github.sha }}"
@@ -62,6 +72,29 @@ jobs:
       - run: make lint
       - run: make vuln
       - run: make chart
+      # The pinned helm the chart gate built: publish pushes the chart with this
+      # exact binary instead of resolving the tool again. Uploaded on a push
+      # only — a pull request has no publish job to feed.
+      - name: pin the helm binary
+        if: github.event_name == 'push'
+        run: |
+          cp "$(go tool -modfile=tools/go.mod -n helm)" "$RUNNER_TEMP/helm"
+          chmod +x "$RUNNER_TEMP/helm"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'push'
+        with:
+          name: helm
+          path: ${{ runner.temp }}/helm
+          retention-days: 1
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+            ~/.cache/kubeconform
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   e2e:
     runs-on: ubuntu-26.04
@@ -70,18 +103,23 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # setup-go's shared key would race; the cache below is per job.
           cache: false
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: go-cache
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum', '.golangci.yml') }}
-          restore-keys: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
+          key: go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.mod', 'go.sum', 'tools/go.mod', 'tools/go.sum') }}-
+            go-${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         id: buildx
       # BuildKit cannot export cache mounts; move them across runs.
@@ -90,6 +128,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/buildkit-cache-mounts
           key: buildkit-mounts-e2e-${{ runner.arch }}-${{ hashFiles('go.sum', 'Dockerfile') }}
+          restore-keys: |
+            buildkit-mounts-e2e-${{ runner.arch }}-
       - uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -114,8 +154,7 @@ jobs:
       # suite that owns the cluster, `make cover` gates the union.
       - run: make test
       - run: |
-          make e2e E2E_CLUSTER=gcb-e2e \
-            E2E_DOCKER="docker buildx build --load --cache-from type=gha,scope=image-e2e --cache-to type=gha,mode=max,scope=image-e2e"
+          make e2e E2E_CLUSTER=gcb-e2e E2E_DOCKER="docker buildx build --load"
       - run: make cover
       - name: cluster diagnostics
         if: failure()
@@ -123,6 +162,13 @@ jobs:
           k3d cluster list || true
           kubectl get pods -A -o wide || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   image:
     if: github.event_name == 'push'
@@ -143,7 +189,15 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # A gha cache scope accumulates for the life of the repository; the ISO
+      # week in the key bounds it to one week, so a poisoned or oversized entry
+      # cannot outlive the week it was written in.
+      - name: cache scope
+        id: scope
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -161,8 +215,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=image-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}-${{ steps.scope.outputs.week }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}-${{ steps.scope.outputs.week }}
       - run: |
           mkdir -p "$RUNNER_TEMP/digests"
           echo "${{ steps.build.outputs.digest }}" > "$RUNNER_TEMP/digests/image-${{ matrix.arch }}"
@@ -194,9 +248,11 @@ jobs:
           path: ${{ runner.temp }}/digests
           merge-multiple: true
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      # The binary `check` built; no Go toolchain is needed here.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          go-version-file: go.mod
+          name: helm
+          path: ${{ runner.temp }}/bin
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -304,9 +360,11 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -eu
-          go tool -modfile=tools/go.mod helm package charts/go-cluster-backup \
+          helm="$RUNNER_TEMP/bin/helm"
+          chmod +x "$helm"
+          "$helm" package charts/go-cluster-backup \
             --version "${VERSION}" --app-version "${VERSION}" --destination dist
-          go tool -modfile=tools/go.mod helm push "dist/go-cluster-backup-${VERSION}.tgz" "oci://${CHART%/*}" | tee push.txt
+          "$helm" push "dist/go-cluster-backup-${VERSION}.tgz" "oci://${CHART%/*}" | tee push.txt
           digest="$(awk '$1 == "Digest:" { print $2 }' push.txt)"
           if [ -z "$digest" ]; then
             echo "::error::helm push printed no digest"

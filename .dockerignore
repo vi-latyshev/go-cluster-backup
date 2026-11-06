@@ -20,3 +20,8 @@ renovate.json
 cliff.toml
 dist
 coverage*.out
+
+# Neither the binary nor its embedded documents come from a test: the only
+# //go:embed is internal/defaults/defaults.yaml.
+**/*_test.go
+**/testdata

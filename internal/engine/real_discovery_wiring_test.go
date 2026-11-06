@@ -712,7 +712,7 @@ func wiringClaimRule(importance string) map[string]any {
 func wiringClaim(t *testing.T, namespace, name string, labels map[string]string, volumeName string) string {
 	t.Helper()
 	claim := map[string]any{
-		"metadata": map[string]any{"name": name, "namespace": namespace, "labels": labels},
+		"metadata": map[string]any{"name": name, "namespace": namespace, "uid": "uid-" + namespace + "-" + name, "labels": labels},
 		"spec":     map[string]any{"volumeName": volumeName},
 		"status":   map[string]any{"phase": "Bound"},
 	}
@@ -737,7 +737,7 @@ func TestRealDiscoveryOptOutCoverage(t *testing.T) {
 	// The declared claim's data, and the volume it is bound to: the path the
 	// rule reads is the one the cluster reports, not a mount made for this test.
 	declared := wiringRootDir(t, "declared")
-	srv.AddPV(`{"metadata":{"name":"pv-declared"},"spec":{"local":{"path":"` + declared + `"}}}`)
+	srv.AddPV(`{"metadata":{"name":"pv-declared"},"spec":{"local":{"path":"` + declared + `"},"claimRef":{"namespace":"ns","name":"declared","uid":"uid-ns-declared"}}}`)
 	srv.AddPVC(wiringClaim(t, "ns", "declared", map[string]string{"backup.test/engine": "files"}, "pv-declared"))
 
 	// A claim no rule declares and no pod covers.

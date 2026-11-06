@@ -638,8 +638,12 @@ of it, and a name may itself contain "/".
 	failed := false
 	for _, r := range results {
 		if r.OK {
-			w.printf("%s\n", human.Line(now, "✓ %s %s ok on %s (%s) run=%s",
-				r.Artifact, r.Depth, r.Storage, human.Size(r.Bytes), r.RunID))
+			line := fmt.Sprintf("✓ %s %s ok on %s (%s) run=%s",
+				r.Artifact, r.Depth, r.Storage, human.Size(r.Bytes), r.RunID)
+			if r.ApplySpoolBytes > 0 {
+				line += fmt.Sprintf(", apply needs ≥ %s of restore spool", human.Size(r.ApplySpoolBytes))
+			}
+			w.printf("%s\n", human.Line(now, "%s", line))
 			continue
 		}
 		failed = true

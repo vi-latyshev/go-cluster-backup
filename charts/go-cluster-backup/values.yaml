@@ -94,13 +94,18 @@ restore:
     - /etc/go-cluster-backup/config.yaml
   # -- Seconds a restore Job may live before Kubernetes kills it.
   activeDeadlineSeconds: 3600
-  # -- Size limit of the restore pod's spool (the config's restore.spool_dir,
-  # mounted at /spool).
+  # -- fetch needs the stored object (Bytes) plus the reserve; apply needs Bytes
+  # + RawBytes plus the reserve (a staged artifact needs more: its RawBytes is
+  # the sealed size); verify needs no spool and prints what an apply would need.
+  # The chart mounts the restore spool as an emptyDir whose sizeLimit statfs
+  # cannot see: exceeding it evicts the pod. This value is that sizeLimit, for
+  # the restore pod's spool (the config's restore.spool_dir, mounted at
+  # /spool).
   spoolSize: 8Gi
   # -- Resources of the restore container.
   resources:
     requests:
-      cpu: 100m
+      cpu: 200m
       memory: 256Mi
       ephemeral-storage: 4Gi
     limits:
@@ -294,7 +299,7 @@ securityContext:
 # -- Resources of the writer container.
 resources:
   requests:
-    cpu: 100m
+    cpu: 200m
     memory: 256Mi
     ephemeral-storage: 1Gi
   limits:

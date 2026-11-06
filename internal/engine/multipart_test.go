@@ -32,6 +32,10 @@ type fakeMultipart struct {
 	// test that spends a storage's time budget or cancels the run mid-upload.
 	partErr   func(number int32, call int) error
 	partDelay func(ctx context.Context) error
+	// beginHook and partHook run at the start of those calls: what a test uses to
+	// learn an upload opened, or a part arrived, while the producer is gated.
+	beginHook func(req storage.PutRequest)
+	partHook  func(number int32)
 
 	// completeDrop makes Complete answer success while committing nothing: the
 	// service's own answer is never the proof, the Stat after it is.
@@ -77,6 +81,9 @@ func (f *fakeMultipart) BeginMultipart(ctx context.Context, req storage.PutReque
 	if err := ctx.Err(); err != nil {
 		return storage.MultipartSession{}, err
 	}
+	if f.beginHook != nil {
+		f.beginHook(req)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.begins++
@@ -90,6 +97,9 @@ func (f *fakeMultipart) BeginMultipart(ctx context.Context, req storage.PutReque
 }
 
 func (f *fakeMultipart) PutPart(ctx context.Context, session storage.MultipartSession, part storage.Part) (storage.PartResult, error) {
+	if f.partHook != nil {
+		f.partHook(part.Number)
+	}
 	if f.partDelay != nil {
 		if err := f.partDelay(ctx); err != nil {
 			return storage.PartResult{}, err
@@ -241,8 +251,8 @@ func TestMultipartResendsOnlyTheFailedPart(t *testing.T) {
 		t.Fatalf("the artifact = %+v", rep.Artifacts[0])
 	}
 	begins, aborts, completes, calls := parts.stats()
-	if begins != 1 || completes != 1 || aborts != 0 {
-		t.Fatalf("begins=%d completes=%d aborts=%d, want one begin, one complete, no abort", begins, completes, aborts)
+	if begins < 1 || completes != 1 || aborts != 0 {
+		t.Fatalf("begins=%d completes=%d aborts=%d, want at least one begin, one complete, no abort", begins, completes, aborts)
 	}
 	if calls[1] != 1 || calls[2] != 2 || calls[3] != 1 {
 		t.Fatalf("part calls %v, want part 2 sent twice and only part 2", calls)
@@ -369,8 +379,8 @@ func TestSmallObjectKeepsTheSinglePut(t *testing.T) {
 		t.Fatalf("the artifact = %+v", rep.Artifacts[0])
 	}
 	begins, aborts, completes, calls := parts.stats()
-	if begins != 1 {
-		t.Fatalf("begins = %d, want the one probe that answered unsupported", begins)
+	if begins < 1 {
+		t.Fatalf("begins = %d, want the capability asked while the object grew", begins)
 	}
 	if aborts != 0 || completes != 0 || len(calls) != 0 {
 		t.Fatalf("an object that fits one request used the multipart path: aborts=%d completes=%d calls=%v",
@@ -701,8 +711,9 @@ func TestUploadPartsSpoolOpenFails(t *testing.T) {
 	mu := newFakeMultipart(4)
 	st := newStorageRunState(e.storages[0])
 	pa := producedArtifact{artifact: model.Artifact{Group: "g", Name: "n"}, file: "missing.bin", bytes: 10}
-	_, err = e.uploadParts(context.Background(), st, mu, sp, pa,
-		storage.MultipartSession{Key: "k", UploadID: "u", PartSize: 4})
+	_, err = e.uploadParts(context.Background(), st, mu, sp,
+		&finishedSource{name: pa.file, size: pa.bytes},
+		storage.MultipartSession{Key: "k", UploadID: "u", PartSize: 4}, artifactName(pa))
 	if err == nil {
 		t.Fatal("uploadParts opened a spool file that does not exist")
 	}
@@ -739,7 +750,8 @@ func TestUploadPartsWrongPartNumber(t *testing.T) {
 	}
 	st := newStorageRunState(e.storages[0])
 	pa := producedArtifact{artifact: model.Artifact{Group: "g", Name: "n"}, file: wr.Name(), bytes: 10}
-	_, err = e.uploadParts(context.Background(), st, z, sp, pa, session)
+	_, err = e.uploadParts(context.Background(), st, z, sp,
+		&finishedSource{name: pa.file, size: pa.bytes}, session, artifactName(pa))
 	if err == nil || !strings.Contains(err.Error(), "answered part") {
 		t.Fatalf("uploadParts = %v, want the wrong-part-number refusal", err)
 	}
@@ -751,7 +763,8 @@ func TestAbortMultipartFailure(t *testing.T) {
 	w := newWorld(t)
 	e := w.newEngine(t, baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")}))
 	z := &multipartFake{fakeMultipart: newFakeMultipart(4), abortErr: errors.New("abort failed")}
-	err := e.abortMultipart(context.Background(), z, storage.MultipartSession{Key: "k", UploadID: "u"}, "k")
+	err := e.abortMultipart(context.Background(), newStorageRunState(e.storages[0]), z,
+		storage.MultipartSession{Key: "k", UploadID: "u"}, "k")
 	if err == nil || !strings.Contains(err.Error(), "abort failed") {
 		t.Fatalf("abortMultipart = %v, want the abort failure", err)
 	}

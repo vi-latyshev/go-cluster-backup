@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
@@ -158,7 +159,23 @@ func (b broken) Delete(ctx context.Context, key string) error {
 // delegating at all.
 
 func TestSuitePassesFake(t *testing.T) {
-	Run(t, func(*testing.T) storage.Storage { return NewFake() })
+	Run(t, func(*testing.T) storage.Storage { return NewFake() }, Options{})
+}
+
+// TestSlowWriterHoldsTheFirstWrite: the slow destination really holds the first
+// write — a storage's io.Copy must not reach a promoted ReadFrom and skip the
+// delay, or every slow-body proof passes without proving anything.
+func TestSlowWriterHoldsTheFirstWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		start := time.Now()
+		dst := &slowWriter{delay: time.Second}
+		if _, err := io.Copy(dst, strings.NewReader("body")); err != nil {
+			t.Fatal(err)
+		}
+		if elapsed := time.Since(start); elapsed < time.Second {
+			t.Fatalf("slow writer was bypassed: elapsed %s", elapsed)
+		}
+	})
 }
 
 func TestFakePagesByPageSize(t *testing.T) {
@@ -214,6 +231,9 @@ func TestChecksCatchBrokenStorages(t *testing.T) {
 		{"checksums per declared traits", "describeerr"},
 		{"checksums per declared traits", "puterr"},
 		{"checksums per declared traits", "staterr"},
+		{"get into a slow destination", "puterr"},
+		{"get into a slow destination", "geterr"},
+		{"get into a slow destination", "wrongget"},
 		// nilstat answers success whatever the context says, so the cancellation
 		// check must catch it on the Stat leg alone.
 		{"returns on cancellation", "nilstat"},
@@ -225,7 +245,7 @@ func TestChecksCatchBrokenStorages(t *testing.T) {
 				if c.Name != tc.check {
 					continue
 				}
-				if err := c.Run(t, s); err == nil {
+				if err := c.Run(t, s, Options{}); err == nil {
 					t.Fatalf("check %q passed a broken storage", c.Name)
 				}
 				return
@@ -237,7 +257,7 @@ func TestChecksCatchBrokenStorages(t *testing.T) {
 
 func TestGoodChecksFindNothingOnFake(t *testing.T) {
 	for _, c := range Checks {
-		if err := c.Run(t, NewFake()); err != nil {
+		if err := c.Run(t, NewFake(), Options{}); err != nil {
 			t.Errorf("check %q failed the fake: %v", c.Name, err)
 		}
 	}

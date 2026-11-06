@@ -258,7 +258,8 @@ func (s *Source) archiveEntry(ctx context.Context, tw *tar.Writer, root *os.Root
 		hdr.Name = rel + "/"
 	}
 	// The same rule an Apply validates with decides here: a socket, a FIFO, a
-	// device node and a link that resolves outside the tree are left out.
+	// device node, and a link whose target leaves the tree or climbs after a
+	// name are left out.
 	if why := entryRefusal(hdr); why != "" {
 		return s.leaveOut(rel, why)
 	}

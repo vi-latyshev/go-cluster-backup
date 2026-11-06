@@ -75,7 +75,7 @@ func TestLiveS3(t *testing.T) {
 	t.Cleanup(func() { cleanupLive(t, build(t, nil), prefix, bucket, endpoint, region, keyID, secret) })
 
 	t.Run("conformance", func(t *testing.T) {
-		storagetest.Run(t, func(t *testing.T) storage.Storage { return build(t, nil) })
+		storagetest.Run(t, func(t *testing.T) storage.Storage { return build(t, nil) }, storagetest.Options{})
 	})
 
 	t.Run("multipart driven part by part", func(t *testing.T) {

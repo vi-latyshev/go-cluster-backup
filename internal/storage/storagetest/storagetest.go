@@ -7,7 +7,7 @@
 //
 // A step-2 storage package proves itself with:
 //
-//	storagetest.Run(t, func(t *testing.T) storage.Storage { return newTestStorage(t, server) })
+//	storagetest.Run(t, func(t *testing.T) storage.Storage { return newTestStorage(t, server) }, storagetest.Options{})
 //
 // Each check is a function returning an error, so the suite itself is tested
 // against deliberately broken implementations — a check that cannot fail is
@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,7 +33,17 @@ import (
 
 type Check struct {
 	Name string
-	Run  func(t *testing.T, s storage.Storage) error
+	Run  func(t *testing.T, s storage.Storage, o Options) error
+}
+
+// Options tune the checks one Run executes; the zero value is the kit's own
+// defaults.
+type Options struct {
+	// SlowWrite is how long the "get into a slow destination" check holds its
+	// first write. A storage whose request timeout also bounded the body would
+	// fail the check when this is longer than that timeout; a storage with no
+	// timeout (local) passes the zero value.
+	SlowWrite time.Duration
 }
 
 var Checks = []Check{
@@ -43,6 +54,7 @@ var Checks = []Check{
 	{"list pages every object", checkList},
 	{"checksums per declared traits", checkChecksums},
 	{"returns on cancellation", checkCancel},
+	{"get into a slow destination", checkSlowGet},
 }
 
 // fatalReporter is what the kit's one failure path needs from a test handle:
@@ -56,11 +68,11 @@ type fatalReporter interface {
 }
 
 // Run executes every check against a freshly built, empty storage instance.
-func Run(t *testing.T, newFn func(t *testing.T) storage.Storage) {
+func Run(t *testing.T, newFn func(t *testing.T) storage.Storage, o Options) {
 	t.Helper()
 	for _, c := range Checks {
 		t.Run(c.Name, func(t *testing.T) {
-			reportCheck(t, c, c.Run(t, newFn(t)))
+			reportCheck(t, c, c.Run(t, newFn(t), o))
 		})
 	}
 }
@@ -75,7 +87,7 @@ func reportCheck(t fatalReporter, c Check, err error) {
 
 const cancelDeadline = 5 * time.Second
 
-func checkDescribe(_ *testing.T, s storage.Storage) error {
+func checkDescribe(_ *testing.T, s storage.Storage, _ Options) error {
 	tr, err := s.Describe(context.Background())
 	if err != nil {
 		return fmt.Errorf("Describe: %w", err)
@@ -88,7 +100,7 @@ func checkDescribe(_ *testing.T, s storage.Storage) error {
 	return nil
 }
 
-func checkPutStatGet(_ *testing.T, s storage.Storage) error {
+func checkPutStatGet(_ *testing.T, s storage.Storage, _ Options) error {
 	ctx := context.Background()
 	want := []byte("conformance: one object, written and read back")
 	key := "conformance/put-stat-get.bin"
@@ -120,7 +132,7 @@ func checkPutStatGet(_ *testing.T, s storage.Storage) error {
 	return nil
 }
 
-func checkStatAbsent(_ *testing.T, s storage.Storage) error {
+func checkStatAbsent(_ *testing.T, s storage.Storage, _ Options) error {
 	_, err := s.Stat(context.Background(), "conformance/definitely-absent")
 	if err == nil {
 		return fmt.Errorf("Stat of an absent key returned no error")
@@ -131,7 +143,7 @@ func checkStatAbsent(_ *testing.T, s storage.Storage) error {
 	return nil
 }
 
-func checkDelete(_ *testing.T, s storage.Storage) error {
+func checkDelete(_ *testing.T, s storage.Storage, _ Options) error {
 	ctx := context.Background()
 	key := "conformance/delete-me.bin"
 	want := []byte("delete me")
@@ -153,7 +165,7 @@ func checkDelete(_ *testing.T, s storage.Storage) error {
 	return nil
 }
 
-func checkList(_ *testing.T, s storage.Storage) error {
+func checkList(_ *testing.T, s storage.Storage, _ Options) error {
 	ctx := context.Background()
 	const n = 5
 	want := map[string]bool{}
@@ -205,7 +217,7 @@ func checkList(_ *testing.T, s storage.Storage) error {
 	return nil
 }
 
-func checkChecksums(_ *testing.T, s storage.Storage) error {
+func checkChecksums(_ *testing.T, s storage.Storage, _ Options) error {
 	ctx := context.Background()
 	tr, err := s.Describe(ctx)
 	if err != nil {
@@ -236,7 +248,7 @@ func checkChecksums(_ *testing.T, s storage.Storage) error {
 	return nil
 }
 
-func checkCancel(t *testing.T, s storage.Storage) error {
+func checkCancel(t *testing.T, s storage.Storage, _ Options) error {
 	body := []byte("cancel me")
 	ops := []struct {
 		name string
@@ -261,6 +273,47 @@ func checkCancel(t *testing.T, s storage.Storage) error {
 		}
 	}
 	return nil
+}
+
+// slowGetDeadline bounds the slow-destination download, so a storage that never
+// returns fails the check instead of hanging the suite.
+const slowGetDeadline = 10 * time.Second
+
+// checkSlowGet proves that reading an object back is bounded by the caller's
+// deadline alone: the destination holds the first write for Options.SlowWrite,
+// and a storage whose request timeout also covered the body fails here.
+func checkSlowGet(_ *testing.T, s storage.Storage, o Options) error {
+	ctx, cancel := context.WithTimeout(context.Background(), slowGetDeadline)
+	defer cancel()
+	want := bytes.Repeat([]byte("slow destination conformance "), 1<<15)
+	key := "conformance/slow-get.bin"
+	if _, err := s.Put(ctx, storage.PutRequest{Key: key, Size: int64(len(want)), SHA256: model.SHA256Hex(want)},
+		bytes.NewReader(want)); err != nil {
+		return fmt.Errorf("Put: %w", err)
+	}
+	dst := &slowWriter{delay: o.SlowWrite}
+	if err := s.Get(ctx, key, dst); err != nil {
+		return fmt.Errorf("Get into a slow destination: %w", err)
+	}
+	if !bytes.Equal(dst.buf.Bytes(), want) {
+		return fmt.Errorf("Get into a slow destination returned %d bytes, want %d equal bytes", dst.buf.Len(), len(want))
+	}
+	return nil
+}
+
+// slowWriter holds its first write for delay — at once when zero — and then
+// buffers everything the download hands it. The buffer is a named field, never
+// embedded: an embedded bytes.Buffer promotes ReadFrom, and io.Copy would use it
+// and skip the delay this type exists to impose.
+type slowWriter struct {
+	buf   bytes.Buffer
+	delay time.Duration
+	once  sync.Once
+}
+
+func (w *slowWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { time.Sleep(w.delay) })
+	return w.buf.Write(p)
 }
 
 func md5Hex(b []byte) string {

@@ -10,6 +10,8 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
 	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/spool"
+	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
 )
 
 func TestApplyRefusalPaths(t *testing.T) {
@@ -56,6 +58,61 @@ func TestApplyRefusalPaths(t *testing.T) {
 		Mode: source.ApplyInPlace, Confirm: "test://fake/source",
 	}); err == nil || !strings.Contains(err.Error(), "Prober") {
 		t.Fatalf("an in-place apply without a prober was accepted: %v", err)
+	}
+}
+
+// TestApplySpoolReserve: an apply reserves the stored object and its decoded
+// copy together, and refuses before the copy's first byte.
+func TestApplySpoolReserve(t *testing.T) {
+	w := newWorld(t)
+	target := &fakeRestorer{}
+	w.extraSources["target"] = target
+	cfg := applyConfig(t, w, "target", nil)
+	e := runOnce(t, w, cfg)
+	runs, err := e.StoredRuns(context.Background(), StoredRunsRequest{})
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("stored runs %v, %v", runs, err)
+	}
+	ar := findArtifact(&runs[0].Report, "wireguard")
+	if ar == nil {
+		t.Fatalf("the manifest does not record wireguard: %+v", runs[0].Report.Artifacts)
+	}
+	before := w.storage(t, "primary").CallCount(storagetest.OpGet, ar.Key)
+	orig := spoolFreeBytes
+	spoolFreeBytes = func(*spool.Spool) (int64, error) { return ar.Bytes + ar.RawBytes - 1, nil }
+	t.Cleanup(func() { spoolFreeBytes = orig })
+
+	_, err = e.Apply(context.Background(), ApplyRunRequest{
+		Fetch: FetchRequest{RunID: runs[0].RunID, Artifact: "wireguard"}, Target: "target", Mode: source.ApplySideBySide,
+	})
+	if err == nil || !strings.Contains(err.Error(), "need") {
+		t.Fatalf("a spool one byte short was accepted: %v", err)
+	}
+	if n := w.storage(t, "primary").CallCount(storagetest.OpGet, ar.Key); n != before {
+		t.Fatalf("a refused apply downloaded the artifact %d times", n-before)
+	}
+	if target.applied != 0 {
+		t.Fatal("a refused apply reached the target")
+	}
+}
+
+// TestApplyDecodeFailure: the copy verified, but the chain the manifest records
+// cannot be reversed here — the apply refuses before the target is touched.
+func TestApplyDecodeFailure(t *testing.T) {
+	w := newWorld(t)
+	target := &fakeRestorer{}
+	w.extraSources["target"] = target
+	cfg := applyConfig(t, w, "target", nil)
+	e := runOnce(t, w, cfg)
+	runs, _ := e.StoredRuns(context.Background(), StoredRunsRequest{})
+	delete(e.processors, "zstd3")
+	if _, err := e.Apply(context.Background(), ApplyRunRequest{
+		Fetch: FetchRequest{RunID: runs[0].RunID, Artifact: "wireguard"}, Target: "target", Mode: source.ApplySideBySide,
+	}); err == nil || !strings.Contains(err.Error(), "does not have") {
+		t.Fatalf("an undecodable apply was accepted: %v", err)
+	}
+	if target.applied != 0 {
+		t.Fatal("the target was applied to after a failed decode")
 	}
 }
 

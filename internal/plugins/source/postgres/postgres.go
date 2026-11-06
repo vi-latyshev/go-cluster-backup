@@ -206,7 +206,7 @@ func (s *Source) dumpArgs() []string {
 		"--no-password",
 		"-F"+formatFlag[s.cfg.Format],
 		"--compress="+s.cfg.Compression,
-		s.cfg.Database,
+		dbnameArg(s.cfg.Database),
 	)
 }
 
@@ -259,7 +259,7 @@ func (s *Source) serverMajor(ctx context.Context, pass string) (int, error) {
 // check both ask the server, and both classify a refusal the same way.
 func (s *Source) psqlQuery(ctx context.Context, database, pass, query string) (string, error) {
 	cmd := exec.CommandContext(ctx, "psql", append(s.connArgs(),
-		"--no-password", "-d", database, "-At",
+		"--no-password", dbnameArg(database), "-At",
 		"-c", query,
 	)...)
 	cmd.Env = s.pgEnv(pass)

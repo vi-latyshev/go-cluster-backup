@@ -110,9 +110,9 @@ func TestGeneralConformance(t *testing.T) {
 
 func TestStorageConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storage.Storage {
-		s, _ := newStorage(t, nil)
+		s, _ := newStorage(t, func(raw map[string]any) { raw["request_timeout"] = "100ms" })
 		return s
-	})
+	}, storagetest.Options{SlowWrite: 300 * time.Millisecond})
 }
 
 func TestDescribeTraits(t *testing.T) {
@@ -126,9 +126,11 @@ func TestDescribeTraits(t *testing.T) {
 	}
 }
 
-// TestSinglePutSequence pins one attempt's requests: one signed PutObject with
-// the configured storage class and no aws-chunked framing, then one HeadObject
-// that proves the object is there. A hidden SDK retry would break the counts.
+// TestSinglePutSequence pins one Put attempt's requests: one signed PutObject
+// with the configured storage class and no aws-chunked framing — and nothing
+// else. The plugin does not verify its own write; the engine's Stat is the one
+// proof, so the whole upload costs 1 PUT + 1 HEAD. A hidden SDK retry would
+// break the counts.
 func TestSinglePutSequence(t *testing.T) {
 	ctx := context.Background()
 	s, f := newStorage(t, nil)
@@ -137,10 +139,10 @@ func TestSinglePutSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size != int64(len(body)) || info.MD5 == "" {
-		t.Errorf("info %+v, want the size and the single-part md5", info)
+	if info.Key != "a/b.bin" || info.Size != int64(len(body)) {
+		t.Errorf("info %+v, want the key and the sent size", info)
 	}
-	for op, want := range map[string]int{"put": 1, "head": 1, "create": 0, "part": 0, "complete": 0, "abort": 0} {
+	for op, want := range map[string]int{"put": 1, "head": 0, "get": 0, "create": 0, "part": 0, "complete": 0, "abort": 0} {
 		if got := f.Count(op); got != want {
 			t.Errorf("%s requests: got %d, want %d", op, got, want)
 		}
@@ -156,6 +158,16 @@ func TestSinglePutSequence(t *testing.T) {
 	}
 	if _, ok := f.objectBody("root/a/b.bin"); !ok {
 		t.Error("the object was not stored under the storage prefix")
+	}
+	// The engine's verification of the copy: one Stat (one HEAD), no download.
+	if _, err := s.Stat(ctx, "a/b.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Count("head"); got != 1 {
+		t.Errorf("head requests after Put and the engine's Stat: got %d, want 1", got)
+	}
+	if got := f.Count("get"); got != 0 {
+		t.Errorf("get requests: got %d, want none", got)
 	}
 }
 
@@ -177,19 +189,6 @@ func TestNoSdkRetryOnPut(t *testing.T) {
 	}
 }
 
-func TestPutNotVisibleIsFailure(t *testing.T) {
-	ctx := context.Background()
-	s, f := newStorage(t, nil)
-	f.putDrops = true
-	_, err := s.Put(ctx, storage.PutRequest{Key: "gone.bin", Size: 4}, strings.NewReader("gone"))
-	if err == nil {
-		t.Fatal("a PutObject that stored nothing was accepted")
-	}
-	if class := classOf(err); class != plugin.ClassTransient {
-		t.Errorf("class %q, want transient: %v", class, err)
-	}
-}
-
 // TestForbiddenHeadIsNotNotFound: an existence probe answered 403 must never be
 // read as absence — the object may be there and simply unreadable.
 func TestForbiddenHeadIsNotNotFound(t *testing.T) {
@@ -203,9 +202,6 @@ func TestForbiddenHeadIsNotNotFound(t *testing.T) {
 	}
 	if class := classOf(err); class != plugin.ClassPermanent {
 		t.Errorf("class %q, want permanent (never not_found): %v", class, err)
-	}
-	if _, err := s.Put(ctx, storage.PutRequest{Key: "new.bin", Size: 1}, strings.NewReader("x")); classOf(err) != plugin.ClassPermanent {
-		t.Errorf("Put whose verification got a 403: %v", err)
 	}
 }
 
@@ -314,6 +310,73 @@ func TestGetPropagatesWriterErrors(t *testing.T) {
 type failWriter struct{}
 
 func (failWriter) Write([]byte) (int, error) { return 0, errors.New("no space left") }
+
+// TestGetWithoutHeadersIsTransientTimeout: request_timeout covers the wait for
+// the response headers, and an endpoint that never starts answering is a
+// transient failure naming the timeout.
+func TestGetWithoutHeadersIsTransientTimeout(t *testing.T) {
+	s, f := newStorage(t, func(raw map[string]any) { raw["request_timeout"] = "100ms" })
+	f.putObject("root/hang.bin", []byte("x"))
+	f.hang["get"] = true
+	err := s.Get(context.Background(), "hang.bin", io.Discard)
+	if err == nil || classOf(err) != plugin.ClassTransient {
+		t.Fatalf("a download that never got headers: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no response within request_timeout") {
+		t.Errorf("error %q does not name the request timeout", err)
+	}
+}
+
+// TestOneConnectionPerStorage: one Storage owns one transport, so sequential
+// calls reuse one TCP connection. A client built per call would open one
+// connection each.
+func TestOneConnectionPerStorage(t *testing.T) {
+	ctx := context.Background()
+	s, f := multipartStorage(t)
+	mu := capabilityOf(t, s)
+	session := beginUpload(t, mu, "pool/object.bin", 2*testPartBytes+1)
+	for i := range 3 {
+		body := bytes.Repeat([]byte{byte('0' + i)}, 1024)
+		if _, err := mu.PutPart(ctx, session, partBytes(int32(i+1), body)); err != nil {
+			t.Fatalf("PutPart %d: %v", i+1, err)
+		}
+	}
+	if _, err := s.Stat(ctx, "pool/absent.bin"); classOf(err) != plugin.ClassNotFound {
+		t.Fatalf("Stat of an absent key: %v", err)
+	}
+	if got := f.Connections(); got != 1 {
+		t.Errorf("connections used by sequential calls: got %d, want 1", got)
+	}
+}
+
+// TestCredentialsAreReadPerCall: the credential files are read on every call, so
+// a rotated key is picked up without rebuilding the Storage.
+func TestCredentialsAreReadPerCall(t *testing.T) {
+	ctx := context.Background()
+	keyFile := writeSecret(t, "first-key-id")
+	s, f := newStorage(t, func(raw map[string]any) {
+		raw["access_key_id"] = map[string]any{"file": keyFile}
+	})
+	if _, err := s.Stat(ctx, "x.bin"); classOf(err) != plugin.ClassNotFound {
+		t.Fatalf("Stat: %v", err)
+	}
+	if err := os.WriteFile(keyFile, []byte("rotated-key-id"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Stat(ctx, "x.bin"); classOf(err) != plugin.ClassNotFound {
+		t.Fatalf("Stat after the key was rotated: %v", err)
+	}
+	auths := f.Authorizations()
+	if len(auths) != 2 {
+		t.Fatalf("signed requests: got %d, want 2", len(auths))
+	}
+	if !strings.Contains(auths[0], "first-key-id") {
+		t.Errorf("first request signed with %q, want the first key", auths[0])
+	}
+	if !strings.Contains(auths[1], "rotated-key-id") {
+		t.Errorf("second request signed with %q, want the rotated key", auths[1])
+	}
+}
 
 func TestGetDeleteRoundTrip(t *testing.T) {
 	ctx := context.Background()
@@ -456,19 +519,6 @@ func TestOperationsReportAnUnreadableSecret(t *testing.T) {
 	}
 	if err := checkerOf(t, s).Check(ctx); err == nil {
 		t.Error("Check with an unreadable secret succeeded")
-	}
-}
-
-// TestPutRejectsASizeTheHeadDisagreesWith: a write is successful only once
-// HeadObject reports the committed size.
-func TestPutRejectsASizeTheHeadDisagreesWith(t *testing.T) {
-	ctx := context.Background()
-	s, f := newStorage(t, nil)
-	f.headWrongSize = true
-	body := []byte("x")
-	_, err := s.Put(ctx, storage.PutRequest{Key: "size.bin", Size: int64(len(body))}, bytes.NewReader(body))
-	if err == nil || classOf(err) != plugin.ClassTransient {
-		t.Fatalf("a head that disagrees with the sent size: got %v", err)
 	}
 }
 

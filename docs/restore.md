@@ -94,6 +94,38 @@ selected run does not hold is a command error, while a verification that ran
 and failed keeps its own row. `stored` proves one readable copy, so use
 `decoded` or `probed` when the bytes themselves are in question.
 
+`decoded` and `probed` stream: the stored object is downloaded and decoded on
+the way through, no decoded copy is written to the restore spool and nothing is
+left on disk. A retry downloads the copy again — a stream cannot be rewound —
+and one copy spends one `restore.retry` budget across the download, the decode
+and the probe. A processor that answers `errors.ErrUnsupported` is not retried:
+this config cannot decode the artifact. Every `✓` line of a `decoded` or
+`probed` check ends with what an apply of that record would need on the spool.
+
+### Spool sizing
+
+`fetch` needs the stored object (`Bytes`) plus the reserve; `apply` needs
+`Bytes + RawBytes` plus the reserve (a staged artifact needs more: its
+`RawBytes` is the sealed size); `verify` needs no spool and prints what an
+apply would need. The chart mounts the restore spool as an `emptyDir` whose
+`sizeLimit` statfs cannot see: exceeding it evicts the pod.
+
+## What a verification trusts
+
+`restore verify` reads the bytes before it decides, but it answers `ok` only
+when they match the manifest's sha256; a `stored` `ok` is a readable copy, not
+a faithful one. The sha256 sits next to the object, in the same storage, and
+the `age` processor does not authenticate a sender — it only decrypts. Whoever
+can write to a storage therefore decides what `restore apply` puts on a target.
+Bound that with prefix-scoped least privilege: a credential limited to the
+deployment's own prefix that grants List, Stat, Get, Put and Delete. All five
+are load-bearing — preflight lists the prefix, an upload is verified with a
+Stat, the survey reads manifests back, and retention deletes under the same
+prefix — so a read-only or write-only credential cannot complete a run, and one
+scoped to the prefix keeps the damage of a leaked key inside it. Keep
+versioning or object lock on the bucket, and run a restore with a role that is
+not the deployment's superuser. `SECURITY.md` states the trust model.
+
 ## One Postgres database
 
 1. **Stop the writers** — scale the Deployments that use the database to 0 (and

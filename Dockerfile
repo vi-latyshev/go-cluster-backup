@@ -27,8 +27,7 @@ FROM docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5
 # redis-cli, sqlite3), CA certificates for every HTTPS storage, and tzdata so a
 # retention policy's IANA timezone resolves beyond UTC. age and zstd are
 # libraries of the binary, not binaries of the image.
-RUN --mount=type=cache,target=/var/cache/apk,id=apk-backup,sharing=locked \
-    apk add --no-cache \
+RUN apk add --no-cache \
         postgresql18-client \
         redis \
         sqlite \
@@ -37,7 +36,7 @@ RUN --mount=type=cache,target=/var/cache/apk,id=apk-backup,sharing=locked \
 
 # uid/gid 1000 — unclaimed; gid 999 is taken by ping.
 RUN addgroup -g 1000 backup && \
-    adduser -D -u 1000 -G backup -h /home/backup -s /bin/sh backup
+    adduser -D -u 1000 -G backup -h /home/backup -s /sbin/nologin backup
 
 COPY --from=builder /out/go-cluster-backup /usr/local/bin/go-cluster-backup
 

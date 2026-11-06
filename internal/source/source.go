@@ -197,6 +197,8 @@ type ProbeReport struct {
 
 // Prober proves an artifact is readable without a target and without writing:
 // a pg_restore listing pass, a walk over a tar stream, an integrity check.
+// src may carry bytes the engine has not verified yet and may end with an
+// upstream error instead of EOF; the engine decides the verdict.
 type Prober interface {
 	Probe(ctx context.Context, src io.Reader) (ProbeReport, error)
 }

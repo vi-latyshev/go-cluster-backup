@@ -85,6 +85,7 @@ type claimFixture struct {
 	Metadata struct {
 		Name      string            `json:"name"`
 		Namespace string            `json:"namespace"`
+		UID       string            `json:"uid"`
 		Labels    map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Spec struct {
@@ -114,11 +115,16 @@ func boundPVC(namespace, name string, labels map[string]string, phase, volumeNam
 	var p claimFixture
 	p.Metadata.Name = name
 	p.Metadata.Namespace = namespace
+	p.Metadata.UID = claimUID(namespace, name)
 	p.Metadata.Labels = labels
 	p.Spec.VolumeName = volumeName
 	p.Status.Phase = phase
 	return mustJSON(p)
 }
+
+// claimUID is the incarnation a fixture claim and the claimRef of its volume
+// share: the binding is namespace, name AND uid.
+func claimUID(namespace, name string) string { return "uid-" + namespace + "-" + name }
 
 // mountingPod is a pod whose volumes mount the named claims.
 func mountingPod(namespace, name string, labels map[string]string, phase string, claims ...string) string {

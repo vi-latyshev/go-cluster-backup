@@ -28,15 +28,15 @@ type Config struct {
 	// default, 6..9 better, 10+ best), and a CLI number here would promise a
 	// distinction the library does not make; the field doc names each level's
 	// CLI equivalent instead.
-	Level string `json:"level" required:"true" doc:"the library's encoder level: \"fastest\" (zstd CLI 1-2), \"default\" (CLI 3-5), \"better\" (CLI 6-9), \"best\" (CLI 10+); a CLI number is not accepted because the library collapses all of them onto these four"`
+	Level string `json:"level" required:"true" doc:"the library's encoder level: \"fastest\" (zstd CLI 1-2), \"default\" (CLI 3-5), \"better\" (CLI 6-9), \"best\" (CLI 10+); a CLI number is not accepted because the library collapses all of them onto these four; \"fastest\" and \"default\" are different heuristics, not points on one scale, and \"better\" was smallest on every measured dump at 1.3-2.3x the cheapest level's CPU"`
 	// Concurrency is the number of encoder/decoder goroutines; memory scales
 	// with the window times this value.
-	Concurrency int `json:"concurrency" doc:"encoder and decoder goroutines; encoder memory is roughly window_bytes times this number, decoder memory roughly decode_window_bytes times it"`
+	Concurrency int `json:"concurrency" doc:"encoder and decoder goroutines; encoder memory is roughly window_bytes times this number, decoder memory roughly decode_window_bytes times it; above 1 it overlaps encoding with reading and writing, the match search inside a frame stays serial"`
 	// WindowBytes is the maximum back-reference distance: how far back the
 	// compressor may look for a repeated string. Must be a power of two between
 	// 1 KiB and 512 MiB. Raising it buys more compression than raising the
 	// level does, and costs memory in proportion.
-	WindowBytes model.ByteSize `json:"window_bytes" required:"true" doc:"encoder maximum back-reference distance in bytes, a power of two between 1024 and 536870912; memory is roughly this times concurrency"`
+	WindowBytes model.ByteSize `json:"window_bytes" required:"true" doc:"encoder maximum back-reference distance in bytes, a power of two between 1024 and 536870912; memory is roughly this times concurrency, and past 8 MiB a wider window buys little on a database dump"`
 	// DecodeWindowBytes is the decoder's own ceiling, stated separately on
 	// purpose: a restore decodes objects written weeks earlier with the window
 	// recorded in their manifests, so it must not follow a later reduction of

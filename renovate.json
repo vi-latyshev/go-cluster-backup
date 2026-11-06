@@ -6,6 +6,18 @@
     "helpers:pinGitHubActionDigests",
     "docker:pinDigests"
   ],
+  "ignorePresets": [
+    ":ignoreModulesAndTests"
+  ],
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/vendor/**",
+    "**/__tests__/**",
+    "**/test/**",
+    "**/tests/**",
+    "**/__fixtures__/**"
+  ],
   "schedule": [
     "before 6am on monday"
   ],
@@ -59,6 +71,20 @@
       ],
       "semanticCommitType": "chore",
       "groupName": "github actions"
+    },
+    {
+      "description": "The Go toolchain moves as one: the go directive of both modules and the golang image.",
+      "matchDatasources": [
+        "golang-version",
+        "docker"
+      ],
+      "matchPackageNames": [
+        "go",
+        "docker.io/library/golang"
+      ],
+      "groupName": "go toolchain",
+      "rangeStrategy": "bump",
+      "semanticCommitType": "fix"
     }
   ]
 }

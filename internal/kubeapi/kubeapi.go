@@ -279,6 +279,16 @@ type PV struct {
 		HostPath *struct {
 			Path string `json:"path"`
 		} `json:"hostPath"`
+		// ClaimRef is the claim the volume is bound to: the API server sets it
+		// on binding, and no claim owns a volume without one. UID is the
+		// claim's incarnation — deleting and recreating a claim of the same
+		// namespace and name leaves the PV's reference naming the old one, and
+		// reading that volume would read the deleted claim's data.
+		ClaimRef *struct {
+			Namespace string `json:"namespace"`
+			Name      string `json:"name"`
+			UID       string `json:"uid"`
+		} `json:"claimRef"`
 	} `json:"spec"`
 }
 

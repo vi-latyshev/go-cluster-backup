@@ -8,9 +8,10 @@
 // no buffer of the object held here, so a part that failed is sent again without
 // re-sending the parts the service already accepted.
 //
-// A write is successful only once HeadObject reports the committed size, so a
-// 200 that did not commit anything (CompleteMultipartUpload may answer 200 with
-// an error in the body) is a failed attempt, not a stored object.
+// A write is one PUT and nothing else: the plugin does not verify its own
+// object, because the engine stats every copy it uploads and that Stat is the
+// proof a copy landed. A 200 that did not commit anything (CompleteMultipartUpload
+// may answer 200 with an error in the body) is caught by that Stat, not here.
 package s3
 
 import (
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -68,7 +70,7 @@ type Config struct {
 	PartBytes       model.ByteSize `json:"part_bytes" doc:"bytes per part of a multipart upload; at least 5 MiB"`
 	MaxRequestBytes model.ByteSize `json:"max_request_bytes" doc:"largest single request the endpoint accepts"`
 	MaxObjectBytes  model.ByteSize `json:"max_object_bytes" doc:"largest object the endpoint accepts"`
-	RequestTimeout  model.Duration `json:"request_timeout" doc:"timeout of one HTTP request"`
+	RequestTimeout  model.Duration `json:"request_timeout" doc:"time until the response headers of one HTTP request; a download body streams under the caller's deadline"`
 }
 
 // Register adds the S3 storage to a registry.
@@ -153,16 +155,20 @@ func newStorage(cfg Config) (*Storage, error) {
 	if cfg.RequestTimeout <= 0 {
 		return nil, fmt.Errorf("request_timeout must be positive, got %s", cfg.RequestTimeout)
 	}
-	return &Storage{cfg: cfg, checksum: checksum}, nil
+	return &Storage{cfg: cfg, checksum: checksum, http: awshttp.NewBuildableClient()}, nil
 }
 
 type Storage struct {
 	cfg      Config
 	checksum aws.RequestChecksumCalculation
-	// http is the client every request goes through; nil is the SDK's own
-	// default. A test substitutes one to hand a request an answer whose body is
-	// shorter than the length it declares — the shape Get's own length guard
-	// exists for, and one no real transport produces.
+	// http is the one client every request of this Storage goes through: its
+	// transport owns the connection pool, so the calls of one run reuse
+	// connections. It carries no http.Client.Timeout — a timeout there would
+	// bound the whole exchange, body included, and undo Get's header-only
+	// request_timeout. nil is the SDK's own default; a test substitutes one to
+	// hand a request an answer whose body is shorter than the length it
+	// declares — the shape Get's own length guard exists for, and one no real
+	// transport produces.
 	http aws.HTTPClient
 }
 
@@ -230,9 +236,7 @@ func (s *Storage) client() (*s3.Client, error) {
 	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(s.cfg.Endpoint)
 		o.UsePathStyle = s.cfg.Addressing == AddressingPath
-		if s.http != nil { // nil leaves the SDK's own client in place
-			o.HTTPClient = s.http
-		}
+		o.HTTPClient = s.http // nil leaves the SDK's own client in place
 	}), nil
 }
 
@@ -240,11 +244,12 @@ func (s *Storage) reqCtx(ctx context.Context) (context.Context, context.CancelFu
 	return context.WithTimeout(ctx, s.cfg.RequestTimeout.Std())
 }
 
-// Put stores one object in one PutObject request and returns only after
-// HeadObject confirms the committed size. An object larger than one request is a
-// permanent error here: the engine uploads such an object part by part through
-// the storage.MultipartUploader capability, and Put never becomes a multipart
-// upload of its own.
+// Put stores one object in one PutObject request. The plugin does not verify its
+// own write: the engine's Stat of the object is the one proof a copy landed, and
+// a second HEAD here only doubled the requests of every upload. An object larger
+// than one request is a permanent error here: the engine uploads such an object
+// part by part through the storage.MultipartUploader capability, and Put never
+// becomes a multipart upload of its own.
 func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reader) (model.ObjectInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return model.ObjectInfo{}, err
@@ -266,7 +271,7 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 	if err := s.putSingle(ctx, c, full, req.Size, body); err != nil {
 		return model.ObjectInfo{}, err
 	}
-	return s.verify(ctx, c, req.Key, full, req.Size)
+	return model.ObjectInfo{Key: req.Key, Size: req.Size}, nil
 }
 
 // putSingle sends the whole object in one request — the only path that can be
@@ -288,29 +293,6 @@ func (s *Storage) putSingle(ctx context.Context, c *s3.Client, full string, size
 		return s.classify(ctx, err, "put "+full)
 	}
 	return nil
-}
-
-// verify is the only proof a write landed: HeadObject must report the sent
-// size. A missing object right after a successful upload is a failed commit,
-// not the not_found of an absent key, so it stays transient here.
-func (s *Storage) verify(ctx context.Context, c *s3.Client, key, full string, size int64) (model.ObjectInfo, error) {
-	rctx, cancel := s.reqCtx(ctx)
-	defer cancel()
-	out, err := c.HeadObject(rctx, &s3.HeadObjectInput{Bucket: aws.String(s.cfg.Bucket), Key: aws.String(full)})
-	if err != nil {
-		if isNotFound(err) {
-			return model.ObjectInfo{}, plugin.Transient(
-				fmt.Errorf("object %s is not visible after the upload (not committed)", full))
-		}
-		return model.ObjectInfo{}, s.classify(ctx, err, "head "+full)
-	}
-	if aws.ToInt64(out.ContentLength) != size {
-		return model.ObjectInfo{}, plugin.Transient(
-			fmt.Errorf("size of %s after upload is %d, want %d: the upload is not committed",
-				full, aws.ToInt64(out.ContentLength), size))
-	}
-	return model.ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), ModTime: aws.ToTime(out.LastModified),
-		MD5: etagMD5(out.ETag)}, nil
 }
 
 func (s *Storage) Stat(ctx context.Context, key string) (model.ObjectInfo, error) {
@@ -401,16 +383,27 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 		return err
 	}
 	full := s.key(key)
-	rctx, cancel := s.reqCtx(ctx)
+	// request_timeout bounds the wait for the response headers only: the body is
+	// a stream and belongs to the caller's deadline, however slow the destination
+	// is. A timer that could not be stopped has cancelled the request already, so
+	// whatever answer still arrived is not one to read.
+	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	timer := time.AfterFunc(s.cfg.RequestTimeout.Std(), cancel)
 	out, err := c.GetObject(rctx, &s3.GetObjectInput{Bucket: aws.String(s.cfg.Bucket), Key: aws.String(full)})
+	timedOut := !timer.Stop()
+	if out != nil && out.Body != nil {
+		defer func() { _ = out.Body.Close() }()
+	}
+	if timedOut {
+		return plugin.Transient(fmt.Errorf("get %s: no response within request_timeout %s", full, s.cfg.RequestTimeout))
+	}
 	if err != nil {
 		if isNotFound(err) {
 			return plugin.NotFound(fmt.Errorf("object %s is definitely absent", full))
 		}
 		return s.classify(ctx, err, "get "+full)
 	}
-	defer func() { _ = out.Body.Close() }()
 	n, err := io.Copy(dst, out.Body)
 	if err != nil {
 		if ctx.Err() != nil {

@@ -27,7 +27,7 @@ import (
 
 // Config is the plugin config. Every field is required.
 type Config struct {
-	Path           string         `json:"path" required:"true" doc:"path of the SQLite database file"`
+	Path           string         `json:"path" required:"true" doc:"absolute path of the SQLite database file"`
 	ScratchDir     string         `json:"scratch_dir" required:"true" doc:"existing writable directory the snapshot's temporary file is spooled into, e.g. the big emptyDir a run mounts; the process temp dir is not used"`
 	BusyTimeout    model.Duration `json:"busy_timeout" doc:"how long sqlite3 waits for a lock held by the live writer"`
 	IntegrityCheck string         `json:"integrity_check" doc:"pragma a restored or probed copy must answer ok to: quick or full"`
@@ -47,6 +47,9 @@ func Register(r *plugin.Registry) error {
 			}
 			if cfg.Path == "" {
 				return nil, errors.New("path is empty")
+			}
+			if !filepath.IsAbs(cfg.Path) {
+				return nil, fmt.Errorf("path %q must be absolute", cfg.Path)
 			}
 			if cfg.ScratchDir == "" {
 				return nil, errors.New("scratch_dir is empty")
