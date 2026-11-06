@@ -176,9 +176,10 @@ func wiringConfig(t *testing.T, opts kubeapi.Options, secretsPath, spoolDir, sto
 		"storages": map[string]any{"local": map[string]any{
 			"type": "local", "retention": map[string]any{"scheduled": map[string]any{"type": "keep_last", "config": map[string]any{
 				"count": 3, "min_keep": 1, "count_incomplete": true}}},
-			"max_total_bytes": int64(1) << 30,
-			"time_budget":     "1m",
-			"config":          map[string]any{"root": storageRoot, "page_size": 100},
+			"max_total_bytes":  int64(1) << 30,
+			"time_budget":      "1m",
+			"call_parallelism": 1,
+			"config":           map[string]any{"root": storageRoot, "page_size": 100},
 		}},
 	}
 	raw, err := json.Marshal(cfg)

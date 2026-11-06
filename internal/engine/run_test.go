@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/catalog"
@@ -22,6 +23,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier/webhook"
 	"github.com/vi-latyshev/go-cluster-backup/internal/processor"
+	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
 	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
 )
 
@@ -1199,5 +1201,160 @@ func TestProduceFailsWhenTheSpoolDirectoryVanishes(t *testing.T) {
 	}
 	if keys := fake.Keys(); len(keys) != 0 {
 		t.Fatalf("an artifact whose spool failed reached a storage: %v", keys)
+	}
+}
+
+// --- the survey phase ---------------------------------------------------------
+
+// listClockStorage is a fake whose listing takes the given time and records when
+// it ended: what proves no write starts while another storage is still surveyed.
+type listClockStorage struct {
+	*storagetest.Fake
+	delay time.Duration
+	mu    sync.Mutex
+	end   time.Time
+}
+
+func (s *listClockStorage) List(ctx context.Context, req storage.ListRequest) (storage.ListPage, error) {
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
+	page, err := s.Fake.List(ctx, req)
+	s.mu.Lock()
+	s.end = time.Now()
+	s.mu.Unlock()
+	return page, err
+}
+
+func (s *listClockStorage) listEnd() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.end
+}
+
+// TestRunSurveysStoragesAtOnce (A6, S3): the surveys of every storage run
+// together — two ten-second listings cost the run ten seconds, not twenty — and
+// the first write still waits for all of them.
+func TestRunSurveysStoragesAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		var mu sync.Mutex
+		var firstPut time.Time
+		for _, name := range []string{"primary", "offsite"} {
+			f := storagetest.NewFake()
+			f.Fault = func(op storagetest.Op, _ string, _ int) error {
+				if op == storagetest.OpList {
+					time.Sleep(10 * time.Second)
+				}
+				return nil
+			}
+			h := &hookPutStorage{Fake: f}
+			h.onPut = func() {
+				mu.Lock()
+				if firstPut.IsZero() {
+					firstPut = time.Now()
+				}
+				mu.Unlock()
+			}
+			w.extraStorages[name] = h
+			w.storages[name] = f
+		}
+		cfg := baseConfig(t, twoStorages())
+		for _, name := range []string{"primary", "offsite"} {
+			cfg["storages"].(map[string]any)[name].(map[string]any)["time_budget"] = "1m"
+		}
+		start := time.Now()
+		rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Outcome != model.OutcomeDelivered {
+			t.Fatalf("outcome %q: %+v", rep.Outcome, rep.Storages)
+		}
+		mu.Lock()
+		at := firstPut
+		mu.Unlock()
+		if at.IsZero() {
+			t.Fatal("the run uploaded nothing")
+		}
+		if elapsed := at.Sub(start); elapsed >= 15*time.Second {
+			t.Fatalf("the first write waited %s for two ten-second listings, want both surveys at once", elapsed)
+		}
+	})
+}
+
+// TestRunWritesNothingBeforeEverySurveyEnds (F5, S3): no write — not an upload,
+// not an abort — starts on one storage while another storage is still being
+// surveyed; a broken parallel survey that writes as it goes would start the
+// fast storage's upload in the slow one's tenth second.
+func TestRunWritesNothingBeforeEverySurveyEnds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		slow := &listClockStorage{Fake: storagetest.NewFake(), delay: 10 * time.Second}
+		w.extraStorages["a_slow"] = slow
+		w.storages["a_slow"] = slow.Fake
+		parts := addMultipart(w, "b_parts", 4)
+		var mu sync.Mutex
+		var firstWrite time.Time
+		parts.beginHook = func(req storage.PutRequest) {
+			if req.Size <= 4 {
+				return
+			}
+			mu.Lock()
+			if firstWrite.IsZero() {
+				firstWrite = time.Now()
+			}
+			mu.Unlock()
+		}
+		cfg := baseConfig(t, map[string]any{
+			"a_slow":  storageInstance("fake", "keep_last"),
+			"b_parts": storageInstance("fake", "keep_last"),
+		})
+		cfg["run"].(map[string]any)["storage_parallelism"] = 2
+		for _, name := range []string{"a_slow", "b_parts"} {
+			cfg["storages"].(map[string]any)[name].(map[string]any)["time_budget"] = "1m"
+		}
+		w.sources["vpn"] = &fakeSource{data: []byte("0123456789")}
+		rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Outcome != model.OutcomeDelivered {
+			t.Fatalf("outcome %q: %+v", rep.Outcome, rep.Storages)
+		}
+		mu.Lock()
+		at := firstWrite
+		mu.Unlock()
+		if at.IsZero() {
+			t.Fatal("the multipart storage never began its upload")
+		}
+		if end := slow.listEnd(); at.Before(end) {
+			t.Fatalf("a write started %s before the slow storage's survey ended", end.Sub(at))
+		}
+	})
+}
+
+// TestRunCollisionRefusesBeforeWritingToAnyStorage (F5, S3): a run id one
+// storage already holds refuses the run after the surveys and before the first
+// write on any storage — the collision is decided once, over every survey.
+func TestRunCollisionRefusesBeforeWritingToAnyStorage(t *testing.T) {
+	w := newWorld(t)
+	cfg := baseConfig(t, map[string]any{
+		"a_slow":  storageInstance("fake", "keep_last"),
+		"b_parts": storageInstance("fake", "keep_last"),
+	})
+	cfg["run"].(map[string]any)["id_layout"] = "fixedrun"
+	parts := addMultipart(w, "b_parts", 4)
+	e := w.newEngine(t, cfg)
+	putCopiedRun(t, w.storage(t, "a_slow"), "a_slow", "fixedrun", time.Now().Add(-time.Hour),
+		model.OutcomeDelivered, [][2]string{{"databases", "prod"}})
+	if _, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled}); err == nil {
+		t.Fatal("a colliding run id was accepted")
+	} else if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("the refusal does not name the collision: %v", err)
+	}
+	begins, aborts, completes, _ := parts.stats()
+	if begins != 0 || aborts != 0 || completes != 0 {
+		t.Fatalf("a refused run wrote to another storage: begins=%d aborts=%d completes=%d", begins, aborts, completes)
 	}
 }

@@ -325,6 +325,7 @@ func storageInstance(typ, retentionType string) map[string]any {
 		},
 		"max_total_bytes": int64(1) << 40,
 		"time_budget":     "10s", "config": map[string]any{},
+		"call_parallelism": 1,
 	}
 }
 

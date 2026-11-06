@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/human"
@@ -879,4 +880,88 @@ func TestGuardTruncatedObjectIsNotAHeldCopy(t *testing.T) {
 	if got := results["alpha"].result.Deleted; len(got) != 2 {
 		t.Fatalf("deleted %v, want the two superseded nights", got)
 	}
+}
+
+// TestListedManifestThatReadsBackAbsentIsNeverDeleted (A8, S2): a manifest in
+// the listing whose read answers not_found is a problem run, and keep_last 1
+// must not delete it: the survey cannot see which copies it holds, so the run
+// is never taken for one with no manifest at all.
+func TestListedManifestThatReadsBackAbsentIsNeverDeleted(t *testing.T) {
+	w := newWorld(t)
+	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+	withRetention(cfg, "primary", keepLastN(1))
+	e := w.newEngine(t, cfg)
+	f := w.storage(t, "primary")
+	seedID := "20261001T040000Z"
+	putCopiedRun(t, f, "primary", seedID, time.Now().Add(-24*time.Hour),
+		model.OutcomeDelivered, [][2]string{{"databases", "prod"}})
+	key := "runs/" + seedID + "/manifest.json"
+	f.Fault = func(op storagetest.Op, k string, _ int) error {
+		if op == storagetest.OpGet && k == key {
+			return plugin.NotFound(errors.New("gone"))
+		}
+		return nil
+	}
+	if _, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled}); err != nil {
+		t.Fatal(err)
+	}
+	if !runIDsOn(f)[seedID] {
+		t.Fatalf("a run whose listed manifest read back absent was deleted: %v", runIDsOn(f))
+	}
+}
+
+// TestBudgetExpiryLeavesEveryManifestReadAccounted (F4, S2): the budget can run
+// out between the manifest reads, and every run whose manifest is in the listing
+// still gets an outcome — its manifest or a problem — so retention never takes a
+// run the survey could not read as one with no manifest.
+func TestBudgetExpiryLeavesEveryManifestReadAccounted(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+		withRetention(cfg, "primary", keepLastN(1))
+		e := w.newEngine(t, cfg)
+		f := w.storage(t, "primary")
+		now := time.Now().UTC()
+		ids := []string{"20261001T040000Z", "20261002T040000Z", "20261003T040000Z", "20261004T040000Z"}
+		for i, id := range ids {
+			putCopiedRun(t, f, "primary", id, now.Add(-time.Duration(len(ids)-i)*time.Hour),
+				model.OutcomeDelivered, [][2]string{{"databases", "prod"}})
+		}
+		f.Fault = func(op storagetest.Op, _ string, _ int) error {
+			if op == storagetest.OpGet {
+				time.Sleep(2 * time.Second)
+			}
+			return nil
+		}
+		sb := e.storages[0]
+		st := newStorageRunState(sb)
+		st.clock.budget = time.Second
+		sur := e.surveyStorage(context.Background(), sb, "runs/", e.retry, st)
+		if !sur.ok {
+			t.Fatalf("the survey failed: %v", sur.err)
+		}
+		var problems []string
+		for id, r := range sur.runs {
+			if r.manifest == nil && r.manifestProblem == "" {
+				t.Fatalf("run %s got neither a manifest nor a problem", id)
+			}
+			if r.manifestProblem != "" {
+				problems = append(problems, id)
+			}
+		}
+		if len(problems) == 0 {
+			t.Fatal("the budget expired and no manifest read recorded a problem")
+		}
+		state := newRetentionState(map[string]survey{sb.name: sur})
+		if _, _, _, err := e.retentionPhase(context.Background(), now, model.RunKindScheduled,
+			sb, sur, state, nil, nil); err != nil {
+			t.Fatalf("retention over an exhausted survey: %v", err)
+		}
+		kept := runIDsOn(f)
+		for _, id := range problems {
+			if !kept[id] {
+				t.Fatalf("retention deleted run %s, whose manifest it could not read", id)
+			}
+		}
+	})
 }

@@ -70,6 +70,11 @@ restore:
 instance:
   source:
     artifact: {importance: required}
+  storage:
+    # The most calls the engine holds in flight to one storage: the manifest
+    # reads of a survey, the parts of a multipart upload. Raise it for a fast
+    # endpoint, lower it for a throttled one or a slow link.
+    call_parallelism: 2
 
 # ── Plugin configs: the `config:` of every instance of that kind/type, ─────
 # wherever it is declared — a declared instance, a retention inside a storage,

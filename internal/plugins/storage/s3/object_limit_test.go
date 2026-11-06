@@ -179,7 +179,7 @@ func runControlledSource(t *testing.T, src *controlledSource) (model.RunReport, 
 		"sources": map[string]any{"data": map[string]any{"type": "controlled", "config": map[string]any{},
 			"pipeline": []string{}, "artifact": map[string]any{"group": "g", "name": "n", "sensitivity": "plain", "importance": "required"}}},
 		"storages": map[string]any{"s3": map[string]any{"type": "s3", "config": sc,
-			"max_total_bytes": "100MiB", "time_budget": "1s",
+			"max_total_bytes": "100MiB", "time_budget": "1s", "call_parallelism": 1,
 			"retention": map[string]any{"scheduled": map[string]any{"type": "keep_last",
 				"config": map[string]any{"count": 3, "min_keep": 1, "count_incomplete": true}}}}},
 	}

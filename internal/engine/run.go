@@ -353,10 +353,24 @@ func (e *Engine) Run(ctx context.Context, req RunRequest) (model.RunReport, erro
 		// occupancy unknown, and a manual run is refused on every storage. No
 		// re-survey: a second snapshot would be a second guess, not a proof.
 		quarantined := !unknownUntil.IsZero() && time.Now().Before(unknownUntil)
+		// The surveys run together — a slow listing on one storage costs its own
+		// seconds, not every later storage's — and the run waits for all of them
+		// before the collision check or the first write: nothing is written on one
+		// storage while another is still being surveyed.
 		surveys = map[string]survey{}
+		var surveyMu sync.Mutex
+		var surveyWG sync.WaitGroup
 		for _, sb := range order {
-			surveys[sb.name] = e.surveyStorage(ctx, sb, prefix, e.retry, results[sb.name])
+			surveyWG.Add(1)
+			go func(sb *storageBinding) {
+				defer surveyWG.Done()
+				s := e.surveyStorage(ctx, sb, prefix, e.retry, results[sb.name])
+				surveyMu.Lock()
+				surveys[sb.name] = s
+				surveyMu.Unlock()
+			}(sb)
 		}
+		surveyWG.Wait()
 		if err := e.checkRunIDFree(surveys, rep.RunID); err != nil {
 			return model.RunReport{}, err
 		}
@@ -1392,7 +1406,7 @@ func (e *Engine) writeManifests(ctx context.Context, kind model.RunKind, order [
 			// The budget is skipped on purpose and the time is still booked:
 			// the objects are already there, and the record of them is worth
 			// the seconds the storage's own budget would refuse.
-			start := time.Now()
+			end := st.clock.begin()
 			_, err := attempt(ctx, e.retry, "manifest "+sb.name, func(ctx context.Context, _ int) (struct{}, error) {
 				st.addAttempts(1)
 				if _, err := safeValue(func() (model.ObjectInfo, error) {
@@ -1406,7 +1420,7 @@ func (e *Engine) writeManifests(ctx context.Context, kind model.RunKind, order [
 				// floor must not lean on it.
 				return struct{}{}, e.verifyObject(ctx, sb, key, "manifest.json", int64(len(body)))
 			})
-			st.clock.add(time.Since(start))
+			end()
 			if err != nil {
 				st.setUploadError(fmt.Errorf("manifest: %w", err))
 				e.storageEvent(sb, human.Failure("manifest.write.failed", human.Text("reason", err.Error())))

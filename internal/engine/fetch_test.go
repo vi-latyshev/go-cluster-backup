@@ -661,6 +661,7 @@ func TestRestoreOnlyConfig(t *testing.T) {
 			"primary": map[string]any{
 				"type":        "fake",
 				"time_budget": "10s", "config": map[string]any{},
+				"call_parallelism": 1,
 			},
 		},
 		"processors": map[string]any{"zstd3": instance("fake")},

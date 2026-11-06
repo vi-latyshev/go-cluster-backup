@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,10 +26,12 @@ type MultipartCheck struct {
 
 // MultipartChecks are the conformance checks of the storage.MultipartUploader
 // capability — the optional half of the storage kind. The checks drive the
-// capability exactly the way the engine does, one call per attempt and parts in
-// order, so what they prove is what the engine leans on.
+// capability the way the engine does, one call per attempt: parts in any order,
+// some of them in flight together, and the accepted list committed by number, so
+// what they prove is what the engine leans on.
 var MultipartChecks = []MultipartCheck{
 	{"multipart: parts in order complete the object", checkMultipartRoundTrip},
+	{"multipart: parts may finish in any order", checkMultipartConcurrent},
 	{"multipart: a re-sent part replaces the earlier one", checkMultipartResend},
 	{"multipart: abort leaves nothing behind", checkMultipartAbort},
 	{"multipart: an object inside one part is the plugin's own answer", checkMultipartSmallObject},
@@ -104,9 +107,10 @@ func multipartBody(n int) []byte {
 	return b
 }
 
-// partSlices slices body into the parts the engine would send: numbers from 1,
-// ascending, each a section of the payload, the last one short when the size does
-// not divide.
+// partSlices slices body into the parts the engine would send: numbers from 1
+// upward, each a section of the payload, the last one short when the size does
+// not divide. The order here is only the numbering; a caller may send them in
+// any order and several at once.
 func partSlices(body []byte, partSize int64) []storage.Part {
 	var parts []storage.Part
 	for offset, number := int64(0), int32(1); offset < int64(len(body)); number++ {
@@ -121,8 +125,21 @@ func partSlices(body []byte, partSize int64) []storage.Part {
 	return parts
 }
 
-// sendParts sends parts in order and checks what the engine leans on: the result
-// names the part it was sent for and carries the service's handle for it.
+// resultMatches checks what every caller leans on: the result names the part it
+// was sent for and carries the service's handle for it.
+func resultMatches(res storage.PartResult, p storage.Part) error {
+	if res.Number != p.Number {
+		return fmt.Errorf("PutPart(%d) answered for part %d", p.Number, res.Number)
+	}
+	if res.ETag == "" {
+		return fmt.Errorf("PutPart(%d) answered without an ETag, so the part cannot be committed", p.Number)
+	}
+	return nil
+}
+
+// sendParts sends parts one at a time and checks each answer: the sequential
+// shape of the capability, kept beside the concurrent check because a plugin may
+// pass one and fail the other.
 func sendParts(mu storage.MultipartUploader, session storage.MultipartSession, parts []storage.Part) ([]storage.PartResult, error) {
 	results := make([]storage.PartResult, 0, len(parts))
 	for _, p := range parts {
@@ -130,11 +147,8 @@ func sendParts(mu storage.MultipartUploader, session storage.MultipartSession, p
 		if err != nil {
 			return nil, fmt.Errorf("PutPart(%d): %w", p.Number, err)
 		}
-		if res.Number != p.Number {
-			return nil, fmt.Errorf("PutPart(%d) answered for part %d", p.Number, res.Number)
-		}
-		if res.ETag == "" {
-			return nil, fmt.Errorf("PutPart(%d) answered without an ETag, so the part cannot be committed", p.Number)
+		if err := resultMatches(res, p); err != nil {
+			return nil, err
 		}
 		results = append(results, res)
 	}
@@ -182,6 +196,66 @@ func checkMultipartRoundTrip(_ *testing.T, s storage.Storage, partSize int64) er
 		return err
 	}
 	if err := mu.CompleteMultipart(context.Background(), session, results); err != nil {
+		return fmt.Errorf("CompleteMultipart: %w", err)
+	}
+	return readBack(s, key, body)
+}
+
+// checkMultipartConcurrent drives the capability the way a multi-part engine
+// does: the tail goes first, the rest go several at once, the answers may arrive
+// in any order, and the accepted parts are committed by number. A storage that
+// takes parts only in ascending order fails here even though the sequential
+// checks pass it.
+func checkMultipartConcurrent(_ *testing.T, s storage.Storage, partSize int64) error {
+	ctx := context.Background()
+	mu, err := multipartOf(s)
+	if err != nil {
+		return err
+	}
+	const key = "multipart/concurrent.bin"
+	body := multipartBody(int(3*partSize) + 7) // four parts
+	session, err := beginOne(mu, key, int64(len(body)), partSize)
+	if err != nil {
+		return err
+	}
+	parts := partSlices(body, session.PartSize)
+	results := make([]storage.PartResult, len(parts))
+
+	last := len(parts) - 1
+	res, err := mu.PutPart(ctx, session, parts[last])
+	if err != nil {
+		return fmt.Errorf("PutPart(%d) before its predecessors: %w", parts[last].Number, err)
+	}
+	if err := resultMatches(res, parts[last]); err != nil {
+		return err
+	}
+	results[last] = res
+
+	errs := make([]error, last)
+	var wg sync.WaitGroup
+	for i := range last {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := mu.PutPart(ctx, session, parts[i])
+			if err != nil {
+				errs[i] = fmt.Errorf("PutPart(%d) alongside its neighbours: %w", parts[i].Number, err)
+				return
+			}
+			if err := resultMatches(res, parts[i]); err != nil {
+				errs[i] = err
+				return
+			}
+			results[i] = res
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	if err := mu.CompleteMultipart(ctx, session, results); err != nil {
 		return fmt.Errorf("CompleteMultipart: %w", err)
 	}
 	return readBack(s, key, body)

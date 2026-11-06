@@ -48,25 +48,27 @@ type surveyRun struct {
 // exactly this survey. A non-nil st applies the storage's run time budget (a run
 // concept) and books the survey's time against it; restore paths pass nil.
 func (e *Engine) surveyStorage(ctx context.Context, sb *storageBinding, prefix string, p retryPolicy, st *storageRunState) survey {
+	started := time.Now()
 	if st != nil {
-		start := time.Now()
+		end := st.clock.begin()
+		defer end()
 		var cancel context.CancelFunc
-		ctx, cancel = st.clock.call(ctx)
-		defer func() {
-			cancel()
-			st.clock.add(time.Since(start))
-		}()
+		ctx, cancel = st.clock.bound(ctx)
+		defer cancel()
 	}
 	res := survey{storage: sb.name, runs: map[string]*surveyRun{}}
 	ro := readOnlyStorage{sb.inst} // a survey reads only, whatever path it serves
 	var objs []model.ObjectInfo
 	token := ""
+	pages := 0
+	listingStart := time.Now()
 	for page := 0; ; page++ {
 		if page > 500 {
 			res.ok = false
 			res.err = fmt.Errorf("listing did not terminate after 500 pages")
 			return res
 		}
+		pages++
 		got, err := attempt(ctx, p, "list "+sb.name, func(ctx context.Context, _ int) (storage.ListPage, error) {
 			return safeValue(func() (storage.ListPage, error) {
 				return ro.List(ctx, storage.ListRequest{Prefix: prefix, Token: token})
@@ -84,6 +86,7 @@ func (e *Engine) surveyStorage(ctx context.Context, sb *storageBinding, prefix s
 		}
 		token = got.NextToken
 	}
+	listing := time.Since(listingStart)
 	for _, o := range objs {
 		rel := strings.TrimPrefix(o.Key, prefix)
 		id, _, found := strings.Cut(rel, "/")
@@ -97,34 +100,86 @@ func (e *Engine) surveyStorage(ctx context.Context, sb *storageBinding, prefix s
 		}
 		r.objects = append(r.objects, o)
 	}
+	// Pass 1: every run's manifest key, in run order. Nothing here touches the
+	// storage — the reads are pass 2.
+	type manifestJob struct {
+		id     string
+		run    *surveyRun
+		key    string
+		keyErr error
+		rep    *model.RunReport
+		err    error
+	}
+	jobs := make([]manifestJob, 0, len(res.runs))
+	manifests := 0
 	for _, id := range sortedKeys(res.runs) {
 		r := res.runs[id]
+		job := manifestJob{id: id, run: r}
 		mkey, err := e.manifestKey(id)
-		if err != nil {
-			// The key cannot be rendered, so whether a manifest exists is
-			// unknown: the run is never dropped while that is true.
-			r.manifestProblem = "the manifest key does not render: " + err.Error()
-			e.storageEvent(sb, human.Failure("storage.manifest-key.failed",
-				human.Text("run", id), human.Text("reason", err.Error())))
-		} else {
+		if err == nil {
 			for _, o := range r.objects {
 				if o.Key == mkey {
 					r.manifestKey = mkey
-					rep, err := e.fetchManifest(ctx, sb, mkey, p)
-					if err == nil && rep != nil && rep.Schema != model.ManifestSchema {
-						// The report is kept so the restore side can refuse it in
-						// its own words; for a deletion decision it is a problem.
-						err = fmt.Errorf("manifest schema %d is not %d, which this build reads", rep.Schema, model.ManifestSchema)
-					}
-					if err != nil {
-						r.manifestProblem = err.Error()
-						e.storageEvent(sb, human.Failure("storage.manifest-unreadable",
-							human.Text("run", id), human.Text("reason", err.Error()), human.ObjectKey("key", mkey)))
-					}
-					r.manifest = rep
+					job.key = mkey
+					manifests++
 					break
 				}
 			}
+		} else {
+			job.keyErr = err
+		}
+		jobs = append(jobs, job)
+	}
+	// Pass 2: the manifest reads, at most call_parallelism in flight. A job
+	// writes only its own outcome, so no event and no shared field is touched
+	// here; every listed manifest is read even when the budget has already
+	// expired — a read that cannot run is a problem, never the verdict that the
+	// run has no manifest.
+	readingStart := time.Now()
+	parallelism := sb.cfg.CallParallelism
+	slots := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	for i := range jobs {
+		if jobs[i].key == "" {
+			continue
+		}
+		// The slot is taken before the goroutine exists, so a survey of a
+		// thousand runs still holds at most call_parallelism readers, not a
+		// thousand waiting goroutines.
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(j *manifestJob) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			j.rep, j.err = e.fetchManifest(ctx, sb, j.key, p)
+		}(&jobs[i])
+	}
+	wg.Wait()
+	reading := time.Since(readingStart)
+	// Pass 3: the outcomes, their events and the deletion inputs, in run order.
+	for i := range jobs {
+		job := &jobs[i]
+		r, id := job.run, job.id
+		switch {
+		case job.keyErr != nil:
+			// The key cannot be rendered, so whether a manifest exists is
+			// unknown: the run is never dropped while that is true.
+			r.manifestProblem = "the manifest key does not render: " + job.keyErr.Error()
+			e.storageEvent(sb, human.Failure("storage.manifest-key.failed",
+				human.Text("run", id), human.Text("reason", job.keyErr.Error())))
+		case job.key != "":
+			rep, err := job.rep, job.err
+			if err == nil && rep.Schema != model.ManifestSchema {
+				// The report is kept so the restore side can refuse it in its
+				// own words; for a deletion decision it is a problem.
+				err = fmt.Errorf("manifest schema %d is not %d, which this build reads", rep.Schema, model.ManifestSchema)
+			}
+			if err != nil {
+				r.manifestProblem = err.Error()
+				e.storageEvent(sb, human.Failure("storage.manifest-unreadable",
+					human.Text("run", id), human.Text("reason", err.Error()), human.ObjectKey("key", job.key)))
+			}
+			r.manifest = rep
 		}
 		var bytes int64
 		at := time.Time{}
@@ -157,18 +212,26 @@ func (e *Engine) surveyStorage(ctx context.Context, sb *storageBinding, prefix s
 		}
 		r.stored = model.StoredRun{RunID: id, Kind: kind, At: at, Bytes: bytes, Verified: verified, Manifest: r.manifest != nil && r.manifestProblem == ""}
 	}
+	e.storageEvent(sb, human.New("storage.survey",
+		human.Count("runs", int64(len(res.runs))),
+		human.Count("objects", int64(len(objs))),
+		human.Count("pages", int64(pages)),
+		human.Count("manifests", int64(manifests)),
+		human.Duration("listing", listing),
+		human.Duration("reading", reading),
+		human.Duration("took", time.Since(started))))
 	res.ok = true
 	return res
 }
 
-// fetchManifest reads one manifest and returns (nil, nil) only when the object
-// is genuinely absent (ClassNotFound). Any other failure — a read error after
-// the retries, an unparsable body — is returned as an error for the caller to
-// record: "the manifest is listed but could not be read" must never be mistaken
-// for "this run has no manifest", which is what a deletion decision would take
-// it for. A parseable manifest of a foreign schema is returned as it is: the
-// survey refuses it as a deletion input, the restore side refuses it as an
-// artifact, each in its own words.
+// fetchManifest reads one manifest and has exactly two outcomes: (rep, nil) on
+// success, (nil, err) on any failure. A listed manifest that reads back absent —
+// the listing and the object disagree — is a problem like an unreadable body,
+// never "this run has no manifest": a deletion decision would take the absent
+// answer for permission to remove a run whose artifacts the survey cannot see. A
+// parseable manifest of a foreign schema is returned as it is: the survey
+// refuses it as a deletion input, the restore side refuses it as an artifact,
+// each in its own words.
 func (e *Engine) fetchManifest(ctx context.Context, sb *storageBinding, key string, p retryPolicy) (*model.RunReport, error) {
 	body, err := attempt(ctx, p, "get manifest "+sb.name, func(ctx context.Context, _ int) ([]byte, error) {
 		var buf bytes.Buffer
@@ -179,7 +242,7 @@ func (e *Engine) fetchManifest(ctx context.Context, sb *storageBinding, key stri
 	})
 	if err != nil {
 		if class, _ := plugin.ClassOf(err); class == plugin.ClassNotFound {
-			return nil, nil // genuinely absent
+			return nil, fmt.Errorf("the manifest is listed but reads back absent: %w", err)
 		}
 		return nil, fmt.Errorf("reading the manifest: %w", err)
 	}

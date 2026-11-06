@@ -8,7 +8,8 @@ import (
 
 // MultipartSession is one multipart upload in progress: the service's handle for
 // it and the part size the engine slices the object into. The engine computes
-// ceil(size / PartSize) parts and sends them in order; the last one may be
+// ceil(size / PartSize) parts; it may send several of them at once, in any
+// order, and hands the accepted list back by number. The last part may be
 // shorter.
 type MultipartSession struct {
 	Key      string
@@ -16,9 +17,10 @@ type MultipartSession struct {
 	PartSize int64
 }
 
-// Part is one slice of the object. Number is 1-based and ascending; Size is the
-// number of bytes Body holds; Body reads exactly Size bytes — the engine hands
-// over a section of its spool file, never a buffer of the part.
+// Part is one slice of the object. Number is 1-based and unique within a
+// session; Size is the number of bytes Body holds; Body reads exactly Size
+// bytes — the engine hands over a section of its spool file, never a buffer of
+// the part.
 type Part struct {
 	Number int32
 	Size   int64
@@ -44,6 +46,13 @@ type StaleUpload struct {
 // uploads one object as parts: the engine drives the upload call by call, so a
 // part that failed is sent again without re-sending the parts already accepted.
 //
+// The engine holds up to the storage's call_parallelism parts in flight at
+// once: PutPart may be called concurrently, with distinct numbers, in one
+// session, the calls may finish in any order, and CompleteMultipart receives the
+// accepted parts by number. A plugin that accepts parts only in ascending order
+// does not satisfy the capability; the conformance run (storagetest.RunMultipart)
+// is what enforces the concurrent contract, and s3 runs it.
+//
 // The capability is discovered by call, exactly like the storage kind. A storage
 // that does not implement it, and a storage that answers errors.ErrUnsupported
 // to BeginMultipart because this object fits one Put, are uploaded whole.
@@ -68,12 +77,16 @@ type MultipartUploader interface {
 	// while the object grows; CompleteMultipart is called only once it is whole.
 	BeginMultipart(ctx context.Context, req PutRequest) (MultipartSession, error)
 	// PutPart sends one part. Sending a number again replaces the part the
-	// service already holds under it — which is what a retry of one part is.
+	// service already holds under it — which is what a retry of one part is. It
+	// may be called concurrently with distinct numbers in one session; the
+	// engine holds up to call_parallelism of them in flight and the service may
+	// accept them in any order.
 	PutPart(ctx context.Context, session MultipartSession, part Part) (PartResult, error)
 	// CompleteMultipart commits the upload and returns only when the service
 	// accepted the commit; a part list that does not match what the service
-	// holds is an error. A commit that did not happen must be an error even when
-	// the answer was HTTP 200 — the service reports some failures that way.
+	// holds is an error. The list carries the accepted parts by number, whatever
+	// order they finished in. A commit that did not happen must be an error even
+	// when the answer was HTTP 200 — the service reports some failures that way.
 	CompleteMultipart(ctx context.Context, session MultipartSession, parts []PartResult) error
 	// AbortMultipart discards the upload and every part of it: an upload already
 	// gone is nothing left to clean, not an error. The engine calls it when the

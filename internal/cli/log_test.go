@@ -615,6 +615,8 @@ discovery: 1 artifacts (0 covered or ignored)
 scheduled run holds the writer lease
 catalog memory/catalog: saved run fixedrun
 notifier memory/sink: ✓ sent run_started
+storage faulty/offsite: survey: 0 runs, 0 objects, 0 manifests in DUR (listing DUR, reading DUR)
+storage local/exchange: survey: 0 runs, 0 objects, 0 manifests in DUR (listing DUR, reading DUR)
 ── g/n (required)
 source synthetic/thing: dumping test:thing
 processor zstd/squeeze: 5 B → 18 B (0.3x) in DUR
@@ -651,6 +653,7 @@ func normalizeLog(log, dir, cfg string) string {
 		l = strings.ReplaceAll(l, cfg, "CFG")
 		l = regexp.MustCompile(`^spool [^ ]+`).ReplaceAllString(l, "spool SPOOL")
 		l = regexp.MustCompile(`in [0-9][0-9m.µ]*s`).ReplaceAllString(l, "in DUR")
+		l = regexp.MustCompile(`(listing|reading) [0-9][0-9m.µ]*s`).ReplaceAllString(l, "$1 DUR")
 		out = append(out, l)
 	}
 	return strings.Join(sortUploadRuns(out), "\n") + "\n"
@@ -680,5 +683,6 @@ func sortUploadRuns(lines []string) []string {
 }
 
 func uploadLine(l string) bool {
-	return strings.HasPrefix(l, "storage ") && (strings.Contains(l, ": uploading ") || strings.Contains(l, ": ✓ "))
+	return strings.HasPrefix(l, "storage ") && (strings.Contains(l, ": uploading ") ||
+		strings.Contains(l, ": ✓ ") || strings.Contains(l, ": survey: "))
 }

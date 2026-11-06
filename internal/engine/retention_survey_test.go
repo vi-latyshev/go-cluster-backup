@@ -1,13 +1,20 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/vi-latyshev/go-cluster-backup/internal/human"
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
 	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
@@ -104,9 +111,208 @@ func TestSurveyStorageKindDisagreement(t *testing.T) {
 	}
 }
 
-// TestFetchManifestAbsentIsNilNil: a manifest listed but answered not_found is
-// genuinely absent — (nil, nil), never an error the survey would call a problem.
-func TestFetchManifestAbsentIsNilNil(t *testing.T) {
+// TestSurveyReadsManifestsWithBoundedParallelism (A5, S1): the manifest reads
+// of one survey run with at most call_parallelism in flight — twenty-five
+// one-second reads finish in thirteen seconds, not twenty-five — and every run
+// still gets its own manifest.
+func TestSurveyReadsManifestsWithBoundedParallelism(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+		cfg["storages"].(map[string]any)["primary"].(map[string]any)["call_parallelism"] = 2
+		e := w.newEngine(t, cfg)
+		f := &slowGetStorage{Fake: storagetest.NewFake(), delay: time.Second}
+		e.storages[0].inst = f
+		now := time.Now().UTC()
+		for i := range 25 {
+			putRun(t, f.Fake, "primary", fmt.Sprintf("202610%02dT040000Z", i+1), now.Add(-time.Duration(25-i)*time.Hour), true)
+		}
+
+		start := time.Now()
+		sur := e.surveyStorage(context.Background(), e.storages[0], "runs/", e.retry, nil)
+		if elapsed := time.Since(start); elapsed > 14*time.Second {
+			t.Fatalf("the survey took %s for 25 one-second reads, want at most 14s with two in flight", elapsed)
+		}
+		if !sur.ok || len(sur.runs) != 25 {
+			t.Fatalf("survey ok=%v runs=%d", sur.ok, len(sur.runs))
+		}
+		if got := f.peakInFlight(); got != 2 {
+			t.Fatalf("the survey held %d manifest reads in flight, want the configured 2", got)
+		}
+		for id, r := range sur.runs {
+			if r.manifest == nil || r.manifestProblem != "" {
+				t.Fatalf("run %s = manifest %v problem %q, want its own manifest", id, r.manifest, r.manifestProblem)
+			}
+		}
+	})
+}
+
+// TestSurveyParallelMatchesSequential (F7, S1): the parallel read changes no
+// field of the result — the same runs, objects, manifests and statuses come
+// back whatever order the reads finish in.
+func TestSurveyParallelMatchesSequential(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+		cfg["storages"].(map[string]any)["primary"].(map[string]any)["call_parallelism"] = 3
+		parallel := w.newEngine(t, cfg)
+		f := w.storage(t, "primary")
+		now := time.Now().UTC()
+		for i := range 3 {
+			putRun(t, f, "primary", fmt.Sprintf("r%d", i+1), now.Add(-time.Duration(3-i)*time.Hour), true)
+		}
+		// The first manifest reads slowest, so the reads finish in reverse order.
+		f.Fault = func(op storagetest.Op, key string, _ int) error {
+			if op == storagetest.OpGet {
+				switch {
+				case strings.HasPrefix(key, "runs/r1/"):
+					time.Sleep(30 * time.Millisecond)
+				case strings.HasPrefix(key, "runs/r2/"):
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			return nil
+		}
+		parallel.storages[0].inst = f
+		sequential := w.newEngine(t, cfg)
+		sequential.storages[0].inst = f
+		sequential.storages[0].cfg.CallParallelism = 1
+
+		gotParallel := parallel.surveyStorage(context.Background(), parallel.storages[0], "runs/", parallel.retry, nil)
+		gotSequential := sequential.surveyStorage(context.Background(), sequential.storages[0], "runs/", sequential.retry, nil)
+		if !reflect.DeepEqual(gotParallel, gotSequential) {
+			t.Fatalf("the parallel survey differs from the sequential one:\nparallel:   %+v\nsequential: %+v", gotParallel, gotSequential)
+		}
+	})
+}
+
+// slowGetStorage is a fake whose Get takes the given time, counting how many
+// reads are in flight — the witness for the manifest-read ceiling.
+type slowGetStorage struct {
+	*storagetest.Fake
+	delay time.Duration
+	mu    sync.Mutex
+	now   int
+	peak  int
+}
+
+func (s *slowGetStorage) Get(ctx context.Context, key string, dst io.Writer) error {
+	s.mu.Lock()
+	s.now++
+	if s.now > s.peak {
+		s.peak = s.now
+	}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.now--
+		s.mu.Unlock()
+	}()
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
+	return s.Fake.Get(ctx, key, dst)
+}
+
+func (s *slowGetStorage) peakInFlight() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peak
+}
+
+// TestSurveyEmitsOneStorageSurveyLine (A4, S1): a finished survey tells the log
+// what it saw — one line per storage, with the runs, objects and manifests the
+// storage holds and how long listing and reading took.
+func TestSurveyEmitsOneStorageSurveyLine(t *testing.T) {
+	w := newWorld(t)
+	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+	raw, err := jsonMarshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	e, err := New(context.Background(), raw, nil, w.registry, slog.New(human.NewHandler(&buf, slog.LevelInfo)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	f := w.storage(t, "primary")
+	now := time.Now().UTC()
+	putRun(t, f, "primary", "20261001T040000Z", now.Add(-48*time.Hour), true)
+	putRun(t, f, "primary", "20261002T040000Z", now.Add(-24*time.Hour), true)
+
+	if _, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled}); err != nil {
+		t.Fatal(err)
+	}
+	if got := surveyLogLines(buf.String()); len(got) != 1 {
+		t.Fatalf("the log carries %d survey lines, want one per storage:\n%s", len(got), buf.String())
+	}
+	line := buf.String()
+	for _, want := range []string{"2 runs", "2 manifests"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("the survey line does not carry %q:\n%s", want, line)
+		}
+	}
+}
+
+// surveyLogLines is the successful survey lines of a run log: a survey line is
+// the one carrying the survey's own counts, not the retention failure that
+// repeats the survey's error.
+func surveyLogLines(log string) []string {
+	var out []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, ": survey: ") && !strings.Contains(line, "retention:") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// TestSurveyFailureLeavesOnlyTheFailureLine (F3, S1): a survey that could not
+// list emits storage.survey.failed and no storage.survey line of its own — the
+// storage that did list still reports what it saw, so a reader never takes a
+// missing line for a survey that found nothing.
+func TestSurveyFailureLeavesOnlyTheFailureLine(t *testing.T) {
+	w := newWorld(t)
+	cfg := baseConfig(t, map[string]any{
+		"good": storageInstance("fake", "keep_last"),
+		"bad":  storageInstance("fake", "keep_last"),
+	})
+	raw, err := jsonMarshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	e, err := New(context.Background(), raw, nil, w.registry, slog.New(human.NewHandler(&buf, slog.LevelInfo)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+	putRun(t, w.storage(t, "good"), "good", "20261001T040000Z", time.Now().UTC().Add(-24*time.Hour), true)
+	w.storage(t, "bad").Fault = func(op storagetest.Op, _ string, _ int) error {
+		if op == storagetest.OpList {
+			return plugin.Permanent(errors.New("list refused"))
+		}
+		return nil
+	}
+	if _, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindScheduled}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "listing what the storage holds: list refused") {
+		t.Fatalf("the failure line is missing:\n%s", buf.String())
+	}
+	if got := surveyLogLines(buf.String()); len(got) != 1 {
+		t.Fatalf("the log carries %d survey lines, want only the storage that listed:\n%s", len(got), buf.String())
+	}
+	if !strings.Contains(buf.String(), "storage fake/good: survey: 1 runs, 2 objects, 1 manifests") {
+		t.Fatalf("the successful storage's survey line is missing:\n%s", buf.String())
+	}
+}
+
+// TestFetchManifestListedButAbsentIsAProblem (A8, S2): a manifest the listing
+// holds but the read answers not_found for is a problem — never the verdict that
+// the run has no manifest, which a deletion decision would act on.
+func TestFetchManifestListedButAbsentIsAProblem(t *testing.T) {
 	w := newWorld(t)
 	e := w.newEngine(t, baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")}))
 	f := w.storage(t, "primary")
@@ -119,8 +325,8 @@ func TestFetchManifestAbsentIsNilNil(t *testing.T) {
 		return nil
 	}
 	rep, err := e.fetchManifest(context.Background(), e.storages[0], key, e.retry)
-	if rep != nil || err != nil {
-		t.Fatalf("fetchManifest = (%v, %v), want (nil, nil) for an absent manifest", rep, err)
+	if rep != nil || err == nil || !strings.Contains(err.Error(), "reads back absent") {
+		t.Fatalf("fetchManifest = (%v, %v), want the listed-but-absent problem", rep, err)
 	}
 }
 

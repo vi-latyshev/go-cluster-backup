@@ -162,8 +162,13 @@ type StorageInstance struct {
 	// refuses on it; a scheduled run never fails on it and frees room instead.
 	// Required for a run; a restore-only config omits it.
 	MaxTotalBytes model.ByteSize `json:"max_total_bytes" optional:"true" doc:"configured byte cap of this storage over every run kind; a manual run is refused past it, a scheduled run frees room"`
-	TimeBudget    model.Duration `json:"time_budget" required:"true" doc:"time budget for this storage within one run"`
-	Config        jsontext.Value `json:"config" doc:"plugin config, decoded by the plugin itself"`
+	// CallParallelism is the ceiling the engine holds in flight to this storage:
+	// the manifest reads of one survey, and the parts of one multipart upload.
+	// The default lives in the defaults document; a deployment states it only to
+	// raise or lower the ceiling for its own storage.
+	CallParallelism int            `json:"call_parallelism" doc:"the most calls the engine holds in flight to this storage"`
+	TimeBudget      model.Duration `json:"time_budget" required:"true" doc:"time budget for this storage within one run"`
+	Config          jsontext.Value `json:"config" doc:"plugin config, decoded by the plugin itself"`
 }
 
 // Validate runs inside plugin.Decode: enum values, ranges, template-independent
@@ -258,6 +263,9 @@ func (c *Config) Validate() error {
 		si := c.Storages[name]
 		if si.MaxTotalBytes < 0 {
 			errs = append(errs, fmt.Errorf("/storages/%s/max_total_bytes must not be negative: %d", name, si.MaxTotalBytes))
+		}
+		if si.CallParallelism < 1 {
+			errs = append(errs, fmt.Errorf("/storages/%s/call_parallelism must be at least 1, got %d", name, si.CallParallelism))
 		}
 		for kind, rt := range si.Retention {
 			if rt == nil || rt.Type == "" {

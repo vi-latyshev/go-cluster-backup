@@ -141,6 +141,9 @@ func render(ev Event) string {
 		return fmt.Sprintf("✗ retention: deleting run %s: %s", b.text("run"), b.text("reason"))
 	case "storage.survey.failed":
 		return "✗ listing what the storage holds: " + b.text("reason")
+	case "storage.survey":
+		return fmt.Sprintf("survey: %d runs, %d objects, %d manifests in %s (listing %s, reading %s)",
+			b.num("runs"), b.num("objects"), b.num("manifests"), Dur(b.dur("took")), Dur(b.dur("listing")), Dur(b.dur("reading")))
 	case "storage.describe.failed":
 		return "✗ describing the storage: " + b.text("reason")
 	case "storage.check.failed":

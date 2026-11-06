@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/catalog"
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
 )
 
 // manualStorage is one storage that accepts both run kinds, with the given cap.
@@ -25,6 +27,7 @@ func manualStorage(cap int64) map[string]any {
 		},
 		"max_total_bytes": cap,
 		"time_budget":     "10s", "config": map[string]any{},
+		"call_parallelism": 1,
 	}
 }
 
@@ -448,5 +451,43 @@ func TestScheduledNeverFailsOnTheCap(t *testing.T) {
 	}
 	if ids := runIDsOn(w.storage(t, "alpha")); ids["old"] {
 		t.Fatalf("the cap eviction did not free the old run: %v", ids)
+	}
+}
+
+// TestManualSurveyFailureRefusesOnlyItsStorage (F6, S3): a storage whose survey
+// failed has an unknown occupancy, so a manual run is refused there — and only
+// there: the other storage takes the whole run, and the outcome is degraded.
+func TestManualSurveyFailureRefusesOnlyItsStorage(t *testing.T) {
+	w := newWorld(t)
+	cfg := manualConfig(t, map[string]any{
+		"alpha": manualStorage(1 << 40),
+		"beta":  manualStorage(1 << 40),
+	})
+	e := w.newEngine(t, cfg)
+	w.storage(t, "alpha").Fault = func(op storagetest.Op, _ string, _ int) error {
+		if op == storagetest.OpList {
+			return plugin.Permanent(errors.New("list refused"))
+		}
+		return nil
+	}
+	rep, err := e.Run(context.Background(), RunRequest{Kind: model.RunKindManual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != model.OutcomeDegraded {
+		t.Fatalf("outcome = %q, want degraded: %+v", rep.Outcome, rep.Storages)
+	}
+	byName := map[string]model.StorageResult{}
+	for _, s := range rep.Storages {
+		byName[s.Storage] = s
+	}
+	if got := byName["alpha"]; !got.CapExceeded || got.Outcome != model.StorageFailed {
+		t.Fatalf("alpha = %+v, want the unknown-occupancy refusal", got)
+	}
+	if got := byName["beta"]; got.Outcome != model.StorageVerified {
+		t.Fatalf("beta = %+v, want the whole run", got)
+	}
+	if keys := w.storage(t, "alpha").Keys(); len(keys) != 0 {
+		t.Fatalf("the refused storage was written to: %v", keys)
 	}
 }
