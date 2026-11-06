@@ -145,9 +145,10 @@ func TestOverlapStartsPartsWhileTheProducerWrites(t *testing.T) {
 	}
 }
 
-// TestOverlapAbortsWhenTheProducerFails (A-O2, o.I1/o.I3): a producer that wrote
-// its bytes and then failed never completes the upload; the one session is
-// aborted exactly once and the artifact fails.
+// TestOverlapAbortsWhenTheProducerFails (A-O2, A12, o.I1/o.I3): a producer that
+// wrote its bytes and then failed never completes the upload; the one session is
+// aborted exactly once, after every in-flight part returned, and the artifact
+// fails.
 func TestOverlapAbortsWhenTheProducerFails(t *testing.T) {
 	w := newWorld(t)
 	parts := addMultipart(w, "a_parts", 4)
@@ -157,18 +158,23 @@ func TestOverlapAbortsWhenTheProducerFails(t *testing.T) {
 		gateAfter: 1, release: make(chan struct{}),
 	}
 	w.extraSources["vpn"] = src
-	opened := make(chan struct{})
 	var once sync.Once
-	parts.beginHook = func(req storage.PutRequest) {
-		if req.Size > 4 {
-			once.Do(func() { close(opened) })
+	// Part one is still in flight when the producer fails: the release happens
+	// from inside the part call, and the part waits for the upload's own end.
+	parts.partHook = func(number int32) {
+		if number == 1 {
+			once.Do(func() { close(src.release) })
 		}
 	}
+	parts.partDelay = func(number int32, ctx context.Context) error {
+		if number == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
 	cfg := overlapConfig(t, map[string]any{"a_parts": storageInstance("fake", "keep_last")})
-	go func() {
-		<-opened
-		close(src.release)
-	}()
+	cfg["storages"].(map[string]any)["a_parts"].(map[string]any)["call_parallelism"] = 2
 	rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
 	if err != nil {
 		t.Fatal(err)
@@ -180,6 +186,32 @@ func TestOverlapAbortsWhenTheProducerFails(t *testing.T) {
 	if aborts != 1 || completes != 0 {
 		t.Fatalf("aborts=%d completes=%d, want exactly one abort and no complete", aborts, completes)
 	}
+	_, abortInFlight, journal, _ := parts.flightStats()
+	if len(abortInFlight) != 1 || abortInFlight[0] != 0 {
+		t.Fatalf("the abort ran with %v parts in flight, want none", abortInFlight)
+	}
+	if after := partsBetweenTheAbortAndTheNextBegin(journal); len(after) != 0 {
+		t.Fatalf("parts sent after the abort: %v", after)
+	}
+}
+
+// partsBetweenTheAbortAndTheNextBegin lists the journal entries that sent a part
+// between an abort and the next session: a correct upload has none, so no part
+// of an aborted session was still running when Abort ran.
+func partsBetweenTheAbortAndTheNextBegin(journal []string) []string {
+	var out []string
+	aborted := false
+	for _, entry := range journal {
+		switch {
+		case entry == "abort":
+			aborted = true
+		case entry == "begin":
+			aborted = false
+		case aborted && strings.HasPrefix(entry, "part "):
+			out = append(out, entry)
+		}
+	}
+	return out
 }
 
 // TestOverlapAbortsOnArtifactOverflow (A-O3, o.I3): a producer that crosses
@@ -216,8 +248,9 @@ func TestOverlapAbortsOnArtifactOverflow(t *testing.T) {
 	}
 }
 
-// TestOverlapAbortsOnCancellation (A-O4, o.I3): a cancelled run aborts the open
-// session once and returns — no goroutine waits for a producer nobody can stop.
+// TestOverlapAbortsOnCancellation (A-O4, A13, o.I3): a cancelled run aborts the
+// open session once — after every in-flight part returned — and no part is sent
+// after the abort.
 func TestOverlapAbortsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -228,18 +261,23 @@ func TestOverlapAbortsOnCancellation(t *testing.T) {
 		gateAfter: 1, release: make(chan struct{}),
 	}
 	w.extraSources["vpn"] = src
-	opened := make(chan struct{})
 	var once sync.Once
-	parts.beginHook = func(req storage.PutRequest) {
-		if req.Size > 4 {
-			once.Do(func() { close(opened) })
+	// Part one is still in flight when the run is cancelled: the cancel happens
+	// from inside the part call, and the part waits for the upload's own end.
+	parts.partHook = func(number int32) {
+		if number == 1 {
+			once.Do(cancel)
 		}
 	}
+	parts.partDelay = func(number int32, ctx context.Context) error {
+		if number == 1 {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return nil
+	}
 	cfg := overlapConfig(t, map[string]any{"a_parts": storageInstance("fake", "keep_last")})
-	go func() {
-		<-opened
-		cancel()
-	}()
+	cfg["storages"].(map[string]any)["a_parts"].(map[string]any)["call_parallelism"] = 2
 	rep, err := w.newEngine(t, cfg).Run(ctx, RunRequest{Kind: model.RunKindScheduled})
 	if err != nil {
 		t.Fatal(err)
@@ -250,6 +288,13 @@ func TestOverlapAbortsOnCancellation(t *testing.T) {
 	_, aborts, _, _ := parts.stats()
 	if aborts != 1 {
 		t.Fatalf("aborts = %d, want exactly 1 after a cancelled upload", aborts)
+	}
+	_, abortInFlight, journal, _ := parts.flightStats()
+	if len(abortInFlight) != 1 || abortInFlight[0] != 0 {
+		t.Fatalf("the abort ran with %v parts in flight, want none", abortInFlight)
+	}
+	if after := partsBetweenTheAbortAndTheNextBegin(journal); len(after) != 0 {
+		t.Fatalf("parts sent after the abort: %v", after)
 	}
 }
 
@@ -519,53 +564,85 @@ func TestOverlapRetryUploadsTheSecondAttemptBytes(t *testing.T) {
 	}
 }
 
-// TestOverlapPermanentPartFailsOneStorage (A-O13, o.I3): a permanent part error
-// aborts that storage's upload once, leaves the other storage's copy, and the
-// artifact stays ok.
+// TestOverlapPermanentPartFailsOneStorage (A-O13, A14, F8, o.I3): a permanent
+// part error aborts that storage's upload once — while the producer is still
+// held, not after its minutes-long wait — leaves the other storage's copy, and
+// reports the part's own refusal, never its neighbour's cancellation. The fatal
+// storage is not asked again for the next artifact.
 func TestOverlapPermanentPartFailsOneStorage(t *testing.T) {
-	w := newWorld(t)
-	parts := addMultipart(w, "a_parts", 4)
-	parts.partErr = func(number int32, _ int) error {
-		if number == 2 {
-			return plugin.Permanent(errors.New("part refused"))
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		parts := addMultipart(w, "a_parts", 4)
+		parts.partDelay = func(number int32, ctx context.Context) error {
+			if number == 1 {
+				// The neighbour is still in flight when part 2 fails; it ends
+				// only because the failed part cancelled the upload.
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
 		}
-		return nil
-	}
-	src := &benchSource{
-		chunks:    func(int) [][]byte { return [][]byte{[]byte("0123456789")} },
-		gateAfter: 1, release: make(chan struct{}),
-	}
-	w.extraSources["vpn"] = src
-	opened := make(chan struct{})
-	var once sync.Once
-	parts.beginHook = func(req storage.PutRequest) {
-		if req.Size > 4 {
-			once.Do(func() { close(opened) })
+		parts.partErr = func(number int32, _ int) error {
+			if number == 2 {
+				return plugin.Permanent(errors.New("part refused"))
+			}
+			return nil
 		}
-	}
-	cfg := overlapConfig(t, twoWayStorages())
-	go func() {
-		<-opened
-		close(src.release)
-	}()
-	rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Artifacts[0].Outcome != model.ArtifactOK {
-		t.Fatalf("the artifact = %+v, want the plain storage's copy to hold", rep.Artifacts[0])
-	}
-	if r := storageResult(rep, "a_parts"); r.Outcome != model.StorageFailed {
-		t.Fatalf("a_parts = %+v, want the failed copy", r)
-	}
-	if r := storageResult(rep, "b_plain"); r.Outcome != model.StorageVerified {
-		t.Fatalf("b_plain = %+v, want the other copy intact", r)
-	}
-	_, aborts, completes, _ := parts.stats()
-	_, aborted := parts.sweepStats()
-	if aborts != 1 || completes != 0 {
-		t.Fatalf("aborts=%d completes=%d (%v), want one abort and no complete", aborts, completes, aborted)
-	}
+		var abortedEarly atomic.Bool
+		parts.abortHook = func() {}
+		src := &benchSource{
+			chunks:     func(int) [][]byte { return [][]byte{[]byte("0123456789abcd")} },
+			sleepAfter: 1, sleep: 10 * time.Minute,
+		}
+		w.extraSources["vpn"] = src
+		w.extraSources["vpn2"] = &benchSource{chunks: func(int) [][]byte { return [][]byte{[]byte("abcdefghijklm")} }}
+		cfg := overlapConfig(t, twoWayStorages())
+		cfg["storages"].(map[string]any)["a_parts"].(map[string]any)["call_parallelism"] = 2
+		cfg["sources"].(map[string]any)["vpn2"] = sourceInstance("fake", "vpn", "wireguard2", nil, "required", "plain")
+		// The producer's hold outlasts the default run deadline; the run must not,
+		// or the hold would end the run rather than prove the abort came first.
+		cfg["run"].(map[string]any)["deadline"] = "15m"
+		parts.abortHook = func() { abortedEarly.Store(!src.done()) }
+		rep, err := w.newEngine(t, cfg).Run(context.Background(), RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, ar := range rep.Artifacts {
+			if ar.Outcome != model.ArtifactOK {
+				t.Fatalf("artifact %s = %+v, want the plain storage's copy", ar.Artifact.Name, ar)
+			}
+		}
+		if r := storageResult(rep, "a_parts"); r.Outcome != model.StorageFailed {
+			t.Fatalf("a_parts = %+v, want the failed copy", r)
+		} else {
+			if !strings.Contains(r.Error, "part refused") {
+				t.Fatalf("a_parts error = %q, want the part's own refusal", r.Error)
+			}
+			if strings.Contains(r.Error, "context canceled") || strings.Contains(r.Error, "context deadline exceeded") {
+				t.Fatalf("a_parts error = %q: the neighbour's cancellation hid the cause", r.Error)
+			}
+		}
+		if r := storageResult(rep, "b_plain"); r.Outcome != model.StorageVerified {
+			t.Fatalf("b_plain = %+v, want the other copy intact", r)
+		}
+		_, aborts, completes, calls := parts.stats()
+		if aborts != 1 || completes != 0 {
+			t.Fatalf("aborts=%d completes=%d, want one abort and no complete", aborts, completes)
+		}
+		if calls[3] != 0 {
+			t.Fatalf("part calls %v: a part was sent after the permanent failure", calls)
+		}
+		if got := parts.sessionCount(); got != 1 {
+			t.Fatalf("the fatal storage opened %d uploads, want it asked once and never again", got)
+		}
+		_, abortInFlight, _, _ := parts.flightStats()
+		if len(abortInFlight) != 1 || abortInFlight[0] != 0 {
+			t.Fatalf("the abort ran with %v parts in flight, want none", abortInFlight)
+		}
+		if !abortedEarly.Load() {
+			t.Fatal("the abort waited for the producer's ten-minute hold to end")
+		}
+	})
 }
 
 // TestOverlapBeginProbeErrorFailsTheStorage (A-O13 adjacent): a BeginMultipart

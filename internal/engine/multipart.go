@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/human"
@@ -25,6 +27,11 @@ type partSource interface {
 	next(ctx context.Context, after int64) (n int64, done bool, err error)
 	// file names the spool file the parts are read from.
 	file() string
+	// terminal reports a channel that closes on the next change of the source's
+	// state, and the producer's own failure the moment its growth recorded it.
+	// Both come from one snapshot, so a failure between a check and a wait is
+	// never lost; a finished source has neither.
+	terminal() (changed <-chan struct{}, err error)
 }
 
 // finishedSource is an object that is already whole: the after-produce path.
@@ -38,6 +45,9 @@ func (s *finishedSource) next(context.Context, int64) (int64, bool, error) {
 }
 
 func (s *finishedSource) file() string { return s.name }
+
+// terminal: the finished source has no producer to fail and never changes.
+func (s *finishedSource) terminal() (<-chan struct{}, error) { return nil, nil }
 
 // followSource is the first produce attempt while it grows. It remembers the
 // change it last saw, so a change that landed between two calls is never lost:
@@ -59,12 +69,20 @@ func (s *followSource) next(ctx context.Context, after int64) (int64, bool, erro
 		select {
 		case <-changed:
 		case <-ctx.Done():
-			return 0, false, ctx.Err()
+			return 0, false, context.Cause(ctx)
 		}
 	}
 }
 
 func (s *followSource) file() string { return s.name }
+
+// terminal reports the producer's failure the moment its growth recorded it —
+// before the retry removes the failed attempt's spool file — and the channel
+// that wakes the slot wait on the next change.
+func (s *followSource) terminal() (<-chan struct{}, error) {
+	_, _, _, changed, err := s.g.snapshot()
+	return changed, err
+}
 
 // multipartUpload drives one finished object through a storage's multipart
 // capability: begin, one call per part, complete, each under the configured
@@ -87,7 +105,7 @@ func (e *Engine) multipartUpload(ctx context.Context, sb *storageBinding, st *st
 		return true, err
 	}
 	parts, err := e.uploadParts(ctx, st, mu, sp, &finishedSource{name: pa.file, size: pa.bytes},
-		session, artifactName(pa))
+		session, artifactName(pa), sb.cfg.CallParallelism)
 	if err != nil {
 		return true, errors.Join(err, e.abortMultipart(ctx, st, mu, session, key))
 	}
@@ -179,22 +197,18 @@ func (e *Engine) followUpload(ctx context.Context, sb *storageBinding, st *stora
 		}
 		return e.uploadAfterProduce(ctx, sb, st, sp, key, label, kind, caps, ready, produced, started)
 	}
-	parts, err := e.uploadParts(ctx, st, mu, sp, src, session, label)
+	parts, err := e.uploadParts(ctx, st, mu, sp, src, session, label, sb.cfg.CallParallelism)
 	if err != nil {
-		// A part that failed is the storage's own failure; the producer's error
-		// and the ended run are not — they abort the upload and fall back to the
-		// finished-file path, exactly as a storage without the capability takes.
-		if _, _, done, _, gerr := g.snapshot(); done && gerr != nil {
+		// The upload recorded where its cause came from. Only the producer's OWN
+		// failure falls back to the finished file; a part's failure and the run's
+		// cancellation are reported as the cause the upload chose — never replaced
+		// by the context's state at this later moment.
+		origin, cause := terminalOf(err)
+		if origin == originSource {
 			return e.abandonFollow(ctx, sb, st, sp, mu, cap, true, session,
 				key, label, kind, caps, ready, produced, started)
 		}
-		if ctx.Err() != nil {
-			// The run itself ended: the upload is aborted once and this storage's
-			// copy is reported failed — the run's cancellation is not its fault,
-			// but the half-sent upload is its to account for.
-			return e.failFollow(ctx, sb, st, cap, true, mu, session, key, label, ctx.Err())
-		}
-		return e.failFollow(ctx, sb, st, cap, true, mu, session, key, label, err)
+		return e.failFollow(ctx, sb, st, cap, true, mu, session, key, label, cause)
 	}
 	<-ready
 	pa := produced.pa
@@ -347,52 +361,313 @@ func (e *Engine) beginMultipart(ctx context.Context, st *storageRunState, mu sto
 	})
 }
 
-// uploadParts sends the object's parts in order from the source it is handed: a
-// file that is already whole, or one the producer is still writing. A part is
-// sent only once its bytes are final — a full part while the object grows, and
-// the tail once it is whole — and every part is its own storage call and its own
-// retry budget: a failed part is opened again from the spool file, never the
-// parts already accepted.
+// producerFailure is the source's own failure, wrapped where the parts loop
+// chose it as the upload's cause: the caller that sees it may fall back to the
+// finished file, and nothing else may. A part's refusal and the run's
+// cancellation are not producer failures, whatever the producer did a moment
+// later.
+type producerFailure struct{ err error }
+
+func (p *producerFailure) Error() string { return p.err.Error() }
+func (p *producerFailure) Unwrap() error { return p.err }
+
+// terminalOrigin is where the cause of one upload's end came from: a part's own
+// failure, the producer's failure, or the run's cancellation, by that priority.
+type terminalOrigin uint8
+
+const (
+	originPart terminalOrigin = iota + 1
+	originSource
+	originParent
+)
+
+// uploadError is the ONE cause an upload chose, with the origin recorded when
+// the event happened. Its callers act on the origin and report the error; they
+// never re-derive either from the context or the growth afterwards.
+type uploadError struct {
+	origin terminalOrigin
+	err    error
+}
+
+func (u *uploadError) Error() string { return u.err.Error() }
+func (u *uploadError) Unwrap() error { return u.err }
+
+// terminalOf reads the origin and cause uploadParts recorded. Any other error is
+// reported as the upload's own part failure, so a caller still fails the
+// storage instead of guessing a fallback.
+func terminalOf(err error) (terminalOrigin, error) {
+	var ue *uploadError
+	if errors.As(err, &ue) {
+		return ue.origin, ue.err
+	}
+	return originPart, err
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// uploadTerminal records the facts that can end one multipart upload, each when
+// it happens. The cause is chosen here, once, from the recorded facts by the
+// plan's priority: an independent part failure, then the producer's failure,
+// then the run's cancellation. Recording a cause and stopping the upload are ONE
+// step — the recorder holds the cancel function — so no caller can record a
+// terminal fact and forget to end the upload. Nothing here reads the context or
+// the growth to re-classify an event that already happened.
+type uploadTerminal struct {
+	mu     sync.Mutex
+	stop   context.CancelCauseFunc
+	part   error
+	source *producerFailure
+	parent error
+}
+
+// recordPart records one part's failure and stops the upload when it is the
+// cause. An error is a consequence, not a cause, only when it is the upload's
+// own recorded cause coming back, a context error this upload's stop or the
+// run's end imposed on the part, or a spool file that vanished after the
+// producer's failure was already recorded. Any other part failure, including a
+// vanished spool file with no producer failure behind it, is the cause.
+func (t *uploadTerminal) recordPart(parent context.Context, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.part != nil {
+		return
+	}
+	if t.source != nil && errors.Is(err, t.source) {
+		return
+	}
+	if isContextError(err) && (t.source != nil || parent.Err() != nil) {
+		return
+	}
+	if errors.Is(err, errVanishedPart) && t.source != nil {
+		return
+	}
+	t.part = err
+	t.stop(err)
+}
+
+// recordSource records the producer's failure and stops the upload at once; a
+// part failure already recorded keeps the priority, so the source is recorded
+// but the upload is already ending through that part.
+func (t *uploadTerminal) recordSource(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.source != nil {
+		return
+	}
+	t.source = &producerFailure{err: err}
+	if t.part == nil {
+		t.stop(t.source)
+	}
+}
+
+// recordSourceFrom records the producer's terminal state when the source
+// reports one: the single exit calls it so a failure no part or dispatcher call
+// happened to carry is still in the facts before the cause is chosen. A context
+// error the run's own cancellation produced is not a producer failure.
+func (t *uploadTerminal) recordSourceFrom(parent context.Context, src partSource) {
+	_, sf := src.terminal()
+	if sf == nil {
+		return
+	}
+	t.recordSourceFact(parent, sf)
+}
+
+// recordSourceFact records one producer failure, unless it is the context error
+// the run's own cancellation produced: that is the run's fact, not the
+// producer's.
+func (t *uploadTerminal) recordSourceFact(parent context.Context, err error) {
+	if isContextError(err) && parent.Err() != nil {
+		return
+	}
+	t.recordSource(err)
+}
+
+// recordNext records the error the parts source answered: the upload's own
+// cause coming back is not a new fact, a context error while the run is
+// cancelled is the run's cancellation, and anything else is the producer's
+// failure — recorded, and stopped, even when the run has also been cancelled.
+func (t *uploadTerminal) recordNext(parent context.Context, err error) {
+	t.mu.Lock()
+	own := t.part != nil || t.source != nil
+	t.mu.Unlock()
+	if own {
+		return
+	}
+	if isContextError(err) && parent.Err() != nil {
+		t.recordParent(err)
+		return
+	}
+	t.recordSource(err)
+}
+
+// recordVanished records the producer's failure a vanished spool file points at,
+// when the source reports one, before the file's part error is judged: the
+// producer's failure is a terminal cause, and recording it stops the upload.
+func (t *uploadTerminal) recordVanished(parent context.Context, src partSource) {
+	t.recordSourceFrom(parent, src)
+}
+
+// recordParent records the run's cancellation, which never outranks a cause the
+// upload recorded itself.
+func (t *uploadTerminal) recordParent(err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.parent == nil {
+		t.parent = err
+	}
+}
+
+// cause is the ONE place the upload's cause is chosen.
+func (t *uploadTerminal) cause() *uploadError {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case t.part != nil:
+		return &uploadError{origin: originPart, err: t.part}
+	case t.source != nil:
+		return &uploadError{origin: originSource, err: t.source}
+	case t.parent != nil:
+		return &uploadError{origin: originParent, err: t.parent}
+	}
+	return nil
+}
+
+// errVanishedPart marks a part whose spool file the producer's own retry removed
+// under it: only an already recorded producer failure may explain such a
+// vanished file, and a part that finds it without one is a terminal failure of
+// its own.
+var errVanishedPart = errors.New("the spool file the part reads is gone")
+
+// uploadParts sends the object's parts from the source it is handed — a file
+// that is already whole, or one the producer is still writing — with at most
+// `parallelism` of them in flight: the ceiling the storage's call_parallelism
+// states. A part is sent only once its bytes are final, and every part is its
+// own storage call and its own retry budget, so a failed part is opened again
+// from the spool file, never the parts already accepted.
+//
+// Every event that can end the upload is recorded in an uploadTerminal when it
+// happens, and the cause is chosen there — a part's own failure first, then the
+// producer's failure (wrapped so the caller can fall back to the finished file),
+// then the run's cancellation. The upload has ONE exit: the chosen cause
+// cancels its own context, every in-flight part returns, and only then the
+// caller may abort. A part that ended because a neighbour failed never hides the
+// cause. The parts are returned by number, whatever order they finished in.
 func (e *Engine) uploadParts(ctx context.Context, st *storageRunState, mu storage.MultipartUploader,
-	sp *spool.Spool, src partSource, session storage.MultipartSession, label string) ([]storage.PartResult, error) {
-	var parts []storage.PartResult
+	sp *spool.Spool, src partSource, session storage.MultipartSession, label string, parallelism int) ([]storage.PartResult, error) {
+	pctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	slots := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	term := &uploadTerminal{stop: stop}
+	results := map[int32]storage.PartResult{}
+	var resMu sync.Mutex
+
 	number := int32(1)
 	var offset int64
 	seen := int64(-1)
+dispatch:
 	for {
-		n, done, err := src.next(ctx, seen)
+		n, done, err := src.next(pctx, seen)
 		if err != nil {
-			return nil, err
+			term.recordNext(ctx, err)
+			break
 		}
 		seen = n
+		file := src.file()
 		for offset < n && (done || offset+session.PartSize < n) {
 			size := min(session.PartSize, n-offset)
-			res, err := e.sendPart(ctx, st, mu, sp, src.file(), session, number, offset, size, label)
-			if err != nil {
-				return nil, err
+		slotsWait:
+			for {
+				// The producer can end while every slot is busy: its terminal
+				// state is read with the notification channel in one snapshot,
+				// recorded — which stops the upload — and the dispatcher leaves
+				// at once, never waiting for a slot or the storage budget.
+				changed, sf := src.terminal()
+				if sf != nil {
+					term.recordSourceFact(ctx, sf)
+					break dispatch
+				}
+				select {
+				case slots <- struct{}{}:
+				case <-pctx.Done():
+					if ctx.Err() != nil {
+						term.recordParent(ctx.Err())
+					}
+					break dispatch
+				case <-changed:
+					// The growth changed: loop and read its terminal state again.
+					continue
+				}
+				break slotsWait
 			}
-			parts = append(parts, res)
+			num, off := number, offset
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				res, perr := e.sendPart(pctx, st, mu, sp, file, session, num, off, size, label)
+				if perr != nil {
+					// A part that found its spool file gone asks the source
+					// whether the producer failed before this moment: that fact
+					// is recorded as it is, and only then can the vanished file
+					// be read as the failed attempt's cleanup.
+					if errors.Is(perr, errVanishedPart) {
+						term.recordVanished(ctx, src)
+					}
+					term.recordPart(ctx, perr)
+				} else {
+					resMu.Lock()
+					results[num] = res
+					resMu.Unlock()
+				}
+				<-slots
+			}()
 			offset += size
 			number++
 		}
 		if done && offset >= n {
-			return parts, nil
+			break
 		}
 	}
+	wg.Wait()
+	// The single exit records the producer's terminal state, so a failure no
+	// part or dispatcher call happened to carry is still in the facts before the
+	// cause is chosen; an already recorded part failure keeps the priority.
+	if ctx.Err() != nil {
+		term.recordParent(ctx.Err())
+	}
+	term.recordSourceFrom(ctx, src)
+	if cause := term.cause(); cause != nil {
+		return nil, cause
+	}
+	parts := make([]storage.PartResult, 0, len(results))
+	for n := int32(1); n < number; n++ {
+		parts = append(parts, results[n])
+	}
+	return parts, nil
 }
 
 // sendPart is one part's own storage call: the retry loop runs inside the
 // budget, so a slow part and its backoff are charged to the storage, and the
 // bytes are read from the file that produced them (a replay of an earlier
-// attempt included).
+// attempt included). A cancelled upload opens no file and books no attempt: the
+// context is checked here, immediately before the call, because a slot and the
+// cancellation can be ready together.
 func (e *Engine) sendPart(ctx context.Context, st *storageRunState, mu storage.MultipartUploader,
 	sp *spool.Spool, file string, session storage.MultipartSession, number int32, offset, size int64, label string) (storage.PartResult, error) {
+	if cause := context.Cause(ctx); cause != nil {
+		return storage.PartResult{}, cause
+	}
 	return storageCall(&st.clock, ctx, func(ctx context.Context) (storage.PartResult, error) {
 		res, err := attempt(ctx, e.retry, fmt.Sprintf("part %d of %s", number, label),
 			func(ctx context.Context, _ int) (storage.PartResult, error) {
 				st.addAttempts(1)
 				f, err := sp.Open(file)
 				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						return storage.PartResult{}, plugin.Permanent(fmt.Errorf("%w: %w", errVanishedPart, err))
+					}
 					return storage.PartResult{}, plugin.Permanent(err)
 				}
 				defer func() { _ = f.Close() }()

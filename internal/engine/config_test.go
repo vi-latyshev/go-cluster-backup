@@ -50,6 +50,23 @@ func TestConfigMissingFieldsWithPaths(t *testing.T) {
 	}
 }
 
+// TestStorageCallParallelismMustBePositive (A7, K1): the field is the ceiling
+// the engine holds in flight to one storage; a value below one is a config
+// error named with its JSON pointer, never a silently serial storage.
+func TestStorageCallParallelismMustBePositive(t *testing.T) {
+	w := newWorld(t)
+	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
+	cfg["storages"].(map[string]any)["primary"].(map[string]any)["call_parallelism"] = 0
+	raw, err := jsonMarshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newEngineRaw(t, w, raw)
+	if err == nil || !strings.Contains(err.Error(), "/storages/primary/call_parallelism") {
+		t.Fatalf("a zero call_parallelism = %v, want the pointer named", err)
+	}
+}
+
 func TestConfigUnknownMemberWithPath(t *testing.T) {
 	w := newWorld(t)
 	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
@@ -348,6 +365,7 @@ storages:
       manual: {type: keep_last, config: {count: 5, min_keep: 1, count_incomplete: true}}
     max_total_bytes: 70000000000
     time_budget: 30m
+    call_parallelism: 1
     config:
       api_url: https://cloud-api.yandex.net/v1/disk
       token: {file: /run/secrets/primary/token}
@@ -362,6 +380,7 @@ storages:
       scheduled: {type: keep_last, config: {count: 3, min_keep: 1, count_incomplete: true}}
     max_total_bytes: 14000000000
     time_budget: 30m
+    call_parallelism: 1
     config:
       endpoint: https://s3.example.com
       region: ru-central-1

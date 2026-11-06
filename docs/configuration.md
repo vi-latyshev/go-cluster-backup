@@ -306,7 +306,8 @@ storage's `CapExceeded`, `CapLimitBytes` and `CapUsedBytes` and a lease refusal
 | `run.max_artifact_bytes` | one artifact: a source that would produce more is stopped and that artifact fails, so one oversized volume cannot fill the spool |
 | `run.spool_reserve_bytes` | free space kept free in the spool; below it an artifact fails rather than filling the filesystem |
 | `restore.spool_reserve_bytes` | free space kept beyond the object being written to the restore spool, checked before the first byte and during every write |
-| `storages.<name>.time_budget` | the time spent inside that storage's own calls in one run — uploads, listings, deletes, the survey — never a source's dump or a processor's compression |
+| `storages.<name>.time_budget` | the wall time while at least one call to that storage is in flight in one run — uploads, listings, deletes, the survey; overlapping calls book their union once, never a source's dump or a processor's compression |
+| `storages.<name>.call_parallelism` | the most calls the engine holds in flight to this storage; the default is stated by `config defaults`. It covers the manifest reads of one survey and the parts of one multipart upload. The ceiling is per process and per instance: a `restore list` or a `validate --preflight` hook beside a run, and two instances on one service, each hold their own |
 | `run.storage_parallelism` | how many storages upload at once, `4` by default. Overlapping holds one `run.storage_parallelism` slot from the storage's first call to its last; a storage that gets no slot, or has no multipart capability, uploads after produce on the finished file. With overlap, `run.deadline` must sit above max(production, upload) plus the finishing tail, not above their sum |
 | `run.lease_wait`, `run.lease_poll` | how long a scheduled run waits for a live writer lease, and how often it asks again; a manual run never waits |
 | `run.retry`, `run.unclassified_error` | the engine's retry policy for every plugin call, including the class an error a plugin did not classify gets |
@@ -314,14 +315,24 @@ storage's `CapExceeded`, `CapLimitBytes` and `CapUsedBytes` and a lease refusal
 | `run.progress_interval` | how often a running dump reports its bytes so far; 0 reports none |
 
 An object goes to a storage in one request when it fits one, or part by part
-through a storage that uploads in parts: the engine sends one part per call, so
-a failed part is re-sent and the parts already accepted are not, and an upload
-that keeps failing is aborted rather than left billed — on a context of its own,
-bounded by a tenth of the storage's `request_timeout`, because an abort fires
-exactly when the run's ending needs its seconds. An object past 10,000 parts is
-refused at part 10,001 — more than 156 GiB at the default 16 MiB part. A run
-starts by sweeping what a killed predecessor left behind: every incomplete
-multipart upload under the storage's own prefix, begun before `now −
+through a storage that uploads in parts: up to
+`storages.<name>.call_parallelism` parts are in flight at once, so a failed part
+is re-sent and the parts already accepted are not, and an upload that keeps
+failing is aborted rather than left billed — on a context of its own, bounded by
+a tenth of the storage's `request_timeout`, because an abort fires exactly when
+the run's ending needs its seconds. Only after the producer exited successfully
+and every part was accepted is Complete sent, with the parts by number whatever
+order they finished in. At the first failed part the engine stops issuing new
+ones; a neighbour already in flight is cancelled, but its bytes may reach the
+service after the abort — that residue stays billed, is invisible to both the
+listing and the multipart inventory, and is at most `call_parallelism − 1` parts
+per failed upload. A part must also fit the service's `request_timeout` on the
+deployment's link: with up to `call_parallelism` parts sharing the channel,
+`request_timeout` must cover `part_bytes × call_parallelism / bandwidth`, so a
+slow link is a reason to lower `call_parallelism` to 1 there. An object past
+10,000 parts is refused at part 10,001 — more than 156 GiB at the default 16 MiB
+part. A run starts by sweeping what a killed predecessor left behind: every
+incomplete multipart upload under the storage's own prefix, begun before `now −
 (run.deadline + run.finish_allowance)` — older than the longest a live run can
 last, so an upload an overlapping run is still writing is never taken — is
 aborted once per storage per run, and a sweep that fails leaves the storage's
@@ -342,7 +353,12 @@ produce and is admitted or refused on the exact size, as before. Overlapping
 holds one `run.storage_parallelism` slot from the storage's first call to its
 last; a storage that gets no slot, or has no multipart capability, uploads
 after produce on the finished file. With overlap, `run.deadline` must sit above
-max(production, upload) plus the finishing tail, not above their sum.
+max(production, upload) plus the finishing tail, not above their sum. Across
+storages the survey phase lists every storage at once — one listing and up to
+`call_parallelism` manifest reads per storage — so it costs roughly the slowest
+storage's listing plus its manifest reads, and holds at most
+`storages × call_parallelism` reads in flight; the upload phase holds at most
+min(storages, `run.storage_parallelism`) × `call_parallelism` parts in flight.
 
 ### One writer
 
@@ -413,7 +429,10 @@ one. `count_incomplete` decides whether a run without a verified manifest takes
 a slot at all: with `true` it can take a period's slot when the period has
 nothing better; with `false` such runs are kept in addition, outside the tiers.
 A manifest whose run id and `kind` disagree is a problem run: it is never
-deleted, because the survey cannot trust what it says about itself.
+deleted, because the survey cannot trust what it says about itself. The same
+holds for a manifest the listing holds but that reads back absent, or that
+cannot be read, parsed or accepted: the survey cannot see the copies it holds,
+and an absent answer is never taken for "this run has no manifest".
 
 Two floors outrank every policy. On each storage, the newest run of a kind
 holding a verified copy of an artifact there — identity `group/name`, with that

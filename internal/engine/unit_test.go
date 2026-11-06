@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/model"
@@ -97,7 +98,7 @@ func TestAttemptRetryPolicy(t *testing.T) {
 		t.Fatalf("unclassified-as-permanent retried %d times", calls)
 	}
 
-	// A RetryAfter hint is honoured verbatim.
+	// A RetryAfter hint is never shortened: the wait is the hint plus jitter.
 	start := time.Now()
 	_, _ = attempt(ctx, p, "t", func(_ context.Context, n int) (struct{}, error) {
 		if n == 1 {
@@ -120,6 +121,58 @@ func TestAttemptRetryPolicy(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("cancelled context retried %d times", calls)
 	}
+}
+
+// TestRetryAfterHintIsNeverShortened (A9, R1): a RetryAfter hint is a floor,
+// not the whole wait — the configured jitter scatters it upward, so parallel
+// retries against one throttled service do not return in lockstep — and with
+// jitter 0 the wait is exactly the hint.
+func TestRetryAfterHintIsNeverShortened(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := retryPolicy{attempts: 11, initial: time.Millisecond, max: 2 * time.Millisecond,
+			jitter: 0.5, unclassified: plugin.ClassTransient}
+		var calls []time.Time
+		_, err := attempt(context.Background(), p, "t", func(context.Context, int) (struct{}, error) {
+			calls = append(calls, time.Now())
+			if len(calls) <= 10 {
+				return struct{}{}, plugin.RetryAfter(errors.New("slow down"), time.Second)
+			}
+			return struct{}{}, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 11 {
+			t.Fatalf("%d calls, want 11", len(calls))
+		}
+		waits := map[time.Duration]bool{}
+		for i := 1; i < len(calls); i++ {
+			wait := calls[i].Sub(calls[i-1])
+			if wait < time.Second || wait > 1500*time.Millisecond {
+				t.Fatalf("wait %d = %s, want the one-second hint plus at most its half of jitter", i, wait)
+			}
+			waits[wait] = true
+		}
+		if len(waits) == 1 {
+			t.Fatalf("every wait was %s: the hint is used verbatim and parallel retries stay in lockstep", calls[1].Sub(calls[0]))
+		}
+
+		exact := p
+		exact.jitter = 0
+		calls = calls[:0]
+		if _, err := attempt(context.Background(), exact, "t", func(context.Context, int) (struct{}, error) {
+			calls = append(calls, time.Now())
+			if len(calls) == 1 {
+				return struct{}{}, plugin.RetryAfter(errors.New("slow down"), time.Second)
+			}
+			return struct{}{}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := calls[1].Sub(calls[0]); got != time.Second {
+			t.Fatalf("the wait with jitter 0 = %s, want exactly the one-second hint", got)
+		}
+	})
 }
 
 func TestBackoffGrowsAndCaps(t *testing.T) {

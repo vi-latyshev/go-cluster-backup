@@ -37,6 +37,7 @@ type memUpload struct {
 	parts     map[int32][]byte
 	etags     map[int32]string
 	order     []int32
+	expected  int32
 	initiated time.Time
 }
 
@@ -81,7 +82,7 @@ func (m *memMultipart) BeginMultipart(ctx context.Context, req storage.PutReques
 	defer m.mu.Unlock()
 	m.next++
 	id := fmt.Sprintf("upload-%d", m.next)
-	m.uploads[id] = &memUpload{key: req.Key, parts: map[int32][]byte{}, etags: map[int32]string{}, initiated: time.Now()}
+	m.uploads[id] = &memUpload{key: req.Key, parts: map[int32][]byte{}, etags: map[int32]string{}, expected: 1, initiated: time.Now()}
 	partSize := m.partSize
 	if m.mode == "wrongpartsize" {
 		partSize++
@@ -108,6 +109,22 @@ func (m *memMultipart) PutPart(ctx context.Context, session storage.MultipartSes
 		if puts >= 3 {
 			return storage.PartResult{}, plugin.Transient(errors.New("injected later part failure"))
 		}
+	case "strictorder":
+		// The sequential-only implementation: a part may arrive only after its
+		// predecessor, which the concurrent check must refuse.
+		m.mu.Lock()
+		upload, ok := m.uploads[session.UploadID]
+		if !ok {
+			m.mu.Unlock()
+			return storage.PartResult{}, errors.New("no such upload")
+		}
+		next := upload.expected
+		if part.Number != next {
+			m.mu.Unlock()
+			return storage.PartResult{}, fmt.Errorf("part %d arrived before part %d: this storage accepts parts only in order", part.Number, next)
+		}
+		upload.expected = part.Number + 1
+		m.mu.Unlock()
 	}
 	data, err := io.ReadAll(io.LimitReader(part.Body, part.Size+1))
 	if err != nil {
@@ -130,6 +147,10 @@ func (m *memMultipart) PutPart(ctx context.Context, session storage.MultipartSes
 		return storage.PartResult{Number: part.Number}, nil
 	case "wrongpartnumber":
 		return storage.PartResult{Number: part.Number + 1, ETag: upload.etags[part.Number]}, nil
+	case "wrongpartnumberafter1":
+		if puts >= 2 {
+			return storage.PartResult{Number: part.Number + 1, ETag: upload.etags[part.Number]}, nil
+		}
 	}
 	return storage.PartResult{Number: part.Number, ETag: upload.etags[part.Number]}, nil
 }
@@ -308,6 +329,14 @@ func TestMultipartChecksCatchBrokenStorages(t *testing.T) {
 		{"multipart: parts in order complete the object", "getfail"},
 		{"multipart: parts in order complete the object", "getwrong"},
 		{"multipart: parts in order complete the object", "completefail"},
+		{"multipart: parts may finish in any order", "strictorder"},
+		{"multipart: parts may finish in any order", "partfailafter1"},
+		{"multipart: parts may finish in any order", "wrongpartnumberafter1"},
+		{"multipart: parts may finish in any order", "wrongpartnumber"},
+		{"multipart: parts may finish in any order", "noetag"},
+		{"multipart: parts may finish in any order", "completefail"},
+		{"multipart: parts may finish in any order", "beginfail"},
+		{"multipart: parts may finish in any order", "partfail"},
 		{"multipart: a re-sent part replaces the earlier one", "append"},
 		{"multipart: a re-sent part replaces the earlier one", "beginfail"},
 		{"multipart: a re-sent part replaces the earlier one", "partfail"},

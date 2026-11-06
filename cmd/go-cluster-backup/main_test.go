@@ -217,6 +217,11 @@ func TestDefaultsArePrintedAsTheyAre(t *testing.T) {
 	if !strings.Contains(stdout.String(), "go-cluster-backup — the service's defaults") {
 		t.Errorf("the document's own header is missing:\n%s", stdout.String())
 	}
+	// A storage's envelope is defaulted like any other: the ceiling on calls in
+	// flight is the document's, not a constructor's.
+	if !strings.Contains(stdout.String(), "call_parallelism") {
+		t.Errorf("the document does not carry the storage envelope's call_parallelism:\n%s", stdout.String())
+	}
 }
 
 // TestRunWiresTheDistribution drives run — main's whole body — without a process

@@ -60,7 +60,15 @@ func attempt[T any](ctx context.Context, p retryPolicy, what string, fn func(ctx
 		if n >= p.attempts {
 			return zero, err
 		}
-		if after <= 0 {
+		if after > 0 {
+			// A service's own RetryAfter hint is a floor, never the whole wait:
+			// the configured jitter scatters it upward so parallel retries
+			// against one throttled service do not return in lockstep. It is
+			// never shortened below the hint.
+			if p.jitter > 0 {
+				after += time.Duration(float64(after) * p.jitter * rand.Float64())
+			}
+		} else {
 			after = p.backoff(n)
 		}
 		if p.log != nil {
