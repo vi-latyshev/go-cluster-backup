@@ -3,7 +3,7 @@ package s3
 // Unit tests for the classification and decoding helpers the request paths all
 // route through. They are internal because these are unexported: an SDK error
 // the fake endpoint cannot produce (a code with no HTTP status, a Retry-After
-// in HTTP-date form) still has to be classified the way the engine will read it.
+// in HTTP-date form) still has to be classified the way execution will read it.
 
 import (
 	"context"
@@ -19,8 +19,9 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // apiErr is a scripted smithy API error: the code and the HTTP status the
@@ -59,28 +60,28 @@ func TestClassifyMapsEveryAnswer(t *testing.T) {
 	cases := []struct {
 		name  string
 		err   error
-		class plugin.Class
+		class pluginerrors.Class
 		after time.Duration
 	}{
-		{"absent bucket", apiErr{code: "NoSuchBucket", status: 404}, plugin.ClassPermanent, 0},
-		{"request timeout code", apiErr{code: "RequestTimeout"}, plugin.ClassTransient, 0},
-		{"unauthorized", apiErr{code: "AccessDenied", status: 401}, plugin.ClassPermanent, 0},
-		{"forbidden", apiErr{code: "AccessDenied", status: 403}, plugin.ClassPermanent, 0},
-		{"slow down", apiErr{code: "SlowDown", status: 429}, plugin.ClassTransient, 0},
-		{"server error", apiErr{code: "InternalError", status: 500}, plugin.ClassTransient, 0},
-		{"absent key", apiErr{code: "NoSuchKey", status: 404}, plugin.ClassNotFound, 0},
-		{"bad request", apiErr{code: "InvalidRequest", status: 400}, plugin.ClassPermanent, 0},
-		{"no status at all", apiErr{code: "SomethingElse"}, plugin.ClassTransient, 0},
-		{"retry-after seconds", responseErr(503, "7"), plugin.ClassTransient, 7 * time.Second},
-		{"retry-after date", responseErr(503, time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)), plugin.ClassTransient, time.Hour},
-		{"retry-after in the past", responseErr(503, time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)), plugin.ClassTransient, 0},
-		{"retry-after unreadable", responseErr(503, "soon"), plugin.ClassTransient, 0},
-		{"transport failure", errors.New("connection reset"), plugin.ClassTransient, 0},
+		{"absent bucket", apiErr{code: "NoSuchBucket", status: 404}, pluginerrors.ClassPermanent, 0},
+		{"request timeout code", apiErr{code: "RequestTimeout"}, pluginerrors.ClassTransient, 0},
+		{"unauthorized", apiErr{code: "AccessDenied", status: 401}, pluginerrors.ClassPermanent, 0},
+		{"forbidden", apiErr{code: "AccessDenied", status: 403}, pluginerrors.ClassPermanent, 0},
+		{"slow down", apiErr{code: "SlowDown", status: 429}, pluginerrors.ClassTransient, 0},
+		{"server error", apiErr{code: "InternalError", status: 500}, pluginerrors.ClassTransient, 0},
+		{"absent key", apiErr{code: "NoSuchKey", status: 404}, pluginerrors.ClassNotFound, 0},
+		{"bad request", apiErr{code: "InvalidRequest", status: 400}, pluginerrors.ClassPermanent, 0},
+		{"no status at all", apiErr{code: "SomethingElse"}, pluginerrors.ClassTransient, 0},
+		{"retry-after seconds", responseErr(503, "7"), pluginerrors.ClassTransient, 7 * time.Second},
+		{"retry-after date", responseErr(503, time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)), pluginerrors.ClassTransient, time.Hour},
+		{"retry-after in the past", responseErr(503, time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)), pluginerrors.ClassTransient, 0},
+		{"retry-after unreadable", responseErr(503, "soon"), pluginerrors.ClassTransient, 0},
+		{"transport failure", errors.New("connection reset"), pluginerrors.ClassTransient, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &Storage{}
-			class, after := plugin.ClassOf(s.classify(context.Background(), tc.err, "op"))
+			class, after := pluginerrors.ClassOf(s.classify(context.Background(), tc.err, "op"))
 			if class != tc.class {
 				t.Errorf("class %q, want %q", class, tc.class)
 			}
@@ -107,7 +108,7 @@ func TestClassifyKeepsTheContextError(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("classify with a dead context = %v, want the context's own error", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != "" {
+	if class, _ := pluginerrors.ClassOf(err); class != "" {
 		t.Errorf("class %q, want unclassified", class)
 	}
 }
@@ -189,7 +190,7 @@ func TestReadSecret(t *testing.T) {
 	if err := os.WriteFile(good, []byte("  tenant:key-id\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	v, err := readSecret(plugin.Secret{File: good})
+	v, err := readSecret(configuration.Secret{File: good})
 	if err != nil || v != "tenant:key-id" {
 		t.Fatalf("readSecret = %q, %v", v, err)
 	}
@@ -197,12 +198,12 @@ func TestReadSecret(t *testing.T) {
 	if err := os.WriteFile(empty, []byte("  \n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readSecret(plugin.Secret{File: empty}); err == nil {
+	if _, err := readSecret(configuration.Secret{File: empty}); err == nil {
 		t.Error("an empty secret file was accepted")
-	} else if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("class %q, want permanent", class)
 	}
-	if _, err := readSecret(plugin.Secret{File: filepath.Join(dir, "absent")}); err == nil {
+	if _, err := readSecret(configuration.Secret{File: filepath.Join(dir, "absent")}); err == nil {
 		t.Error("a missing secret file was accepted")
 	}
 }
@@ -249,8 +250,8 @@ func secretFile(t *testing.T, value string) string {
 func TestGetRejectsABodyShorterThanItsDeclaredLength(t *testing.T) {
 	s := &Storage{cfg: Config{
 		Endpoint: "https://s3.example.com", Region: "ru-central-1", Bucket: "b", Prefix: "root",
-		AccessKeyID:     plugin.Secret{File: secretFile(t, "tenant:key-id")},
-		SecretAccessKey: plugin.Secret{File: secretFile(t, "secret-key")},
+		AccessKeyID:     configuration.Secret{File: secretFile(t, "tenant:key-id")},
+		SecretAccessKey: configuration.Secret{File: secretFile(t, "secret-key")},
 		Addressing:      AddressingPath, StorageClass: "STANDARD",
 		PartBytes:       model.ByteSize(minPartBytes),
 		MaxRequestBytes: 1 << 30, MaxObjectBytes: 1 << 40,
@@ -261,7 +262,7 @@ func TestGetRejectsABodyShorterThanItsDeclaredLength(t *testing.T) {
 	if err == nil {
 		t.Fatal("a download shorter than its declared length was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 }

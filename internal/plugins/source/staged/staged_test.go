@@ -15,18 +15,23 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sourcetest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/staged"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source/sourcetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := staged.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, staged.Spec, func(lr *loader.Registry) error {
+		return staged.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -34,15 +39,15 @@ func testRegistry(t *testing.T) *plugin.Registry {
 
 func build(t *testing.T, cfg string) (source.Source, error) {
 	t.Helper()
-	return plugin.Build(context.Background(), testRegistry(t), source.Kind, "staged",
-		jsontext.Value(cfg), plugin.Deps{Instance: "staged", Log: slog.New(slog.DiscardHandler)})
+	return instances.Build(context.Background(), testRegistry(t), source.Kind, "staged",
+		jsontext.Value(cfg), instances.Deps{Instance: "staged", Log: slog.New(slog.DiscardHandler)})
 }
 
 func config(dir, name string) string {
 	return fmt.Sprintf(`{"dir": %q, "name": %q}`, dir, name)
 }
 
-// writeRecord writes the chain record the engine's Stage leaves beside the
+// writeRecord writes the chain record the stage workflow leaves beside the
 // artifact: the exact extension tail and the chain.
 func writeRecord(t *testing.T, dir, name, ext, chain string) {
 	t.Helper()
@@ -52,7 +57,7 @@ func writeRecord(t *testing.T, dir, name, ext, chain string) {
 	}
 }
 
-// stagedDir writes the pair the engine's Stage would have left behind: the
+// stagedDir writes the pair the stage workflow would have left behind: the
 // artifact and the record that names it.
 func stagedDir(t *testing.T) (string, string) {
 	t.Helper()
@@ -129,7 +134,7 @@ func TestMissingStagedArtifactRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a missing staged artifact passed Check")
 	}
 	if _, err := s.Describe(context.Background()); err == nil {
@@ -142,7 +147,7 @@ func TestMissingStagedArtifactRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := missingDir.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := missingDir.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a missing staged directory passed Check")
 	}
 }
@@ -160,7 +165,7 @@ func TestABesideFileIsNotThisArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a longer-named neighbour satisfied this source's check")
 	}
 	// With the record and its own file present, only the named file is read.
@@ -180,7 +185,7 @@ func TestABesideFileIsNotThisArtifact(t *testing.T) {
 	if err := os.Remove(own); err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil {
 		t.Fatal("a neighbour stood in for the record's missing file")
 	}
@@ -196,7 +201,7 @@ func TestRecordedArtifactMissingRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil {
 		t.Fatal("a record whose artifact is absent passed Check")
 	}
@@ -215,7 +220,7 @@ func TestEmptyStagedArtifactRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("an empty staged artifact passed Check")
 	}
 }
@@ -273,8 +278,8 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := plugin.Build(ctx, testRegistry(t), source.Kind, "staged",
-		jsontext.Value(config(dir, "example-state")), plugin.Deps{Instance: "staged"}); err == nil {
+	if _, err := instances.Build(ctx, testRegistry(t), source.Kind, "staged",
+		jsontext.Value(config(dir, "example-state")), instances.Deps{Instance: "staged"}); err == nil {
 		t.Error("New accepted a cancelled context")
 	}
 	s, err := build(t, config(dir, "example-state"))
@@ -284,7 +289,7 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	if _, err := s.Describe(ctx); err == nil {
 		t.Error("Describe accepted a cancelled context")
 	}
-	if err := s.(plugin.Checker).Check(ctx); err == nil {
+	if err := s.(instances.Checker).Check(ctx); err == nil {
 		t.Error("Check accepted a cancelled context")
 	}
 	if err := s.Dump(ctx, io.Discard); err == nil {
@@ -310,7 +315,7 @@ func TestAnUnreadableChainRecordRefuses(t *testing.T) {
 	if err == nil {
 		t.Fatal("a record that is not a file was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent: %v", class, err)
 	}
 	if errors.Is(err, fs.ErrNotExist) {
@@ -336,7 +341,7 @@ func TestAStatFailureThatIsNotAbsenceRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil {
 		t.Fatal("an unresolvable artifact path was accepted")
 	}
@@ -357,7 +362,7 @@ func TestARecordExtThatLeavesTheDirRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 	checks := map[string]func() error{
-		"Check":    func() error { return s.(plugin.Checker).Check(context.Background()) },
+		"Check":    func() error { return s.(instances.Checker).Check(context.Background()) },
 		"Describe": func() error { _, err := s.Describe(context.Background()); return err },
 	}
 	for name, check := range checks {
@@ -365,7 +370,7 @@ func TestARecordExtThatLeavesTheDirRefuses(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%s accepted a record ext that leaves the dir", name)
 		}
-		if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 			t.Fatalf("%s: class = %q, want permanent: %v", name, class, err)
 		}
 	}
@@ -392,7 +397,7 @@ func TestAnUnopenableStagedFileRefuses(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unopenable staged artifact was streamed")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent: %v", class, err)
 	}
 }
@@ -413,7 +418,7 @@ func TestRecordedChainWithoutARecordRefuses(t *testing.T) {
 	if err == nil {
 		t.Fatal("a missing chain record was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class %q, want permanent: %v", class, err)
 	}
 	if !strings.Contains(err.Error(), source.StagedChainFile(dir, "example-state")) {

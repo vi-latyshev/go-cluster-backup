@@ -16,7 +16,7 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi"
 )
 
 // TestTemplateFuncsWithoutAnObject: every rule function answers through the

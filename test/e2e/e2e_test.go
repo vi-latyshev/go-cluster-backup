@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/extcmd"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
 )
 
 // env is the shared cluster fixture, nil when the suite is disabled.

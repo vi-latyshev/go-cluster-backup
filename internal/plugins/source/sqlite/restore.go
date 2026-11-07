@@ -9,9 +9,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"sync"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // ApplyOptions is restore.apply.sqlite: the knobs that shape one restore.
@@ -30,7 +33,7 @@ func (o ApplyOptions) Validate() error {
 	return nil
 }
 
-var labelRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+var labelRe = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`^[A-Za-z0-9._-]+$`) })
 
 // Apply writes the decoded artifact beside or over this instance's database.
 // The copy lands in a temp file in the same directory, the configured integrity
@@ -50,10 +53,10 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	if req.Mode != source.ApplySideBySide && req.Mode != source.ApplyInPlace {
 		return source.ApplyReport{}, fmt.Errorf("apply mode %q must be side_by_side or in_place", req.Mode)
 	}
-	if !labelRe.MatchString(req.Label) {
+	if !labelRe().MatchString(req.Label) {
 		return source.ApplyReport{}, fmt.Errorf("apply label %q is empty or carries characters no file name should carry", req.Label)
 	}
-	opts, err := plugin.DecodeOptions[ApplyOptions](req.Options, "restore.apply.sqlite")
+	opts, err := configuration.DecodeOptions[ApplyOptions](req.Options, "restore.apply.sqlite")
 	if err != nil {
 		return source.ApplyReport{}, err
 	}
@@ -64,11 +67,11 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	dir := filepath.Dir(s.cfg.Path)
 	tmp, err := os.CreateTemp(dir, ".restore-*")
 	if err != nil {
-		return source.ApplyReport{}, plugin.Transient(err)
+		return source.ApplyReport{}, pluginerrors.Transient(err)
 	}
 	tmpName := tmp.Name()
 	removeTmp := func() { _ = os.Remove(tmpName) }
-	n, copyErr := plugin.CopyContext(ctx, tmp, src)
+	n, copyErr := pluginio.CopyContext(ctx, tmp, src)
 	if closeErr := tmp.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
@@ -78,7 +81,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	}
 	if err := chmodFile(tmpName, os.FileMode(mode)); err != nil {
 		removeTmp()
-		return source.ApplyReport{}, plugin.Transient(err)
+		return source.ApplyReport{}, pluginerrors.Transient(err)
 	}
 	if err := s.check(ctx, tmpName); err != nil {
 		removeTmp()
@@ -95,7 +98,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		}
 		if err := renameFile(tmpName, target); err != nil {
 			removeTmp()
-			return source.ApplyReport{}, plugin.Transient(err)
+			return source.ApplyReport{}, pluginerrors.Transient(err)
 		}
 		report.Target = target
 	case source.ApplyInPlace:
@@ -108,7 +111,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 				}
 				if err := renameFile(s.cfg.Path, previous); err != nil {
 					removeTmp()
-					return source.ApplyReport{}, plugin.Transient(err)
+					return source.ApplyReport{}, pluginerrors.Transient(err)
 				}
 				if err := moveSidecars(s.cfg.Path, previous); err != nil {
 					removeTmp()
@@ -117,7 +120,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 				report.Previous = previous
 			} else if !errors.Is(statErr, os.ErrNotExist) {
 				removeTmp()
-				return source.ApplyReport{}, plugin.Transient(statErr)
+				return source.ApplyReport{}, pluginerrors.Transient(statErr)
 			}
 		} else if err := removeSidecars(s.cfg.Path); err != nil {
 			removeTmp()
@@ -128,7 +131,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 			if report.Previous != "" {
 				return source.ApplyReport{}, fmt.Errorf("the current database is at %q and %q could not be replaced: %w", report.Previous, s.cfg.Path, err)
 			}
-			return source.ApplyReport{}, plugin.Transient(err)
+			return source.ApplyReport{}, pluginerrors.Transient(err)
 		}
 		report.Target = s.cfg.Path
 	}
@@ -148,13 +151,13 @@ func moveSidecars(from, to string) error {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 		if err := refuseExisting(to + ext); err != nil {
 			return err
 		}
 		if err := renameFile(from+ext, to+ext); err != nil {
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 	}
 	return nil
@@ -165,7 +168,7 @@ func moveSidecars(from, to string) error {
 func removeSidecars(path string) error {
 	for _, ext := range sidecarSuffixes {
 		if err := os.Remove(path + ext); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 	}
 	return nil
@@ -179,11 +182,11 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 	}
 	tmp, err := os.CreateTemp(s.cfg.ScratchDir, "sqlite-probe-*")
 	if err != nil {
-		return source.ProbeReport{}, plugin.Transient(err)
+		return source.ProbeReport{}, pluginerrors.Transient(err)
 	}
 	name := tmp.Name()
 	defer func() { _ = os.Remove(name) }()
-	n, copyErr := plugin.CopyContext(ctx, tmp, src)
+	n, copyErr := pluginio.CopyContext(ctx, tmp, src)
 	if closeErr := tmp.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
@@ -199,9 +202,9 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 // refuseExisting keeps a second restore from landing on the first one's target.
 func refuseExisting(path string) error {
 	if _, err := lstatFile(path); err == nil {
-		return plugin.Permanent(fmt.Errorf("%s already exists; a side-by-side target is never overwritten", path))
+		return pluginerrors.Permanent(fmt.Errorf("%s already exists; a side-by-side target is never overwritten", path))
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	return nil
 }

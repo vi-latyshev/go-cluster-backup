@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 func artifactResult(group, name, outcome string, size int64) model.ArtifactResult {
@@ -155,7 +155,7 @@ func TestReadFailureKeepsTheCallerStopAndHidesTheCause(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "reading the run_finished response") {
 		t.Fatalf("readFailure = %v", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient", class)
 	}
 }

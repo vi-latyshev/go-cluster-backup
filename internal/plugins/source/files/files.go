@@ -29,43 +29,17 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/human"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/human"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // Config is the plugin config. Every field is required.
 type Config struct {
 	Root           string `json:"root" required:"true" doc:"directory whose tree becomes one tar stream"`
 	IgnoreVanished bool   `json:"ignore_vanished" doc:"files deleted between the walk and their open are skipped instead of failing the artifact"`
-}
-
-// Register adds the files source to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, source.Kind, plugin.Spec[Config, source.Source]{
-		Type:      "files",
-		Summary:   "one directory tree as a single tar stream",
-		Stability: plugin.Stable,
-		Example:   []byte(`{"root": "/volumes/example/name", "ignore_vanished": true}`),
-		New: func(ctx context.Context, cfg Config, deps plugin.Deps) (source.Source, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if cfg.Root == "" {
-				return nil, errors.New("root is empty")
-			}
-			if !filepath.IsAbs(cfg.Root) {
-				return nil, fmt.Errorf("root %q must be absolute", cfg.Root)
-			}
-			log := deps.Log
-			if log == nil {
-				log = slog.New(slog.DiscardHandler)
-			}
-			return &Source{cfg: cfg, log: log}, nil
-		},
-	})
 }
 
 type Source struct {
@@ -85,7 +59,7 @@ type Source struct {
 // DumpStats reports what the Dump calls on this instance left out of the
 // stream: the entries an entryRefusal rejected, the files that vanished into a
 // tolerated delete, and the files whose tail had to be zero-padded because they
-// shrank under the read. The engine records the counts beside the artifact, so
+// shrank under the read. The pipeline records the counts beside the artifact, so
 // a tree read while it lived stays visible in the manifest and in the nightly
 // message instead of only in a log line.
 func (s *Source) DumpStats(ctx context.Context) (model.DumpStats, error) {
@@ -111,10 +85,10 @@ func (s *Source) Check(ctx context.Context) error {
 	}
 	st, err := os.Stat(s.cfg.Root)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("volume tree: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("volume tree: %w", err))
 	}
 	if !st.IsDir() {
-		return plugin.Permanent(fmt.Errorf("%s is not a directory", s.cfg.Root))
+		return pluginerrors.Permanent(fmt.Errorf("%s is not a directory", s.cfg.Root))
 	}
 	return nil
 }
@@ -129,7 +103,7 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 	// under the walk.
 	root, err := os.OpenRoot(s.cfg.Root)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("opening the root %s: %w", s.cfg.Root, err))
+		return pluginerrors.Permanent(fmt.Errorf("opening the root %s: %w", s.cfg.Root, err))
 	}
 	defer func() { _ = root.Close() }()
 

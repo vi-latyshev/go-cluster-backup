@@ -15,17 +15,21 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/local"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := local.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, local.Spec, func(lr *loader.Registry) error {
+		return local.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -37,8 +41,8 @@ func newStorageIn(t *testing.T, dir string) storage.Storage {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := plugin.Build(context.Background(), testRegistry(t), storage.Kind, "local", raw,
-		plugin.Deps{Instance: "local", Log: slog.New(slog.DiscardHandler)})
+	s, err := storage.Build(context.Background(), testRegistry(t), "local", raw,
+		storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "local", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +50,7 @@ func newStorageIn(t *testing.T, dir string) storage.Storage {
 }
 
 func TestGeneralConformance(t *testing.T) {
-	plugintest.CheckSpec(t, testRegistry(t))
+	storagetest.CheckSpec(t, testRegistry(t))
 }
 
 func TestStorageConformance(t *testing.T) {
@@ -107,7 +111,8 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		`{"root":"","page_size":10}`,
 		`{"root":"/tmp","page_size":0}`,
 	} {
-		_, err := r.BuildAny(context.Background(), "storage", "local", jsontext.Value(raw), plugin.Deps{Instance: "local"})
+		_, err := storage.Build(context.Background(), r, "local", jsontext.Value(raw),
+			storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "local"})
 		if err == nil {
 			t.Errorf("config %s accepted", raw)
 		}
@@ -200,8 +205,8 @@ func TestRegisterRejectsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r := testRegistry(t)
-	if _, err := r.BuildAny(ctx, "storage", "local", jsontext.Value(`{"root":"/tmp","page_size":1}`),
-		plugin.Deps{Instance: "local"}); err == nil {
+	if _, err := storage.Build(ctx, r, "local", jsontext.Value(`{"root":"/tmp","page_size":1}`),
+		storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "local"}); err == nil {
 		t.Fatal("a cancelled context built a storage")
 	}
 }
@@ -281,7 +286,7 @@ func TestStatUnderAFilePath(t *testing.T) {
 	if err == nil {
 		t.Fatal("Stat under a path that is a file succeeded")
 	}
-	if class, _ := plugin.ClassOf(err); class == plugin.ClassNotFound {
+	if class, _ := pluginerrors.ClassOf(err); class == pluginerrors.ClassNotFound {
 		t.Errorf("a broken path was read as absence: %v", err)
 	}
 }
@@ -290,7 +295,7 @@ func TestGetAbsentAndUnderAFilePath(t *testing.T) {
 	ctx := context.Background()
 	s := newStorageIn(t, t.TempDir())
 	err := s.Get(ctx, "absent.bin", io.Discard)
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassNotFound {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassNotFound {
 		t.Fatalf("Get of an absent key: class %q err %v, want not_found", class, err)
 	}
 	if _, err := s.Put(ctx, storage.PutRequest{Key: "a", Size: 1}, strings.NewReader("x")); err != nil {

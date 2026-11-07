@@ -9,27 +9,37 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keeplast"
-	"github.com/vi-latyshev/go-cluster-backup/internal/retention"
-	"github.com/vi-latyshev/go-cluster-backup/internal/retention/retentiontest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/retentiontest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testPlugin(t *testing.T) (*loader.Registry, *instances.Registry) {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := keeplast.Register(r); err != nil {
+	lr := loader.New()
+	factories := instances.NewRegistry()
+	if err := loader.Add(lr, keeplast.Spec, func(lr *loader.Registry) error {
+		return keeplast.Apply(lr, factories)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	return r
+	return lr, factories
+}
+
+func testRegistry(t *testing.T) *instances.Registry {
+	t.Helper()
+	_, factories := testPlugin(t)
+	return factories
 }
 
 func newPolicy(t *testing.T, cfg string) retention.Retention {
 	t.Helper()
-	p, err := plugin.Build(context.Background(), testRegistry(t), retention.Kind, "keep_last", jsontext.Value(cfg),
-		plugin.Deps{Instance: "keep_last", Log: slog.New(slog.DiscardHandler)})
+	p, err := instances.Build(context.Background(), testRegistry(t), retention.Kind, "keep_last", jsontext.Value(cfg),
+		instances.Deps{Instance: "keep_last", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +63,20 @@ func run(id string, daysAgo int, bytes int64) model.StoredRun {
 
 func TestGeneralConformance(t *testing.T) {
 	plugintest.CheckSpec(t, testRegistry(t))
+}
+
+// TestApplyContributesCompiledDescriptor: registration is memory-only and the
+// descriptor stays visible whatever the selection, so merge, schema and
+// `plugins describe` never depend on the deployment enabling keep_last.
+func TestApplyContributesCompiledDescriptor(t *testing.T) {
+	lr, _ := testPlugin(t)
+	ds := loader.All(lr, instances.Descriptors)
+	if len(ds) != 1 {
+		t.Fatalf("descriptors %+v", ds)
+	}
+	if ds[0].ID != "retention/keep_last" || ds[0].ID != keeplast.Spec.ID {
+		t.Fatalf("descriptor id %q, spec id %q", ds[0].ID, keeplast.Spec.ID)
+	}
 }
 
 func TestRetentionConformance(t *testing.T) {
@@ -93,9 +117,9 @@ func TestIncompleteRunsAreKeptAndNotCounted(t *testing.T) {
 func TestBuildReturnsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := plugin.Build(ctx, testRegistry(t), retention.Kind, "keep_last",
+	_, err := instances.Build(ctx, testRegistry(t), retention.Kind, "keep_last",
 		jsontext.Value(`{"count": 3, "min_keep": 1, "count_incomplete": true}`),
-		plugin.Deps{Instance: "keep_last", Log: slog.New(slog.DiscardHandler)})
+		instances.Deps{Instance: "keep_last", Log: slog.New(slog.DiscardHandler)})
 	if err == nil {
 		t.Fatal("Build with a cancelled context succeeded")
 	}
@@ -108,7 +132,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		`{"count": 3, "min_keep": 0, "count_incomplete": false}`,
 		`{"count": 2, "min_keep": 3, "count_incomplete": false}`,
 	} {
-		if _, err := r.BuildAny(context.Background(), "retention", "keep_last", jsontext.Value(raw), plugin.Deps{Instance: "keep_last"}); err == nil {
+		if _, err := r.BuildAny(context.Background(), "retention", "keep_last", jsontext.Value(raw), instances.Deps{Instance: "keep_last"}); err == nil {
 			t.Errorf("config %s accepted", raw)
 		}
 	}

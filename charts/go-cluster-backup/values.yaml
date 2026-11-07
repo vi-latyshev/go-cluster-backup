@@ -37,6 +37,18 @@ component: backup
 # -- Extra labels added to every object and to every CronJob pod template.
 labels: {}
 
+# ── Shutdown ──────────────────────────────────────────────────────────────
+# -- Seconds Kubernetes gives a writer or restore pod between SIGTERM and
+# SIGKILL (the stage initContainer shares the writer pod, so the same value
+# covers it). The tool's shutdown needs
+# `G = join + finish_allowance + abort_total + close + margin`, read from the
+# configuration's `run.finish_allowance` and `plugins.config.lifecycle`; at the
+# shipped defaults G = 1m + 2m + 2m + 30s + 30s = 360s. The config-gate hook
+# passes this same value to `validate --termination-grace-seconds`, which
+# refuses a configuration whose own G exceeds it — raise this when the
+# configuration raises any input, never lower it below the effective G.
+terminationGracePeriodSeconds: 360
+
 # ── Scheduled run ─────────────────────────────────────────────────────────
 # -- Cron schedule of the scheduled run.
 schedule: "0 3 * * *"
@@ -225,12 +237,12 @@ rbac:
 
 # ── Catalog ───────────────────────────────────────────────────────────────
 catalog:
-  # -- Create the catalog ConfigMap the tool writes its run index into. It is
-  # created without `data` and annotated `helm.sh/resource-policy: keep`, so an
-  # uninstall never takes the run history with it. Set to false when the
+  # -- Create the catalog ConfigMap the tool keeps its writer-lease record in.
+  # It is created without `data` and annotated `helm.sh/resource-policy: keep`,
+  # so an uninstall never takes a live claim away. Set to false when the
   # ConfigMap is managed by the consumer's own manifests — such a manifest must
-  # never declare `data` either: every reconcile of it would revert the run
-  # index the tool wrote.
+  # never declare `data` either: every reconcile of it would revert the lease
+  # record the tool wrote.
   create: true
   # -- Name of the catalog ConfigMap. Empty uses `<fullname>-catalog`, and the
   # chart refuses to render when the config names a different one.

@@ -14,15 +14,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/extcmd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/sqlitecopy"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/sqlitecopy"
 )
 
 // Config is the plugin config. Every field is required.
@@ -31,41 +32,6 @@ type Config struct {
 	ScratchDir     string         `json:"scratch_dir" required:"true" doc:"existing writable directory the snapshot's temporary file is spooled into, e.g. the big emptyDir a run mounts; the process temp dir is not used"`
 	BusyTimeout    model.Duration `json:"busy_timeout" doc:"how long sqlite3 waits for a lock held by the live writer"`
 	IntegrityCheck string         `json:"integrity_check" doc:"pragma a restored or probed copy must answer ok to: quick or full"`
-}
-
-// Register adds the sqlite source to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, source.Kind, plugin.Spec[Config, source.Source]{
-		Type:      "sqlite",
-		Summary:   "one SQLite database, copied with sqlite3's online .backup",
-		Stability: plugin.Stable,
-		Requires:  []string{"sqlite3"},
-		Example:   []byte(`{"path": "/data/app.db", "scratch_dir": "/scratch", "busy_timeout": "10s", "integrity_check": "quick"}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (source.Source, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if cfg.Path == "" {
-				return nil, errors.New("path is empty")
-			}
-			if !filepath.IsAbs(cfg.Path) {
-				return nil, fmt.Errorf("path %q must be absolute", cfg.Path)
-			}
-			if cfg.ScratchDir == "" {
-				return nil, errors.New("scratch_dir is empty")
-			}
-			if !filepath.IsAbs(cfg.ScratchDir) {
-				return nil, fmt.Errorf("scratch_dir %q must be absolute", cfg.ScratchDir)
-			}
-			if cfg.BusyTimeout.Std() <= 0 {
-				return nil, errors.New("busy_timeout must be positive")
-			}
-			if _, ok := sqlitecopy.Pragma(cfg.IntegrityCheck); !ok {
-				return nil, fmt.Errorf("integrity_check %q must be quick or full", cfg.IntegrityCheck)
-			}
-			return &Source{cfg: cfg}, nil
-		},
-	})
 }
 
 // The filesystem primitives the dump and the restore drive. Each is a variable
@@ -103,21 +69,21 @@ func (s *Source) Check(ctx context.Context) error {
 		return err
 	}
 	if _, err := exec.LookPath("sqlite3"); err != nil {
-		return plugin.Permanent(fmt.Errorf("sqlite3 is not in PATH: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("sqlite3 is not in PATH: %w", err))
 	}
 	if err := extcmd.CheckScratchDir(s.cfg.ScratchDir); err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	st, err := os.Stat(s.cfg.Path)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("database file: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("database file: %w", err))
 	}
 	if st.IsDir() {
-		return plugin.Permanent(fmt.Errorf("%s is a directory, not a database file", s.cfg.Path))
+		return pluginerrors.Permanent(fmt.Errorf("%s is a directory, not a database file", s.cfg.Path))
 	}
 	f, err := os.Open(s.cfg.Path)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("database file is not readable: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("database file is not readable: %w", err))
 	}
 	return f.Close()
 }
@@ -130,12 +96,12 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 	}
 	tmp, err := os.CreateTemp(s.cfg.ScratchDir, "sqlite-backup-*")
 	if err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	name := tmp.Name()
 	if err := closeFile(tmp); err != nil {
 		_ = os.Remove(name)
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	defer func() { _ = os.Remove(name) }()
 
@@ -144,24 +110,24 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 	}
 	f, err := os.Open(name)
 	if err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	defer func() { _ = f.Close() }()
 	st, err := statFile(f)
 	if err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	if st.Size() == 0 {
-		return plugin.Transient(errors.New("sqlite3 exited 0 but wrote an empty copy"))
+		return pluginerrors.Transient(errors.New("sqlite3 exited 0 but wrote an empty copy"))
 	}
-	_, err = plugin.CopyContext(ctx, dst, f)
+	_, err = pluginio.CopyContext(ctx, dst, f)
 	return err
 }
 
 // backup runs the shell's .backup into out.
 func (s *Source) backup(ctx context.Context, out string) error {
 	cmd := exec.CommandContext(ctx, "sqlite3", sqlitecopy.BackupArgs(s.cfg.Path, out, s.cfg.BusyTimeout.Std())...)
-	if _, err := extcmd.Output(ctx, cmd, classifyExit); err != nil {
+	if _, err := extcmd.Output(ctx, cmd, classifyExit()); err != nil {
 		return err
 	}
 	return nil
@@ -172,23 +138,31 @@ func (s *Source) backup(ctx context.Context, out string) error {
 // is the only proof.
 func (s *Source) check(ctx context.Context, file string) error {
 	cmd := exec.CommandContext(ctx, "sqlite3", "-readonly", file, s.pragma()+";")
-	out, err := extcmd.Output(ctx, cmd, classifyExit)
+	out, err := extcmd.Output(ctx, cmd, classifyExit())
 	if err != nil {
 		return err
 	}
 	if answer := strings.TrimSpace(out); answer != "ok" {
-		return plugin.Permanent(fmt.Errorf("%s answered %q for %s", s.pragma(), answer, file))
+		return pluginerrors.Permanent(fmt.Errorf("%s answered %q for %s", s.pragma(), answer, file))
 	}
 	return nil
 }
 
+// The patterns and the classifier they build are lazily-built singletons: a
+// package initializer does no work.
 var (
-	transientRe = regexp.MustCompile(`(?i)database is locked|database is busy|unable to close due to unfinalized|i/o error|disk i/o error`)
+	transientRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`(?i)database is locked|database is busy|unable to close due to unfinalized|i/o error|disk i/o error`)
+	})
 	// A corrupt or missing database will not repair itself on the next attempt.
-	permanentRe = regexp.MustCompile(`(?i)malformed|not a database|unable to open database file|file is encrypted|no such file`)
+	permanentRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`(?i)malformed|not a database|unable to open database file|file is encrypted|no such file`)
+	})
 )
 
 // classifyExit marks a failed sqlite3 run with this plugin's patterns; text
-// matching neither stays unclassified and the engine's config decides what
+// matching neither stays unclassified and the execution config decides what
 // that means.
-var classifyExit = extcmd.Classifier(permanentRe, transientRe)
+var classifyExit = sync.OnceValue(func() func(bin string, err error, detail string) error {
+	return extcmd.Classifier(permanentRe(), transientRe())
+})

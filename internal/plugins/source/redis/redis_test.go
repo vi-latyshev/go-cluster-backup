@@ -16,17 +16,22 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/redis"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source/sourcetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sourcetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := redis.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, redis.Spec, func(lr *loader.Registry) error {
+		return redis.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -34,8 +39,8 @@ func testRegistry(t *testing.T) *plugin.Registry {
 
 func build(t *testing.T, cfg string) (source.Source, error) {
 	t.Helper()
-	return plugin.Build(context.Background(), testRegistry(t), source.Kind, "redis",
-		jsontext.Value(cfg), plugin.Deps{Instance: "redis", Log: slog.New(slog.DiscardHandler)})
+	return instances.Build(context.Background(), testRegistry(t), source.Kind, "redis",
+		jsontext.Value(cfg), instances.Deps{Instance: "redis", Log: slog.New(slog.DiscardHandler)})
 }
 
 func config(t *testing.T, addr string) string {
@@ -238,7 +243,7 @@ func TestDumpRefusedPasswordIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("a refused password was not an error")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -252,7 +257,7 @@ func TestDumpConnectionFailureIsTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.Dump(context.Background(), io.Discard)
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -264,7 +269,7 @@ func TestDumpUnreachableIsTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.Dump(context.Background(), io.Discard)
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -328,7 +333,7 @@ func TestCheckPingsWithThePassword(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err != nil {
+	if err := s.(instances.Checker).Check(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	argv := strings.Split(strings.TrimSpace(stubLog(t, "argv")), "\n")
@@ -342,7 +347,7 @@ func TestCheckPingsWithThePassword(t *testing.T) {
 	}
 
 	stubSet(t, "out", "AUTH failed: WRONGPASS")
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a refused password passed Check")
 	}
 }
@@ -353,7 +358,7 @@ func TestCheckWithoutBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "redis-cli") {
 		t.Fatalf("Check = %v, want a missing redis-cli named", err)
 	}
@@ -367,7 +372,7 @@ func TestCheckJudgesTheScratchDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
 		t.Fatalf("Check = %v, want the missing scratch_dir named", err)
 	}
 	file := filepath.Join(t.TempDir(), "not-a-dir")
@@ -378,7 +383,7 @@ func TestCheckJudgesTheScratchDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := notDir.(plugin.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
+	if err := notDir.(instances.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
 		t.Fatalf("Check = %v, want a scratch_dir that is a file refused", err)
 	}
 }
@@ -413,8 +418,8 @@ func slowConfig(t *testing.T, addr string) string {
 func TestNewRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := plugin.Build(ctx, testRegistry(t), source.Kind, "redis",
-		jsontext.Value(config(t, "127.0.0.1:1")), plugin.Deps{Instance: "redis", Log: slog.New(slog.DiscardHandler)})
+	_, err := instances.Build(ctx, testRegistry(t), source.Kind, "redis",
+		jsontext.Value(config(t, "127.0.0.1:1")), instances.Deps{Instance: "redis", Log: slog.New(slog.DiscardHandler)})
 	if err == nil {
 		t.Fatal("New accepted a cancelled context")
 	}
@@ -441,7 +446,7 @@ func TestCheckRespectsCancellation(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := s.(plugin.Checker).Check(ctx); err == nil {
+	if err := s.(instances.Checker).Check(ctx); err == nil {
 		t.Fatal("Check accepted a cancelled context")
 	}
 }
@@ -454,8 +459,8 @@ func TestCheckUnreachableIsTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	err = s.(instances.Checker).Check(context.Background())
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -476,7 +481,7 @@ func TestCheckCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
-	if err := s.(plugin.Checker).Check(ctx); !errors.Is(err, context.Canceled) {
+	if err := s.(instances.Checker).Check(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Check = %v, want context.Canceled", err)
 	}
 }
@@ -495,7 +500,7 @@ func TestCheckFailsWithoutThePasswordFile(t *testing.T) {
 	if err := os.Remove(pass); err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "reading password file") {
 		t.Fatalf("Check = %v, want the missing password file named", err)
 	}
@@ -514,8 +519,8 @@ func TestCheckRefusedPingIsPermanent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	err = s.(instances.Checker).Check(context.Background())
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -571,7 +576,7 @@ func TestDumpScratchDirVanishedIsTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.Dump(context.Background(), io.Discard)
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -589,7 +594,7 @@ func TestDumpRefusesAnEmptySnapshot(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "empty snapshot") {
 		t.Fatalf("Dump = %v, want an empty snapshot refused", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -608,7 +613,7 @@ func TestDumpFailsWhenTheSnapshotVanishes(t *testing.T) {
 	if err == nil {
 		t.Fatal("a snapshot that vanished before it was read was streamed")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }

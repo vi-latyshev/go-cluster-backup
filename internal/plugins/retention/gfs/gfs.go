@@ -1,7 +1,7 @@
 // Package gfs is the retention policy "grandfather-father-son": the newest run
 // of each of the newest N calendar days, each of the newest M ISO weeks and
 // each of the newest K calendar months, plus a floor of the newest runs. It
-// carries no byte budget: the configured cap belongs to the engine, which
+// carries no byte budget: the configured cap belongs to the protection ledger, which
 // partitions runs by kind and applies the cap over every kind at once.
 package gfs
 
@@ -11,9 +11,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/retention"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention"
 )
 
 type Config struct {
@@ -23,38 +22,6 @@ type Config struct {
 	Timezone        string `json:"timezone" doc:"IANA time zone the calendar (days, weeks, months) is read in, e.g. UTC"`
 	MinKeep         int    `json:"min_keep" doc:"floor: the newest this many runs always stay"`
 	CountIncomplete bool   `json:"count_incomplete" required:"true" doc:"runs without a verified manifest occupy retention slots: a period's slot goes to its newest run this build can judge, and to a run it cannot only when the period has no other; false keeps such runs in addition, outside the tiers"`
-}
-
-// Register adds the gfs policy to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, retention.Kind, plugin.Spec[Config, retention.Retention]{
-		Type:      "gfs",
-		Summary:   "keep the newest run per day, week and month",
-		Stability: plugin.Stable,
-		Example:   []byte(`{"daily": 30, "weekly": 12, "monthly": 12, "timezone": "UTC", "min_keep": 1, "count_incomplete": true}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (retention.Retention, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if cfg.Daily < 1 {
-				return nil, fmt.Errorf("daily must be at least 1, got %d", cfg.Daily)
-			}
-			if cfg.Weekly < 0 {
-				return nil, fmt.Errorf("weekly must not be negative, got %d", cfg.Weekly)
-			}
-			if cfg.Monthly < 0 {
-				return nil, fmt.Errorf("monthly must not be negative, got %d", cfg.Monthly)
-			}
-			if cfg.MinKeep < 1 {
-				return nil, fmt.Errorf("min_keep must be at least 1, got %d", cfg.MinKeep)
-			}
-			loc, err := time.LoadLocation(cfg.Timezone)
-			if err != nil {
-				return nil, err
-			}
-			return &Policy{cfg: cfg, loc: loc}, nil
-		},
-	})
 }
 
 type Policy struct {
@@ -141,8 +108,8 @@ func (p *Policy) Decide(ctx context.Context, req retention.DecideRequest) (reten
 	}
 	d := retention.Decided(runs, keep)
 	// The floor is the newest min_keep runs, which the loop above kept: the
-	// engine's cap eviction honours it, so a byte budget never cuts deeper than
-	// the policy itself would. The window mirrors the old byte budget's: an
+	// protection ledger's cap eviction honours it, so a byte budget never cuts deeper than
+	// the policy itself would. The window mirrors the byte budget's: an
 	// unfinished run count_incomplete keeps is outside it.
 	var floorCandidates []model.StoredRun
 	for _, r := range runs {

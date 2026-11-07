@@ -11,7 +11,7 @@ Object names are derived from the release fullname `{{ include "go-cluster-backu
 {{- end }}
   ConfigMap/{{ include "go-cluster-backup.fullname" . }}-config the configuration the tool reads
 {{- if .Values.catalog.create }}
-  ConfigMap/{{ include "go-cluster-backup.catalogName" . }} the run index the tool writes (kept on uninstall)
+  ConfigMap/{{ include "go-cluster-backup.catalogName" . }} the writer lease the tool writes (kept on uninstall)
 {{- end }}
   ServiceAccount/{{ include "go-cluster-backup.serviceAccountName" . }}
 
@@ -69,5 +69,9 @@ EOF
 
 The catalog ConfigMap carries `helm.sh/resource-policy: keep` and no `data`:
 never declare `data` for it in your own manifests, or you will fight the tool
-for the run index.
+for the writer lease.
+
+Upgrading from a release that kept run history in that ConfigMap: delete the
+object once, while no run is live, and let the next upgrade recreate it empty —
+the tool writes nothing there but the lease.
 {{- end }}

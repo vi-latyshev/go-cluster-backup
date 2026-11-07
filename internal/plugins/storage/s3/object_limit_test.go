@@ -1,9 +1,9 @@
 package s3_test
 
 // The endpoint's max_object_bytes must hold for an upload whose final size is
-// not known when it starts: an engine run whose producer keeps writing while
+// not known when it starts: a backup run whose producer keeps writing while
 // parts are already accepted must be refused on the part that crosses the
-// limit. The whole engine is driven here, because "part number and size" is
+// limit. The whole workflow is driven here, because "part number and size" is
 // what the multipart protocol offers the plugin — no call ever sees the final
 // object.
 
@@ -19,11 +19,15 @@ import (
 
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/engine"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keeplast"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/all"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/assembly"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog/catalogtest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/workflow/backup"
 )
 
 const (
@@ -71,6 +75,9 @@ func TestGrowingUploadRespectsObjectLimit(t *testing.T) {
 		growing: true,
 		chunks:  [][]byte{bytes.Repeat([]byte("x"), 6<<20), bytes.Repeat([]byte("y"), 4<<20)},
 	})
+	if len(rep.Artifacts) == 0 {
+		t.Fatalf("no artifacts in the report")
+	}
 	if rep.Artifacts[0].Outcome != model.ArtifactOK {
 		t.Fatalf("a 10 MiB object at the 10 MiB limit: outcome %q, error %q",
 			rep.Artifacts[0].Outcome, rep.Artifacts[0].Error)
@@ -110,6 +117,9 @@ func TestFinishedUploadRespectsObjectLimit(t *testing.T) {
 	rep, f := runControlledSource(t, &controlledSource{
 		chunks: [][]byte{bytes.Repeat([]byte("x"), objectLimit)},
 	})
+	if len(rep.Artifacts) == 0 {
+		t.Fatalf("no artifacts in the report")
+	}
 	if rep.Artifacts[0].Outcome != model.ArtifactOK {
 		t.Fatalf("a 10 MiB object at the 10 MiB limit: outcome %q, error %q",
 			rep.Artifacts[0].Outcome, rep.Artifacts[0].Error)
@@ -135,7 +145,7 @@ func TestFinishedUploadRespectsObjectLimit(t *testing.T) {
 	}
 }
 
-// runControlledSource runs one engine run with the real s3 plugin against the
+// runControlledSource runs one backup run with the real s3 plugin against the
 // fake endpoint, its object limits set to objectLimit/limitPartBytes, and returns the
 // report and the endpoint.
 func runControlledSource(t *testing.T, src *controlledSource) (model.RunReport, *fakeS3Server) {
@@ -162,26 +172,44 @@ func runControlledSource(t *testing.T, src *controlledSource) (model.RunReport, 
 		m["max_request_bytes"] = limitPartBytes
 		m["max_object_bytes"] = objectLimit
 	})
-	r := testRegistry(t)
-	if err := keeplast.Register(r); err != nil {
+	// The compiled distribution registers every plugin the binary runs, hosts and
+	// roles included; the controlled source is one more compiled plugin of this
+	// test distribution.
+	r := instances.NewRegistry()
+	lr := loader.New()
+	if err := all.Compose(lr, r); err != nil {
 		t.Fatal(err)
 	}
-	if err := plugin.Register(r, source.Kind, plugin.Spec[struct{}, source.Source]{
-		Type: "controlled", Example: []byte(`{}`),
-		New: func(context.Context, struct{}, plugin.Deps) (source.Source, error) { return src, nil },
+	if err := loader.Add(lr, loader.Spec{ID: source.Kind.ID("controlled")}, func(lr *loader.Registry) error {
+		return instances.AddFactory(lr, r, source.Kind, instances.FactorySpec[struct{}, source.Source]{
+			Type: "controlled", Example: []byte(`{}`),
+			New: func(context.Context, struct{}, instances.Deps) (source.Source, error) { return src, nil },
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An asynchronous storage is admitted only under a durable writer lease, so
+	// this distribution's catalog is the in-memory record the lease kit shares.
+	if err := loader.Add(lr, loader.Spec{ID: catalog.Kind.ID("test")}, func(lr *loader.Registry) error {
+		return instances.AddFactory(lr, r, catalog.Kind, instances.FactorySpec[struct{}, catalog.Catalog]{
+			Type: "test", Example: []byte(`{}`),
+			New: func(context.Context, struct{}, instances.Deps) (catalog.Catalog, error) {
+				return catalogtest.NewLeaser(), nil
+			},
+		})
 	}); err != nil {
 		t.Fatal(err)
 	}
 	cfg := map[string]any{
-		"version": 1,
 		"run": map[string]any{"spool_dir": t.TempDir(), "spool_reserve_bytes": 0,
-			"max_artifact_bytes": "20MiB", "deadline": "1s", "lease_hard_bound": "2s"},
+			"max_artifact_bytes": "20MiB", "deadline": "10s", "lease_hard_bound": "2s"},
 		"sources": map[string]any{"data": map[string]any{"type": "controlled", "config": map[string]any{},
 			"pipeline": []string{}, "artifact": map[string]any{"group": "g", "name": "n", "sensitivity": "plain", "importance": "required"}}},
 		"storages": map[string]any{"s3": map[string]any{"type": "s3", "config": sc,
-			"max_total_bytes": "100MiB", "time_budget": "1s", "call_parallelism": 1,
+			"max_total_bytes": "100MiB", "time_budget": "10s", "call_parallelism": 1,
 			"retention": map[string]any{"scheduled": map[string]any{"type": "keep_last",
 				"config": map[string]any{"count": 3, "min_keep": 1, "count_incomplete": true}}}}},
+		"catalog": map[string]any{"type": "test", "config": map[string]any{}},
 	}
 	cfg["layout"] = map[string]any{"run_prefix": "runs/{{ .Run.ID }}", "artifact_key": "{{ .Artifact.Group }}/{{ .Artifact.Name }}{{ .Artifact.Ext }}", "manifest_key": "manifest.json", "manual_id_suffix": "-manual"}
 	run := cfg["run"].(map[string]any)
@@ -198,12 +226,13 @@ func runControlledSource(t *testing.T, src *controlledSource) (model.RunReport, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := engine.New(context.Background(), raw, nil, r, slog.New(slog.DiscardHandler))
+	e, err := assembly.New(context.Background(), raw, nil,
+		assembly.Deps{Factories: r, Loader: lr, Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = e.Close() }()
-	rep, err := e.Run(context.Background(), engine.RunRequest{Kind: model.RunKindScheduled})
+	defer func() { _ = e.Close(context.Background()) }()
+	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
 	if err != nil {
 		t.Fatal(err)
 	}

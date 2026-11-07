@@ -3,7 +3,7 @@ package webhook
 import (
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // TestSampleMatrixCoversKindsAndRefusals: every branch a template may take has a
@@ -42,5 +42,28 @@ func TestSampleMatrixCoversKindsAndRefusals(t *testing.T) {
 		if !c.ok {
 			t.Errorf("the sample matrix has no %s", c.name)
 		}
+	}
+}
+
+// TestStartedSamplesCarryNoPrevious: the previous-run record is filled only for
+// the finished event, so a started sample that carried one would let a template
+// pass validation on data no started event ever has. The finished side keeps a
+// filled record, or a template reading it would never be rendered against one.
+func TestStartedSamplesCarryNoPrevious(t *testing.T) {
+	var finishedWithPrevious bool
+	for _, s := range samples() {
+		switch s.ev.Name {
+		case model.EventStarted:
+			if s.ev.Run.Previous != (model.PreviousRun{}) {
+				t.Errorf("%s: a started event carries no previous run, and this sample has %+v", s.name, s.ev.Run.Previous)
+			}
+		case model.EventFinished:
+			if s.ev.Run.Previous != (model.PreviousRun{}) {
+				finishedWithPrevious = true
+			}
+		}
+	}
+	if !finishedWithPrevious {
+		t.Error("no finished sample carries a previous run, so a template reading one is never rendered against it")
 	}
 }

@@ -17,20 +17,25 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/notifier"
-	"github.com/vi-latyshev/go-cluster-backup/internal/notifier/notifiertest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier/notifiertest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier/webhook"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := webhook.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, webhook.Spec, func(lr *loader.Registry) error {
+		return webhook.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -42,8 +47,8 @@ func build(t *testing.T, cfg map[string]any) notifier.Notifier {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := plugin.Build(context.Background(), testRegistry(t), notifier.Kind, "webhook", raw,
-		plugin.Deps{Instance: "webhook", Log: slog.New(slog.DiscardHandler)})
+	n, err := instances.Build(context.Background(), testRegistry(t), notifier.Kind, "webhook", raw,
+		instances.Deps{Instance: "webhook", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,9 +198,9 @@ func TestMaxResponseBytesTakesAUnit(t *testing.T) {
 
 // TestUnsubscribedEventIsSkipped settles the question the brief left open: an
 // event absent from `events` is "not subscribed" — it returns notifier.ErrSkipped
-// without a request, because a notifier is handed every engine event and
+// without a request, because a notifier is handed every run event and
 // refusing the ones it was never told about would fail runs for no reason. The
-// sentinel keeps the skip neutral: it is not a delivery the engine could mistake
+// sentinel keeps the skip neutral: it is not a delivery the run could mistake
 // for one that reached a receiver.
 func TestUnsubscribedEventIsSkipped(t *testing.T) {
 	var requests int
@@ -209,7 +214,7 @@ func TestUnsubscribedEventIsSkipped(t *testing.T) {
 	ev := notifiertest.Event()
 	ev.Name = "run_started"
 	err := n.Notify(context.Background(), ev)
-	if !errors.Is(err, notifier.ErrSkipped) {
+	if !errors.Is(err, notifier.ErrSkipped()) {
 		t.Fatalf("an unsubscribed event returned %v, want notifier.ErrSkipped", err)
 	}
 	if requests != 0 {
@@ -217,21 +222,21 @@ func TestUnsubscribedEventIsSkipped(t *testing.T) {
 	}
 }
 
-// TestStatusClasses pins the classification the engine's retry loop reads.
+// TestStatusClasses pins the classification execution's retry loop reads.
 func TestStatusClasses(t *testing.T) {
 	cases := map[string]struct {
 		status int
-		want   plugin.Class
+		want   pluginerrors.Class
 	}{
 		"accepted 200":     {http.StatusOK, ""},
 		"accepted 202":     {http.StatusAccepted, ""},
-		"rate limited 429": {http.StatusTooManyRequests, plugin.ClassTransient},
-		"server 500":       {http.StatusInternalServerError, plugin.ClassTransient},
-		"server 503":       {http.StatusServiceUnavailable, plugin.ClassTransient},
-		"bad request 400":  {http.StatusBadRequest, plugin.ClassPermanent},
-		"unauthorized 401": {http.StatusUnauthorized, plugin.ClassPermanent},
-		"not found 404":    {http.StatusNotFound, plugin.ClassPermanent},
-		"redirect 302":     {http.StatusFound, plugin.ClassPermanent},
+		"rate limited 429": {http.StatusTooManyRequests, pluginerrors.ClassTransient},
+		"server 500":       {http.StatusInternalServerError, pluginerrors.ClassTransient},
+		"server 503":       {http.StatusServiceUnavailable, pluginerrors.ClassTransient},
+		"bad request 400":  {http.StatusBadRequest, pluginerrors.ClassPermanent},
+		"unauthorized 401": {http.StatusUnauthorized, pluginerrors.ClassPermanent},
+		"not found 404":    {http.StatusNotFound, pluginerrors.ClassPermanent},
+		"redirect 302":     {http.StatusFound, pluginerrors.ClassPermanent},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -249,7 +254,7 @@ func TestStatusClasses(t *testing.T) {
 			if err == nil {
 				t.Fatal("Notify accepted a status outside success_status")
 			}
-			if class, _ := plugin.ClassOf(err); class != tc.want {
+			if class, _ := pluginerrors.ClassOf(err); class != tc.want {
 				t.Errorf("HTTP %d classified %q, want %q", tc.status, class, tc.want)
 			}
 		})
@@ -271,8 +276,8 @@ func TestResponseBodyIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := plugin.Build(context.Background(), testRegistry(t), notifier.Kind, "webhook", raw,
-		plugin.Deps{Instance: "webhook", Log: slog.New(slog.NewTextHandler(&logged, nil))})
+	n, err := instances.Build(context.Background(), testRegistry(t), notifier.Kind, "webhook", raw,
+		instances.Deps{Instance: "webhook", Log: slog.New(slog.NewTextHandler(&logged, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +297,7 @@ func TestResponseBodyIsBounded(t *testing.T) {
 }
 
 // TestTimeoutIsTransient is the timeout path: a receiver slower than the
-// configured budget fails the attempt, and the engine may try again.
+// configured budget fails the attempt, and execution may try again.
 func TestTimeoutIsTransient(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -309,7 +314,7 @@ func TestTimeoutIsTransient(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("Notify took %s, so the configured timeout did not apply", elapsed)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("timeout classified %q, want transient", class)
 	}
 }
@@ -612,8 +617,8 @@ func TestSpanAcrossTemplateLinesIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = plugin.Build(context.Background(), testRegistry(t), notifier.Kind, "webhook", raw,
-		plugin.Deps{Instance: "webhook", Log: slog.New(slog.DiscardHandler)})
+	_, err = instances.Build(context.Background(), testRegistry(t), notifier.Kind, "webhook", raw,
+		instances.Deps{Instance: "webhook", Log: slog.New(slog.DiscardHandler)})
 	if err == nil {
 		t.Fatal("a span the template itself splits across lines was accepted")
 	}
@@ -688,7 +693,7 @@ func TestStatsLineRendersSkippedAndPadded(t *testing.T) {
 
 // TestPayloadSeesTitleLinesTextAndEvent is the payload contract: the four
 // values a body can be built from, with the whole message as one string and the
-// engine event as it arrived.
+// run event as it arrived.
 func TestPayloadSeesTitleLinesTextAndEvent(t *testing.T) {
 	cfg := baseConfig("http://127.0.0.1:1/never")
 	cfg["body_format"] = "text"
@@ -816,7 +821,7 @@ func TestValidateRendersEveryEventOffline(t *testing.T) {
 			events: map[string]string{"run_finished": "Backup {{ .Run.NoSuchField }}"},
 			want:   "NoSuchField",
 		},
-		"an event the engine never sends": {
+		"an event the run never sends": {
 			events: map[string]string{"run_finshed": "Backup {{ .Run.Outcome }}"},
 			want:   "run_finshed",
 		},

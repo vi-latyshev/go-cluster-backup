@@ -3,7 +3,6 @@
 # sqlite datastore and the server token into one sealed artifact; the run then
 # reads that artifact back, discovers file volumes by label, and uploads
 # everything to one S3-compatible endpoint.
-version: 1
 
 run:
   spool_dir: /spool
@@ -11,6 +10,18 @@ run:
   max_artifact_bytes: 3GiB
   deadline: 90m
   lease_hard_bound: 6000s
+
+# The one plugin root: per-type settings shared by every instance of a type.
+# The service's own document defaults every field here; a deployment states only
+# what it changes.
+plugins:
+  config:
+    notifier/webhook:
+      # The receiver's own content type; the method, the body format and the
+      # timeouts are defaults.
+      headers: {Content-Type: application/json}
+      # This receiver answers 202 for an accepted delivery.
+      success_status: [200, 202]
 
 # What the init container produces: the k3s datastore, the integrity check and
 # the server token, sealed before they leave the node.
@@ -94,15 +105,12 @@ notifiers:
     type: webhook
     config:
       url: https://notify.example.com/backup
-      method: POST
-      headers: {Content-Type: application/json}
-      body_format: yaml
-      timeout: 10s
-      success_status: [200, 202]
-      max_response_bytes: 512
       events:
         run_started: |
           🚀 Backup started
+          📦 {{ .Run.RunID }}
+        run_finished: |
+          {{ pick .Run.Outcome "delivered" "✅ Backup completed" "degraded" "⚠️ Backup DEGRADED" "failed" "❌ Backup FAILED" }}
           📦 {{ .Run.RunID }}
           {{ if .Run.Previous.Unfinished }}
           ⚠️ Previous run did not report
@@ -115,9 +123,6 @@ notifiers:
           {{ end }}
           {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}
           {{ end }}
-        run_finished: |
-          {{ pick .Run.Outcome "delivered" "✅ Backup completed" "degraded" "⚠️ Backup DEGRADED" "failed" "❌ Backup FAILED" }}
-          📦 {{ .Run.RunID }}
       payload: |
         title: {{ json .Title }}
         lines:

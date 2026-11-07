@@ -15,9 +15,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 // TestLiveS3 runs the storage conformance suite and one multipart upload
@@ -87,7 +88,7 @@ func TestLiveS3(t *testing.T) {
 			t.Fatal("the s3 storage implements no storage.MultipartUploader")
 		}
 		// The payload lives in a file and every part is sent as a section of it:
-		// the live run must exercise the read path the engine uses, not a reader
+		// the live run must exercise the read path transfer uses, not a reader
 		// that already holds the bytes.
 		body := newPattern(t, 11<<20+7) // three parts: 5 MiB, 5 MiB, 1 MiB + 7
 		spool, err := os.CreateTemp(t.TempDir(), "live-spool-*")
@@ -122,8 +123,8 @@ func TestLiveS3(t *testing.T) {
 			results = append(results, res)
 			offset += size
 		}
-		// One part sent again, the same number with the same bytes: what the
-		// engine's retry of a part does, and what must leave the object whole.
+		// One part sent again, the same number with the same bytes: what
+		// execution's retry of a part does, and what must leave the object whole.
 		resent, err := part(2, 5<<20, 5<<20)
 		if err != nil {
 			t.Fatalf("re-sent part 2: %v", err)
@@ -179,7 +180,7 @@ func TestLiveS3(t *testing.T) {
 		}
 		if _, err := s.Stat(ctx, key); err == nil {
 			t.Errorf("the aborted upload left an object behind")
-		} else if class, _ := plugin.ClassOf(err); class != plugin.ClassNotFound {
+		} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassNotFound {
 			t.Errorf("Stat after abort: class %q, want not_found: %v", class, err)
 		}
 		if err := s.Delete(ctx, key); err != nil {
@@ -224,7 +225,7 @@ func TestLiveS3(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("PutPart: %v", err)
 		}
-		// A cutoff an hour back must leave it: that is the direction the engine
+		// A cutoff an hour back must leave it: that is the direction transfer
 		// leans on so an upload a live run is writing is never taken.
 		left, err := mu.StaleMultipart(ctx, time.Now().Add(-time.Hour))
 		if err != nil {
@@ -236,7 +237,7 @@ func TestLiveS3(t *testing.T) {
 			}
 		}
 		// A cutoff ahead of now makes this upload "old" without waiting a run's
-		// length — the same code path the engine's own cutoff drives.
+		// length — the same code path transfer's own cutoff drives.
 		stale, err := mu.StaleMultipart(ctx, time.Now().Add(time.Minute))
 		if err != nil {
 			t.Fatalf("StaleMultipart: %v", err)
@@ -293,7 +294,7 @@ func TestLiveS3Check(t *testing.T) {
 	region := envOr("S3_LIVE_REGION", "ru-central-1")
 	keyFile := writeSecret(t, keyID)
 	secretFile := writeSecret(t, secret)
-	build := func(t *testing.T, bucket string) plugin.Checker {
+	build := func(t *testing.T, bucket string) instances.Checker {
 		t.Helper()
 		raw := map[string]any{
 			"endpoint":          endpoint,
@@ -310,7 +311,7 @@ func TestLiveS3Check(t *testing.T) {
 			"max_object_bytes":  5 << 40,
 			"request_timeout":   "1m",
 		}
-		c, ok := newStorageFrom(t, raw).(plugin.Checker)
+		c, ok := newStorageFrom(t, raw).(instances.Checker)
 		if !ok {
 			t.Fatal("the s3 storage implements no Check")
 		}
@@ -330,7 +331,7 @@ func TestLiveS3Check(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Check against bucket %s returned success", wrong)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("Check against an absent bucket: class %q, want permanent: %s", class, redact(err))
 	}
 	if !strings.Contains(err.Error(), wrong) {

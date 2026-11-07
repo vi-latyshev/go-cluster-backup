@@ -9,14 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 )
 
-func checkerOf(t *testing.T, s storage.Storage) plugin.Checker {
+func checkerOf(t *testing.T, s storage.Storage) instances.Checker {
 	t.Helper()
-	c, ok := s.(plugin.Checker)
+	c, ok := s.(instances.Checker)
 	if !ok {
 		t.Fatal("the storage implements no Check")
 	}
@@ -69,7 +70,7 @@ func TestCheckRootFileIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Check accepted a root that is a file")
 	}
-	if class := classOf(err); class != plugin.ClassPermanent {
+	if class := classOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("class %q, want permanent (never not_found): %v", class, err)
 	}
 	if !strings.Contains(err.Error(), "app:/cluster-backup") {
@@ -89,7 +90,7 @@ func TestCheckUnreadableAnswerIsTransient(t *testing.T) {
 			s, f := newStorage(t, nil)
 			f.statBody = body
 			err := checkerOf(t, s).Check(context.Background())
-			if class := classOf(err); err == nil || class != plugin.ClassTransient {
+			if class := classOf(err); err == nil || class != pluginerrors.ClassTransient {
 				t.Fatalf("class %q err %v, want transient", class, err)
 			}
 			if got := f.Count("stat"); got != 1 {
@@ -103,7 +104,7 @@ func TestCheckUnauthorizedIsPermanent(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["stat"] = http.StatusUnauthorized
 	err := checkerOf(t, s).Check(context.Background())
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("401: got %v", err)
 	}
 	if got := f.Count("stat"); got != 1 {
@@ -114,7 +115,7 @@ func TestCheckUnauthorizedIsPermanent(t *testing.T) {
 func TestCheckForbiddenIsPermanent(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["stat"] = http.StatusForbidden
-	if err := checkerOf(t, s).Check(context.Background()); err == nil || classOf(err) != plugin.ClassPermanent {
+	if err := checkerOf(t, s).Check(context.Background()); err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("403: got %v", err)
 	}
 }
@@ -123,7 +124,7 @@ func TestCheckServerErrorIsOneAttempt(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["stat"] = http.StatusInternalServerError
 	err := checkerOf(t, s).Check(context.Background())
-	if err == nil || classOf(err) != plugin.ClassTransient {
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("500: got %v", err)
 	}
 	if got := f.Count("stat"); got != 1 {
@@ -139,8 +140,8 @@ func TestCheckRateLimitPassesRetryAfter(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 429 was accepted")
 	}
-	class, after := plugin.ClassOf(err)
-	if class != plugin.ClassTransient || after != 7*time.Second {
+	class, after := pluginerrors.ClassOf(err)
+	if class != pluginerrors.ClassTransient || after != 7*time.Second {
 		t.Errorf("got class %q after %s, want transient after 7s: %v", class, after, err)
 	}
 	if got := f.Count("stat"); got != 1 {
@@ -157,7 +158,7 @@ func TestCheckReadsTokenAtCheckTime(t *testing.T) {
 	raw := baseConfig(t, f)
 	raw["token"] = map[string]any{"file": token}
 	c := checkerOf(t, newStorageFrom(t, raw))
-	if err := c.Check(context.Background()); err == nil || classOf(err) != plugin.ClassPermanent {
+	if err := c.Check(context.Background()); err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("Check with a token file that is not there yet: got %v", err)
 	}
 	if err := os.WriteFile(token, []byte("test-token"), 0o600); err != nil {

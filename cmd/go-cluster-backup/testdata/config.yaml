@@ -9,8 +9,6 @@
 # engine on its own pod template, a claim declares itself as a file volume, the
 # marker takes an object out, and the last rule accounts for every claim no rule
 # claimed. The labels are this file's own — a deployment names its own.
-version: 1
-
 run:
   id_layout: "20060102T150405Z"
   spool_dir: /backup/spool
@@ -83,11 +81,11 @@ discoveries:
       # this file's decision.
       undeclared_volumes: {importance: required}
       pods:
-        # A pod that declares its engine: the engine dumps every database of
+        # A pod that declares its engine: the postgres source dumps every database of
         # the instance (all_databases), each as its own artifact, and the
         # volumes this pod mounts are covered by those dumps — they need no
         # file copy of their own. The instance identity is the artifact name,
-        # so the engine can suffix a unit without ever reading this template
+        # so the planning layer can suffix a unit without ever reading this template
         # per database.
         - name: postgres
           selector: "backup.example/engine=postgres"
@@ -194,7 +192,7 @@ storages:
     type: yandex_disk
     # Retention is keyed by run kind: the scheduled partition never sees a manual
     # run and vice versa, so a manual run never takes a GFS slot. max_total_bytes
-    # is the storage's own cap over every kind, checked by the engine.
+    # is the storage's own cap over every kind, checked by the protection ledger.
     retention:
       scheduled: {type: gfs, config: {daily: 7, weekly: 4, monthly: 0, timezone: UTC, min_keep: 1, count_incomplete: true}}
       manual: {type: keep_last, config: {count: 5, min_keep: 1, count_incomplete: true}}
@@ -250,10 +248,6 @@ catalog:
     request_timeout: 30s
     namespace: backup
     name: backup-catalog
-    key: catalog.json
-    lease_key_suffix: ".lease"
-    max_runs: 60
-    max_history_bytes: 900KB
 
 notifiers:
   ops:
@@ -275,18 +269,6 @@ notifiers:
         run_started: |
           🚀 Backup started
           📦 {{ .Run.RunID }}
-          {{ if .Run.Previous.Unfinished }}
-          ⚠️ Previous run did not report
-          🕐 Last success: {{ date .Run.Previous.LastGoodAt }}
-          {{ end }}
-          {{ with .Run.Previous.Failure }}
-          ⚠️ Previous run failed before it reported: {{ .Reason }}
-          {{ range .Containers }}{{ if .Terminated }}✗ {{ .Container }}: {{ .Terminated.Reason }} (exit {{ .Terminated.ExitCode }}) {{ clip 160 .Terminated.Message }}
-          {{ else if .Waiting }}✗ {{ .Container }}: {{ .Waiting }}
-          {{ end }}{{ end }}
-          {{ end }}
-          {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}
-          {{ end }}
         # The finished message is the report: one line per artifact — with what
         # its source left out or padded, when it left anything, so a tree that
         # changed under the read is visible where the operator looks — one line
@@ -307,6 +289,18 @@ notifiers:
           {{ range .Run.Excluded }}{{ if eq .Kind "ignored" }}
           🚫 ignored {{ .Name }}: {{ .Reason }}
           {{ end }}{{ end }}
+          {{ if .Run.Previous.Unfinished }}
+          ⚠️ Previous run did not report
+          🕐 Last success: {{ date .Run.Previous.LastGoodAt }}
+          {{ end }}
+          {{ with .Run.Previous.Failure }}
+          ⚠️ Previous run failed before it reported: {{ .Reason }}
+          {{ range .Containers }}{{ if .Terminated }}✗ {{ .Container }}: {{ .Terminated.Reason }} (exit {{ .Terminated.ExitCode }}) {{ clip 160 .Terminated.Message }}
+          {{ else if .Waiting }}✗ {{ .Container }}: {{ .Waiting }}
+          {{ end }}{{ end }}
+          {{ end }}
+          {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}
+          {{ end }}
       # One body template for every event, in this receiver's own shape: a title
       # and a list of lines, each line's text and its monospace part. The keys
       # are the receiver's, so they live here and nowhere in the plugin.

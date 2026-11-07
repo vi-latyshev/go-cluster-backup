@@ -15,17 +15,22 @@ import (
 	json "encoding/json/v2"
 
 	agecrypto "filippo.io/age"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor/age"
-	"github.com/vi-latyshev/go-cluster-backup/internal/processor"
-	"github.com/vi-latyshev/go-cluster-backup/internal/processor/processortest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor/processortest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := age.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, age.Spec, func(lr *loader.Registry) error {
+		return age.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -56,8 +61,8 @@ func build(t *testing.T, recipients []string, identityFile string) processor.Pro
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := plugin.Build(context.Background(), testRegistry(t), processor.Kind, "age", raw,
-		plugin.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
+	p, err := instances.Build(context.Background(), testRegistry(t), processor.Kind, "age", raw,
+		instances.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +97,7 @@ func TestSealsAndExt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !traits.Seals {
-		t.Error("Describe does not declare Seals: the engine's secret-artifact rule depends on it")
+		t.Error("Describe does not declare Seals: the secret-artifact rule depends on it")
 	}
 	if traits.Ext != ".age" {
 		t.Errorf("Ext is %q, want .age", traits.Ext)
@@ -172,7 +177,7 @@ func TestWrongIdentityIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Decode with the wrong identity succeeded")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("wrong identity is %q, want permanent: another attempt with the same key cannot succeed", class)
 	}
 	// The failure must not leak key material.
@@ -197,7 +202,7 @@ func TestTruncatedCiphertext(t *testing.T) {
 	if err == nil {
 		t.Fatal("Decode accepted a truncated ciphertext")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("truncated ciphertext is %q, want permanent: the same bytes cannot decode on a retry", class)
 	}
 }
@@ -212,8 +217,8 @@ func TestIdentityErrorOmitsKeyMaterial(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := jsontext.Value(`{"recipients": ["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"], "identities": [{"file": "` + path + `"}]}`)
-	p, err := plugin.Build(context.Background(), testRegistry(t), processor.Kind, "age", raw,
-		plugin.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
+	p, err := instances.Build(context.Background(), testRegistry(t), processor.Kind, "age", raw,
+		instances.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatalf("construction must not touch the filesystem, so it may not fail here: %v", err)
 	}
@@ -235,8 +240,8 @@ func TestIdentityErrorOmitsKeyMaterial(t *testing.T) {
 
 func TestMissingIdentityFile(t *testing.T) {
 	raw := jsontext.Value(`{"recipients": [], "identities": [{"file": "/nonexistent/identity.txt"}]}`)
-	p, err := plugin.Build(context.Background(), testRegistry(t), processor.Kind, "age", raw,
-		plugin.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
+	p, err := instances.Build(context.Background(), testRegistry(t), processor.Kind, "age", raw,
+		instances.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +249,7 @@ func TestMissingIdentityFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("a missing identity file passed the restore-side check")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("missing identity file is %q, want permanent", class)
 	}
 	// And a decode attempted without a preflight fails just as loudly.
@@ -274,9 +279,9 @@ func TestConfigValidation(t *testing.T) {
 // refused before the processor exists, so `validate` never has to build one to
 // report it.
 func TestBuildRefusesAMalformedRecipient(t *testing.T) {
-	_, err := plugin.Build(context.Background(), testRegistry(t), processor.Kind, "age",
+	_, err := instances.Build(context.Background(), testRegistry(t), processor.Kind, "age",
 		jsontext.Value(`{"recipients": ["not-a-key"], "identities": []}`),
-		plugin.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
+		instances.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
 	if err == nil {
 		t.Fatal("a malformed recipient was accepted")
 	}
@@ -290,9 +295,9 @@ func TestBuildRefusesAMalformedRecipient(t *testing.T) {
 func TestBuildReturnsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := plugin.Build(ctx, testRegistry(t), processor.Kind, "age",
+	_, err := instances.Build(ctx, testRegistry(t), processor.Kind, "age",
 		jsontext.Value(`{"recipients": ["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"], "identities": []}`),
-		plugin.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
+		instances.Deps{Instance: "age", Log: slog.New(slog.DiscardHandler)})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Build with a cancelled context returned %v, want context.Canceled", err)
 	}
@@ -315,7 +320,7 @@ func TestCheckEncode(t *testing.T) {
 	if err == nil {
 		t.Fatal("CheckEncode passed an instance with no recipients")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("no recipients is %q, want permanent", class)
 	}
 	cancelled, cancel := context.WithCancel(ctx)
@@ -441,7 +446,7 @@ func TestEncodeCloseErrorIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Encode reported success although the destination refused the final write")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("a failing destination is %q, want permanent", class)
 	}
 }

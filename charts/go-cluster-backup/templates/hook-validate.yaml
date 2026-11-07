@@ -70,7 +70,7 @@ spec:
           image: {{ include "go-cluster-backup.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           terminationMessagePolicy: FallbackToLogsOnError
-          args: ["validate", "--config", {{ include "go-cluster-backup.configPath" . | quote }}]
+          args: ["validate", "--config", {{ include "go-cluster-backup.configPath" . | quote }}, "--termination-grace-seconds", {{ .Values.terminationGracePeriodSeconds | quote }}]
           securityContext:
             {{- toYaml .Values.hooks.securityContext | nindent 12 }}
           resources:

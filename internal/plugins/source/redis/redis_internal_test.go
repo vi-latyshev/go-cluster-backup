@@ -13,8 +13,9 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // internalSource builds a redis source against a redis-cli that writes an RDB
@@ -55,12 +56,15 @@ done
 	}
 	raw := fmt.Sprintf(`{"address": %q, "password": {"file": %q}, "scratch_dir": %q, "connect_attempts": 2, "connect_interval": "20ms"}`,
 		l.Addr().String(), pass, t.TempDir())
-	r := plugin.NewRegistry()
-	if err := Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, Spec, func(lr *loader.Registry) error {
+		return Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := plugin.Build(context.Background(), r, source.Kind, "redis", jsontext.Value(raw),
-		plugin.Deps{Instance: "redis", Log: slog.New(slog.DiscardHandler)})
+	s, err := instances.Build(context.Background(), r, source.Kind, "redis", jsontext.Value(raw),
+		instances.Deps{Instance: "redis", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}

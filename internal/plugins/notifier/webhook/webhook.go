@@ -1,5 +1,5 @@
 // Package webhook is the notifier plugin that delivers an HTTP request per
-// engine event. Both texts it sends are the config file's own: a plain-text
+// run event. Both texts it sends are the config file's own: a plain-text
 // message template per event (see message.go) and one payload template for
 // every event, which turns that message into whatever body a receiver takes.
 // This package knows no receiver and ships no message, so an endpoint taking a
@@ -22,12 +22,12 @@ import (
 
 	json "encoding/json/v2"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/notifier"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier"
 )
 
 const maxBodyBytes = 1 << 20
@@ -66,15 +66,15 @@ type Config struct {
 	// Events is the message of every event this notifier delivers, keyed by
 	// event name. An event with no entry here is "not subscribed": Notify
 	// returns notifier.ErrSkipped without a request, because a notifier is handed
-	// every engine event and refusing the ones it was never told about would fail
-	// runs for no reason — and the engine counts the skip as neither a failure
+	// every run event and refusing the ones it was never told about would fail
+	// runs for no reason — and the run counts the skip as neither a failure
 	// nor a delivery.
-	Events map[string]plugin.Template `json:"events" required:"true" doc:"the message of every event this notifier delivers, keyed by event name; an event with no entry here is not subscribed. The template is plain text: its first rendered line is the title, a line that renders empty is dropped, and a pair of markup backticks marks a line's monospace part"`
+	Events map[string]configuration.Template `json:"events" required:"true" doc:"the message of every event this notifier delivers, keyed by event name; an event with no entry here is not subscribed. The template is plain text: its first rendered line is the title, a line that renders empty is dropped, and a pair of markup backticks marks a line's monospace part"`
 	// Payload is one body template for every event, executed with .Title, .Lines
 	// (each .Text and .Code), .Text (the whole message) and .Event (the event as
-	// the engine sent it). The receiver's own key names live here and nowhere
+	// the run sent it). The receiver's own key names live here and nowhere
 	// else.
-	Payload plugin.Template `json:"payload" required:"true" doc:"one request body template for every event, executed with .Title, .Lines (each .Text and .Code), .Text (the whole message, title included) and .Event (the engine event); whatever keys the receiver takes are written here"`
+	Payload configuration.Template `json:"payload" required:"true" doc:"one request body template for every event, executed with .Title, .Lines (each .Text and .Code), .Text (the whole message, title included) and .Event (the run event); whatever keys the receiver takes are written here"`
 }
 
 // readFailure is the diagnosis of a response body that could not be read: the
@@ -84,15 +84,15 @@ func readFailure(ctx context.Context, event string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return plugin.Transient(fmt.Errorf("reading the %s response: the receiver's answer could not be read", event))
+	return pluginerrors.Transient(fmt.Errorf("reading the %s response: the receiver's answer could not be read", event))
 }
 
-// eventNames is every event the engine delivers, in the order a refusal names
+// eventNames is every event the run delivers, in the order a refusal names
 // them: a key of `events` outside this list is a message the notifier would
 // wait for forever.
 var eventNames = []string{model.EventStarted, model.EventFinished}
 
-var _ plugin.Validator = Config{}
+var _ configuration.Validator = Config{}
 
 // Validate checks what a configuration can be refused for offline: the
 // endpoint, the mechanics, and every template rendered against the built-in
@@ -141,7 +141,7 @@ func (c Config) Validate() error {
 	}
 	for _, name := range slices.Sorted(maps.Keys(c.Events)) {
 		if !slices.Contains(eventNames, name) {
-			errs = append(errs, fmt.Errorf("events/%s: the engine delivers %s, and a key naming no event it sends is a message nobody ever receives",
+			errs = append(errs, fmt.Errorf("events/%s: the run delivers %s, and a key naming no event it sends is a message nobody ever receives",
 				name, strings.Join(eventNames, " and ")))
 		}
 		event, err := newMessage(name, c.Events[name])
@@ -212,51 +212,6 @@ func (c Config) body(msg Message, ev model.Event) ([]byte, error) {
 	return nil, fmt.Errorf("body_format %q is not %s or %s", c.BodyFormat, formatYAML, formatText)
 }
 
-// Register adds the webhook notifier to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, notifier.Kind, plugin.Spec[Config, notifier.Notifier]{
-		Type:      "webhook",
-		Summary:   "posts an event to an HTTP endpoint: the message text and the request body are the config file's own templates",
-		Stability: plugin.Stable,
-		Example: []byte(`{"url": "https://notify.example.com/backup", ` +
-			`"method": "POST", "headers": {"Content-Type": "application/json"}, "body_format": "yaml", ` +
-			`"timeout": "10s", "success_status": [200, 202], "max_response_bytes": 512, ` +
-			`"events": {"run_finished": "{{ pick .Run.Outcome \"delivered\" \"Backup completed\" \"degraded\" \"Backup DEGRADED\" \"failed\" \"Backup FAILED\" }}\n` +
-			"⏱ `{{ .Run.RunID }}`\"}, " +
-			`"payload": "title: {{ json .Title }}\nlines:\n{{ range .Lines }}\n  - {text: {{ json .Text }}, mono: {{ json .Code }}}\n{{ end }}"}`),
-		New: func(ctx context.Context, cfg Config, deps plugin.Deps) (notifier.Notifier, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			// The config was validated once already: plugin.Decode runs
-			// Validate before this constructor is reached, and a config it
-			// refuses never gets here.
-			accepted := make(map[int]bool, len(cfg.SuccessStatus))
-			for _, code := range cfg.SuccessStatus {
-				accepted[code] = true
-			}
-			events := make(map[string]*eventMessage, len(cfg.Events))
-			for name, tmpl := range cfg.Events {
-				// Validate parsed every subscribed message already, with the
-				// same function set, so parsing it here cannot fail.
-				events[name] = must.Do(newMessage(name, tmpl))
-			}
-			client := &http.Client{
-				Timeout: cfg.Timeout.Std(),
-				// A receiver answering 3xx is a misconfigured endpoint: the
-				// body is not re-posted to wherever a Location header points.
-				// ErrUseLastResponse hands the 3xx back as an ordinary
-				// response, so it falls into the status classification below
-				// instead of looking like a transport failure.
-				CheckRedirect: func(*http.Request, []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-			}
-			return &Notifier{cfg: cfg, accepted: accepted, events: events, client: client, log: deps.Log}, nil
-		},
-	})
-}
-
 type Notifier struct {
 	cfg      Config
 	accepted map[int]bool
@@ -275,8 +230,8 @@ func (n *Notifier) Close() error {
 
 // Notify renders the message of one event and the body built from it, and posts
 // it once. An event with no entry in `events` is not subscribed: it is skipped
-// and returns notifier.ErrSkipped, which the engine counts as neither a failure
-// nor a delivery. Errors are classified for the engine's retry loop: 429 and
+// and returns notifier.ErrSkipped, which the run counts as neither a failure
+// nor a delivery. Errors are classified for execution's retry loop: 429 and
 // every 5xx are transient; any other unexpected status, an unrenderable message
 // and a body its format refuses are permanent.
 func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
@@ -286,7 +241,7 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 	event, subscribed := n.events[ev.Name]
 	if !subscribed {
 		n.log.Debug("event is not subscribed by this notifier", "event", ev.Name)
-		return notifier.ErrSkipped
+		return notifier.ErrSkipped()
 	}
 	// ONE cleaned copy, passed to both templates. Cleaning inside render alone
 	// left the payload's `.Event` unclean, so a payload that serializes the
@@ -295,11 +250,11 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 	ev = cleanEvent(ev)
 	msg, err := event.render(ev)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	body, err := n.cfg.body(msg, ev)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("events/%s: %w", ev.Name, err))
+		return pluginerrors.Permanent(fmt.Errorf("events/%s: %w", ev.Name, err))
 	}
 	req, err := http.NewRequestWithContext(ctx, n.cfg.Method, n.cfg.URL, bytes.NewReader(body))
 	if err != nil {
@@ -307,7 +262,7 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 		// endpoint — a credential in the path or query for the receivers this
 		// plugin exists for. The delivery error carries the stage and the
 		// event, never a cause.
-		return plugin.Permanent(fmt.Errorf("building the %s request: the configured endpoint cannot be used", ev.Name))
+		return pluginerrors.Permanent(fmt.Errorf("building the %s request: the configured endpoint cannot be used", ev.Name))
 	}
 	for name, value := range n.cfg.Headers {
 		req.Header.Set(name, value)
@@ -322,9 +277,9 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 		// a timeout is the one word errors.As can name without it.
 		var nerr net.Error
 		if errors.As(err, &nerr) && nerr.Timeout() {
-			return plugin.Transient(fmt.Errorf("posting %s: timed out", ev.Name))
+			return pluginerrors.Transient(fmt.Errorf("posting %s: timed out", ev.Name))
 		}
-		return plugin.Transient(fmt.Errorf("posting %s: the receiver did not answer", ev.Name))
+		return pluginerrors.Transient(fmt.Errorf("posting %s: the receiver did not answer", ev.Name))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, n.cfg.MaxResponseBytes.Int64())); err != nil {
@@ -338,7 +293,7 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 	}
 	err = fmt.Errorf("posted %s: HTTP %d", ev.Name, resp.StatusCode)
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
-	return plugin.Permanent(err)
+	return pluginerrors.Permanent(err)
 }

@@ -12,10 +12,11 @@ import (
 	"io"
 
 	"github.com/klauspost/compress/zstd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/processor"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor"
 )
 
 // Config carries every knob of this processor. There is no default: the
@@ -45,8 +46,8 @@ type Config struct {
 	DecodeWindowBytes model.ByteSize `json:"decode_window_bytes" required:"true" doc:"maximum window a frame may carry for this instance to decode it, a power of two between 1024 and 536870912; must be at least the largest window_bytes used by any run still in retention"`
 }
 
-// Config implements plugin.Validator through Validate.
-var _ plugin.Validator = Config{}
+// Config implements configuration.Validator through Validate.
+var _ configuration.Validator = Config{}
 
 func (c Config) Validate() error {
 	if ok, _ := zstd.EncoderLevelFromString(c.Level); !ok {
@@ -68,26 +69,6 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
-}
-
-// Register adds the zstd processor to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, processor.Kind, plugin.Spec[Config, processor.Processor]{
-		Type:      "zstd",
-		Summary:   "zstd frame compression, streaming, with the window and concurrency from the config",
-		Stability: plugin.Stable,
-		Example:   []byte(`{"level": "better", "concurrency": 1, "window_bytes": 67108864, "decode_window_bytes": 134217728}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (processor.Processor, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			// Decode ran Config.Validate before New: the level, the
-			// concurrency and both windows are already admitted, and a breach
-			// of that claim is a panic, not a config error this call can see.
-			must.Do(cfg, cfg.Validate())
-			return &Processor{cfg: cfg}, nil
-		},
-	})
 }
 
 type Processor struct {
@@ -113,9 +94,9 @@ func (p *Processor) Encode(ctx context.Context, dst io.Writer, src io.Reader) er
 		zstd.WithWindowSize(int(p.cfg.WindowBytes)),
 	)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("zstd encoder: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("zstd encoder: %w", err))
 	}
-	_, copyErr := plugin.CopyContext(ctx, enc, src)
+	_, copyErr := pluginio.CopyContext(ctx, enc, src)
 	// The encoder buffers, so its flush is where a failing writer usually
 	// first shows up: Close must run on the error path too, and its error
 	// must not be discarded, or a broken destination reads as success.
@@ -124,7 +105,7 @@ func (p *Processor) Encode(ctx context.Context, dst io.Writer, src io.Reader) er
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(fmt.Errorf("zstd encode: %w", errors.Join(copyErr, closeErr)))
+		return pluginerrors.Transient(fmt.Errorf("zstd encode: %w", errors.Join(copyErr, closeErr)))
 	}
 	return nil
 }
@@ -146,15 +127,15 @@ func (p *Processor) Decode(ctx context.Context, dst io.Writer, src io.Reader) er
 		zstd.WithDecoderConcurrency(p.cfg.Concurrency),
 	)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("zstd decoder: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("zstd decoder: %w", err))
 	}
 	defer dec.Close()
-	if _, err := plugin.CopyContext(ctx, dst, dec); err != nil {
+	if _, err := pluginio.CopyContext(ctx, dst, dec); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if errors.Is(err, zstd.ErrWindowSizeExceeded) {
-			return plugin.Permanent(fmt.Errorf(
+			return pluginerrors.Permanent(fmt.Errorf(
 				"zstd decode: the frame needs a window larger than decode_window_bytes=%d (%s); raise it to at least the window_bytes this run was written with",
 				p.cfg.DecodeWindowBytes.Int64(), frameWindow(header)))
 		}

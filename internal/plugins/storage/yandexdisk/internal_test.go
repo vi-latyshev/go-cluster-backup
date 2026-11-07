@@ -18,8 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 func TestRetryAfterHint(t *testing.T) {
@@ -51,27 +52,27 @@ func TestRetryAfterHint(t *testing.T) {
 func TestClassifyAPIMapsEveryAnswer(t *testing.T) {
 	cases := []struct {
 		status int
-		class  plugin.Class
+		class  pluginerrors.Class
 	}{
-		{http.StatusUnauthorized, plugin.ClassPermanent},
-		{http.StatusForbidden, plugin.ClassPermanent},
-		{http.StatusInsufficientStorage, plugin.ClassPermanent},
-		{http.StatusLocked, plugin.ClassPermanent},
-		{http.StatusTooManyRequests, plugin.ClassTransient},
-		{http.StatusInternalServerError, plugin.ClassTransient},
-		{http.StatusBadRequest, plugin.ClassPermanent},
+		{http.StatusUnauthorized, pluginerrors.ClassPermanent},
+		{http.StatusForbidden, pluginerrors.ClassPermanent},
+		{http.StatusInsufficientStorage, pluginerrors.ClassPermanent},
+		{http.StatusLocked, pluginerrors.ClassPermanent},
+		{http.StatusTooManyRequests, pluginerrors.ClassTransient},
+		{http.StatusInternalServerError, pluginerrors.ClassTransient},
+		{http.StatusBadRequest, pluginerrors.ClassPermanent},
 	}
 	for _, tc := range cases {
 		err := classifyAPI(apiResponse{status: tc.status, header: http.Header{}, body: []byte(`{"message":"m"}`)}, "op")
-		class, _ := plugin.ClassOf(err)
+		class, _ := pluginerrors.ClassOf(err)
 		if class != tc.class {
 			t.Errorf("HTTP %d: class %q, want %q (%v)", tc.status, class, tc.class, err)
 		}
 	}
 	h := http.Header{}
 	h.Set("Retry-After", "5")
-	class, after := plugin.ClassOf(classifyAPI(apiResponse{status: http.StatusTooManyRequests, header: h}, "op"))
-	if class != plugin.ClassTransient || after != 5*time.Second {
+	class, after := pluginerrors.ClassOf(classifyAPI(apiResponse{status: http.StatusTooManyRequests, header: h}, "op"))
+	if class != pluginerrors.ClassTransient || after != 5*time.Second {
 		t.Errorf("429 with a hint: class %q after %s", class, after)
 	}
 }
@@ -84,7 +85,7 @@ func TestTransportErrorKeepsTheContextAndHidesTheHref(t *testing.T) {
 	}
 	uerr := &url.Error{Op: "PUT", URL: "http://host/up/secret-token", Err: errors.New("connection refused")}
 	err := transportError(context.Background(), uerr, "upload data")
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 	if strings.Contains(err.Error(), "secret-token") {
@@ -141,7 +142,7 @@ func TestMkdirAllGuardsItsPath(t *testing.T) {
 	if err == nil {
 		t.Fatal("a folder outside the application folder was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("class %q, want permanent", class)
 	}
 	if err := s.mkdirAll(context.Background(), "app:/"); err != nil {
@@ -175,18 +176,66 @@ func (shortBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// TestConfineRejectsCursorsOutsideTheListingScope covers the guard every walk
+// cursor passes before a request: a negative offset, a folder outside the root,
+// and a folder beside the prefix are refused by cause, while the root above the
+// prefix, the prefix folder and a folder below it are accepted.
+func TestConfineRejectsCursorsOutsideTheListingScope(t *testing.T) {
+	const (
+		root   = "app:/cluster-backup"
+		prefix = "app:/cluster-backup/runs/"
+	)
+	s := &Storage{root: root}
+	refused := []struct {
+		name   string
+		cursor listCursor
+		want   string
+	}{
+		{"negative offset", listCursor{Dir: root, Offset: -1}, "offset -1 is negative"},
+		{"outside the root", listCursor{Dir: "app:/Backups"}, "outside the root"},
+		{"beside the prefix", listCursor{Dir: root + "/other"}, "outside the prefix"},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			err := s.confine(tc.cursor, prefix)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("confine(%+v) = %v, want a refusal naming %q", tc.cursor, err, tc.want)
+			}
+		})
+	}
+	for _, cursor := range []listCursor{{Dir: root}, {Dir: root + "/runs"}, {Dir: root + "/runs/2026/x"}} {
+		if err := s.confine(cursor, prefix); err != nil {
+			t.Errorf("confine(%+v) refused a cursor on the prefix path: %v", cursor, err)
+		}
+	}
+}
+
+// TestFetchPageRefusesAForgedCursorBeforeAnyRequest: the walk library treats a
+// cursor as opaque, so the adapter checks every cursor it is handed — even one
+// it did not produce — before naming a path in a request.
+func TestFetchPageRefusesAForgedCursorBeforeAnyRequest(t *testing.T) {
+	s := &Storage{root: "app:/cluster-backup", parallelism: 1}
+	_, err := s.fetchPage(context.Background(), listCursor{Dir: "app:/Backups"}, "app:/cluster-backup/runs/")
+	if err == nil || !strings.Contains(err.Error(), "outside the root") {
+		t.Fatalf("fetchPage with a forged cursor = %v, want the root refusal", err)
+	}
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Errorf("class %q, want permanent", class)
+	}
+}
+
 func TestGetRejectsABodyShorterThanItsDeclaredLength(t *testing.T) {
 	token := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(token, []byte("test-token"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s, err := newStorage(Config{
-		APIURL: "https://cloud-api.example/v1/disk", Token: plugin.Secret{File: token},
+	s, err := open(Config{
+		APIURL: "https://cloud-api.example/v1/disk", Token: configuration.Secret{File: token},
 		Root: "app:/cluster-backup", PermanentDelete: true,
 		RequestTimeout:     model.Duration(time.Second),
 		CommitPollInterval: model.Duration(time.Second),
 		CommitPollTimeout:  model.Duration(time.Second),
-	}, nil)
+	}, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +244,7 @@ func TestGetRejectsABodyShorterThanItsDeclaredLength(t *testing.T) {
 	if err == nil {
 		t.Fatal("a download shorter than its declared length was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 }

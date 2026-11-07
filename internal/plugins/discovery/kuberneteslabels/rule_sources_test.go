@@ -1,47 +1,36 @@
 package kuberneteslabels_test
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery/kuberneteslabels"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
-func builtReporter(t *testing.T) discovery.RuleSourceReporter {
+// exampleConfig is the reference config this factory registers, read from the
+// compiled descriptor: the hook runs on exactly the bytes a deployment starts
+// from.
+func exampleConfig(t *testing.T) jsontext.Value {
 	t.Helper()
-	r := registry(t)
-	var example []byte
-	for _, d := range r.Descriptors() {
+	for _, d := range registry(t).Descriptors() {
 		if d.Type == "kubernetes_labels" {
-			example = d.Example
+			return d.Example
 		}
 	}
-	if example == nil {
-		t.Fatal("kubernetes_labels registered no example")
-	}
-	inst, err := plugin.Build(context.Background(), r, discovery.Kind, "kubernetes_labels",
-		jsontext.Value(example), plugin.Deps{Instance: "workloads"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	reporter, ok := inst.(discovery.RuleSourceReporter)
-	if !ok {
-		t.Fatal("kubernetes_labels does not expose its rules")
-	}
-	return reporter
+	t.Fatal("kubernetes_labels registered no example")
+	return nil
 }
 
-// TestRuleSourcesExposeEveryRule: the discovery hands offline validation each
+// TestRuleSourcesExposeEveryRule: the pure hook hands offline validation each
 // rule as the file spells it — paths, source type, the unrendered config, the
-// routing — without touching a cluster.
+// routing — from raw bytes, with no discovery built and no cluster touched.
 func TestRuleSourcesExposeEveryRule(t *testing.T) {
-	rules, err := builtReporter(t).RuleSources(context.Background())
+	rules, err := kuberneteslabels.RuleSources(exampleConfig(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,10 +83,29 @@ func TestRuleSourcesExposeEveryRule(t *testing.T) {
 	}
 }
 
-func TestRuleSourcesReturnOnCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := builtReporter(t).RuleSources(ctx); err == nil {
-		t.Fatal("RuleSources ignored a cancelled context")
+// TestRuleSourcesRefuseMalformedConfig: the hook reads raw bytes, so bytes that
+// are not this plugin's config are refused by the strict decoder instead of
+// yielding a partial rule set.
+func TestRuleSourcesRefuseMalformedConfig(t *testing.T) {
+	if _, err := kuberneteslabels.RuleSources(jsontext.Value(`{"pods": []}`)); err == nil {
+		t.Fatal("RuleSources accepted a config missing every required field")
+	}
+	if _, err := kuberneteslabels.RuleSources(jsontext.Value(`{`)); err == nil {
+		t.Fatal("RuleSources accepted bytes that are not JSON")
+	}
+}
+
+// TestRuleSourcesThroughTheConfigurationSchema: a discovery declared in the one
+// config document reaches the merge and offline validation with no plugin
+// constructed and no cluster touched.
+func TestRuleSourcesThroughTheConfigurationSchema(t *testing.T) {
+	rules, errs := configuration.ExtractRules(registry(t), map[string]configuration.Instance{
+		"workloads": {Type: "kubernetes_labels", Config: exampleConfig(t)},
+	})
+	if len(errs) != 0 {
+		t.Fatalf("ExtractRules = %v, want no failures", errs)
+	}
+	if got := len(rules["workloads"]); got != 4 {
+		t.Fatalf("ExtractRules read %d rules, want 4: %+v", got, rules["workloads"])
 	}
 }

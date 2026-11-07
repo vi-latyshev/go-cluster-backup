@@ -8,8 +8,8 @@ import (
 
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // unitsConfigPath is the enumeration config pointed at a password file the
@@ -135,7 +135,7 @@ func TestUnitsLeavesOutTheExcluded(t *testing.T) {
 }
 
 // TestUnitsSingleDatabaseIsOneArtifact: with all_databases false the instance is
-// what it always was — one artifact — and the engine reads exactly that.
+// what it always was — one artifact — and the planning layer reads exactly that.
 func TestUnitsSingleDatabaseIsOneArtifact(t *testing.T) {
 	stubs(t, "pg_dump", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
@@ -148,7 +148,7 @@ func TestUnitsSingleDatabaseIsOneArtifact(t *testing.T) {
 }
 
 // TestUnitsRefusals: every way an enumeration fails is classified, so the
-// engine's retry policy can decide — a server that is not answering is worth
+// the execution retry policy can decide — a server that is not answering is worth
 // another attempt, a refused credential, an impossible artifact name and a
 // password file that cannot be read are not.
 func TestUnitsRefusals(t *testing.T) {
@@ -157,7 +157,7 @@ func TestUnitsRefusals(t *testing.T) {
 		setup     func(*testing.T)
 		config    func(*testing.T) string
 		want      string
-		wantClass plugin.Class
+		wantClass pluginerrors.Class
 		// wantUnits is the whole enumeration: set when the call succeeds, and
 		// the exact names are the assertion.
 		wantUnits []string
@@ -170,7 +170,7 @@ func TestUnitsRefusals(t *testing.T) {
 			config: func(t *testing.T) string { return unitsConfig(t, listener(t), "app", "postgres") },
 			want:   "holds no database to dump",
 			// The server answered; another attempt answers the same way.
-			wantClass: plugin.ClassPermanent,
+			wantClass: pluginerrors.ClassPermanent,
 		},
 		{
 			name: "an empty answer",
@@ -179,10 +179,10 @@ func TestUnitsRefusals(t *testing.T) {
 			},
 			config:    func(t *testing.T) string { return unitsConfig(t, listener(t)) },
 			want:      "holds no database to dump",
-			wantClass: plugin.ClassPermanent,
+			wantClass: pluginerrors.ClassPermanent,
 		},
 		{
-			// The name is the server's: this plugin reports it, and the engine
+			// The name is the server's: this plugin reports it, and the planning layer
 			// refuses it as that database's own failed artifact.
 			name: "a name that cannot be an artifact",
 			setup: func(t *testing.T) {
@@ -199,20 +199,20 @@ func TestUnitsRefusals(t *testing.T) {
 			},
 			config:    func(t *testing.T) string { return unitsConfig(t, listener(t)) },
 			want:      "password authentication failed",
-			wantClass: plugin.ClassPermanent,
+			wantClass: pluginerrors.ClassPermanent,
 		},
 		{
 			name:      "the server is not answering",
 			setup:     func(t *testing.T) {},
 			config:    func(t *testing.T) string { return unitsConfig(t, "127.0.0.1:1") },
 			want:      "connection refused",
-			wantClass: plugin.ClassTransient,
+			wantClass: pluginerrors.ClassTransient,
 		},
 		{
 			name:      "the password file cannot be read",
 			setup:     func(t *testing.T) {},
 			config:    func(t *testing.T) string { return unitsConfigPath(t, listener(t), "/nonexistent/nope/password") },
-			wantClass: plugin.ClassPermanent,
+			wantClass: pluginerrors.ClassPermanent,
 		},
 	}
 	for _, tc := range cases {
@@ -225,7 +225,7 @@ func TestUnitsRefusals(t *testing.T) {
 			}
 			units, err := enumerator(t, s).Units(context.Background())
 			if tc.wantUnits != nil {
-				// A name the engine cannot use still leaves the enumeration whole:
+				// A name the planning layer cannot use still leaves the enumeration whole:
 				// the names are the server's and are handed back as they are.
 				var got []string
 				for _, u := range units {
@@ -242,7 +242,7 @@ func TestUnitsRefusals(t *testing.T) {
 			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want it to mention %q", err, tc.want)
 			}
-			if class, _ := plugin.ClassOf(err); class != tc.wantClass {
+			if class, _ := pluginerrors.ClassOf(err); class != tc.wantClass {
 				t.Fatalf("class = %q, want %q (%v)", class, tc.wantClass, err)
 			}
 		})

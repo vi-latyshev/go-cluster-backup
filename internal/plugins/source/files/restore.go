@@ -16,14 +16,16 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // ApplyOptions is restore.apply.files: the knobs that shape one restore.
 type ApplyOptions struct {
-	PreserveOwner bool            `json:"preserve_owner" doc:"restore uid/gid from the archive; needs the privilege to chown"`
-	SideBySideDir plugin.Template `json:"side_by_side_dir" doc:"subdirectory of root a side-by-side restore unpacks into; \"{{ .Label }}\" is the run id"`
+	PreserveOwner bool                   `json:"preserve_owner" doc:"restore uid/gid from the archive; needs the privilege to chown"`
+	SideBySideDir configuration.Template `json:"side_by_side_dir" doc:"subdirectory of root a side-by-side restore unpacks into; \"{{ .Label }}\" is the run id"`
 }
 
 // renderedOptions is the decoded and rendered form Apply actually uses.
@@ -79,32 +81,32 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	if req.Mode == source.ApplySideBySide {
 		rootPath, err = sideBySideSubdir(rootPath, opts.sideBySideDir)
 		if err != nil {
-			return source.ApplyReport{}, plugin.Permanent(err)
+			return source.ApplyReport{}, pluginerrors.Permanent(err)
 		}
 		if _, err := os.Lstat(rootPath); err == nil {
-			return source.ApplyReport{}, plugin.Permanent(fmt.Errorf("%s already exists; a side-by-side target is never overwritten", rootPath))
+			return source.ApplyReport{}, pluginerrors.Permanent(fmt.Errorf("%s already exists; a side-by-side target is never overwritten", rootPath))
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return source.ApplyReport{}, plugin.Transient(err)
+			return source.ApplyReport{}, pluginerrors.Transient(err)
 		}
 	}
 
 	seeker, ok := src.(io.ReadSeeker)
 	if !ok {
-		return source.ApplyReport{}, plugin.Permanent(errors.New("restore.apply.files needs a seekable artifact: the archive is probed and then rewound"))
+		return source.ApplyReport{}, pluginerrors.Permanent(errors.New("restore.apply.files needs a seekable artifact: the archive is probed and then rewound"))
 	}
 	if _, err := s.Probe(ctx, seeker); err != nil {
 		return source.ApplyReport{}, err
 	}
 	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-		return source.ApplyReport{}, plugin.Transient(err)
+		return source.ApplyReport{}, pluginerrors.Transient(err)
 	}
 
 	if err := os.MkdirAll(rootPath, 0o755); err != nil {
-		return source.ApplyReport{}, plugin.Transient(err)
+		return source.ApplyReport{}, pluginerrors.Transient(err)
 	}
 	root, err := openRoot(rootPath)
 	if err != nil {
-		return source.ApplyReport{}, plugin.Transient(err)
+		return source.ApplyReport{}, pluginerrors.Transient(err)
 	}
 	defer func() { _ = root.Close() }()
 	if req.Mode == source.ApplyInPlace {
@@ -154,20 +156,20 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 			break
 		}
 		if err != nil {
-			return source.ProbeReport{}, plugin.Transient(fmt.Errorf("reading the tar stream: %w", err))
+			return source.ProbeReport{}, pluginerrors.Transient(fmt.Errorf("reading the tar stream: %w", err))
 		}
 		if err := validateEntry(hdr); err != nil {
-			return source.ProbeReport{}, plugin.Permanent(err)
+			return source.ProbeReport{}, pluginerrors.Permanent(err)
 		}
 		report.Entries++
-		n, err := plugin.CopyContext(ctx, io.Discard, tr)
+		n, err := pluginio.CopyContext(ctx, io.Discard, tr)
 		if err != nil {
 			return source.ProbeReport{}, err
 		}
 		report.Bytes += n
 	}
 	if counted.n == 0 {
-		return source.ProbeReport{}, plugin.Permanent(errors.New("the artifact is empty: a tar stream always carries its end-of-archive marker"))
+		return source.ProbeReport{}, pluginerrors.Permanent(errors.New("the artifact is empty: a tar stream always carries its end-of-archive marker"))
 	}
 	return report, nil
 }
@@ -201,7 +203,7 @@ func parentRefusal(root *os.Root, name string, verified map[string]struct{}) err
 		info, err := lstatRoot(root, dir)
 		switch {
 		case err == nil && info.Mode()&fs.ModeSymlink != 0:
-			return plugin.Permanent(fmt.Errorf("tar entry %q is written through the symlink %q", name, dir))
+			return pluginerrors.Permanent(fmt.Errorf("tar entry %q is written through the symlink %q", name, dir))
 		case err == nil && info.IsDir():
 			verified[dir] = struct{}{}
 		case err == nil:
@@ -209,7 +211,7 @@ func parentRefusal(root *os.Root, name string, verified map[string]struct{}) err
 		case errors.Is(err, fs.ErrNotExist):
 			return nil
 		default:
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 	}
 	return nil
@@ -237,7 +239,7 @@ var openRoot = os.OpenRoot
 func checkLiveLinks(ctx context.Context, root *os.Root) error {
 	return fs.WalkDir(root.FS(), ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -247,10 +249,10 @@ func checkLiveLinks(ctx context.Context, root *os.Root) error {
 		}
 		target, err := readlinkRoot(root, name)
 		if err != nil {
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 		if why := entryRefusal(&tar.Header{Name: name, Typeflag: tar.TypeSymlink, Linkname: target}); why != "" {
-			return plugin.Permanent(fmt.Errorf("live symlink %q is not one a restore may depend on: %s; restore side_by_side into a fresh directory", name, why))
+			return pluginerrors.Permanent(fmt.Errorf("live symlink %q is not one a restore may depend on: %s; restore side_by_side into a fresh directory", name, why))
 		}
 		return nil
 	})
@@ -369,7 +371,7 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 			break
 		}
 		if err != nil {
-			return written, plugin.Transient(fmt.Errorf("reading the tar stream: %w", err))
+			return written, pluginerrors.Transient(fmt.Errorf("reading the tar stream: %w", err))
 		}
 		name := path.Clean(hdr.Name)
 		if err := parentRefusal(root, name, verified); err != nil {
@@ -389,7 +391,7 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 				return written, err
 			}
 			if err := root.Symlink(hdr.Linkname, name); err != nil {
-				return written, plugin.Transient(err)
+				return written, pluginerrors.Transient(err)
 			}
 		case tar.TypeLink:
 			// Only a regular file in the restored tree may be linked. Lstat does
@@ -399,13 +401,13 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 			target := path.Clean(hdr.Linkname)
 			info, err := lstatRoot(root, target)
 			if err != nil || !info.Mode().IsRegular() {
-				return written, plugin.Permanent(fmt.Errorf("tar entry %q is a hard link to %q, which is not a regular file in the restored tree", hdr.Name, target))
+				return written, pluginerrors.Permanent(fmt.Errorf("tar entry %q is a hard link to %q, which is not a regular file in the restored tree", hdr.Name, target))
 			}
 			if err := replaceEntry(root, name); err != nil {
 				return written, err
 			}
 			if err := root.Link(target, name); err != nil {
-				return written, plugin.Transient(err)
+				return written, pluginerrors.Transient(err)
 			}
 		case tar.TypeReg:
 			if err := replaceEntry(root, name); err != nil {
@@ -420,11 +422,11 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 				_ = root.Chtimes(name, time.Now(), hdr.ModTime)
 			}
 		default:
-			return written, plugin.Permanent(fmt.Errorf("tar entry %q has unsupported type %q", hdr.Name, string(rune(hdr.Typeflag))))
+			return written, pluginerrors.Permanent(fmt.Errorf("tar entry %q has unsupported type %q", hdr.Name, string(rune(hdr.Typeflag))))
 		}
 		if preserveOwner {
 			if err := root.Lchown(name, hdr.Uid, hdr.Gid); err != nil {
-				return written, plugin.Permanent(fmt.Errorf("restoring owner %d:%d of %q: %w", hdr.Uid, hdr.Gid, name, err))
+				return written, pluginerrors.Permanent(fmt.Errorf("restoring owner %d:%d of %q: %w", hdr.Uid, hdr.Gid, name, err))
 			}
 		}
 	}
@@ -438,11 +440,11 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 	for _, d := range dirs {
 		if preserveOwner {
 			if err := root.Lchown(d.name, d.uid, d.gid); err != nil {
-				return written, plugin.Permanent(fmt.Errorf("restoring owner %d:%d of %q: %w", d.uid, d.gid, d.name, err))
+				return written, pluginerrors.Permanent(fmt.Errorf("restoring owner %d:%d of %q: %w", d.uid, d.gid, d.name, err))
 			}
 		}
 		if err := chmodRoot(root, d.name, d.mode); err != nil {
-			return written, plugin.Transient(err)
+			return written, pluginerrors.Transient(err)
 		}
 	}
 	return written, nil
@@ -452,9 +454,9 @@ func extract(ctx context.Context, root *os.Root, src io.Reader, preserveOwner bo
 func writeFile(ctx context.Context, root *os.Root, name string, mode fs.FileMode, src io.Reader) (int64, error) {
 	f, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
-		return 0, plugin.Transient(err)
+		return 0, pluginerrors.Transient(err)
 	}
-	n, copyErr := plugin.CopyContext(ctx, f, src)
+	n, copyErr := pluginio.CopyContext(ctx, f, src)
 	if closeErr := f.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
@@ -462,10 +464,10 @@ func writeFile(ctx context.Context, root *os.Root, name string, mode fs.FileMode
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return n, ctxErr
 		}
-		return n, plugin.Transient(copyErr)
+		return n, pluginerrors.Transient(copyErr)
 	}
 	if err := chmodRoot(root, name, mode); err != nil {
-		return n, plugin.Transient(err)
+		return n, pluginerrors.Transient(err)
 	}
 	return n, nil
 }
@@ -477,22 +479,22 @@ func ensureDir(root *os.Root, name string, mode fs.FileMode) error {
 	switch {
 	case err == nil:
 		if info.Mode()&fs.ModeSymlink != 0 {
-			return plugin.Permanent(fmt.Errorf("%s is a symlink; refusing to write a directory through it", name))
+			return pluginerrors.Permanent(fmt.Errorf("%s is a symlink; refusing to write a directory through it", name))
 		}
 		if !info.IsDir() {
-			return plugin.Permanent(fmt.Errorf("%s is not a directory; refusing to replace it with one", name))
+			return pluginerrors.Permanent(fmt.Errorf("%s is not a directory; refusing to replace it with one", name))
 		}
 	case errors.Is(err, fs.ErrNotExist):
 		if err := root.MkdirAll(name, mode|0o700); err != nil {
-			return plugin.Transient(err)
+			return pluginerrors.Transient(err)
 		}
 	default:
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	// The umask must not decide the mode the extraction writes through; the
 	// archive's own mode is applied once the children exist.
 	if err := chmodRoot(root, name, mode|0o700); err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	return nil
 }
@@ -505,13 +507,13 @@ func replaceEntry(root *os.Root, name string) error {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	if info.IsDir() {
-		return plugin.Permanent(fmt.Errorf("%s is a directory; refusing to replace it with a file", name))
+		return pluginerrors.Permanent(fmt.Errorf("%s is a directory; refusing to replace it with a file", name))
 	}
 	if err := root.Remove(name); err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	return nil
 }
@@ -519,7 +521,7 @@ func replaceEntry(root *os.Root, name string) error {
 // decodeApplyOptions decodes the options strictly and renders the side-by-side
 // directory template against the run label.
 func decodeApplyOptions(raw jsontext.Value, label string) (renderedOptions, error) {
-	opts, err := plugin.DecodeOptions[ApplyOptions](raw, "restore.apply.files")
+	opts, err := configuration.DecodeOptions[ApplyOptions](raw, "restore.apply.files")
 	if err != nil {
 		return renderedOptions{}, err
 	}

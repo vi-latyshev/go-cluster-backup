@@ -17,6 +17,10 @@ export GOTOOLCHAIN := go$(shell sed -n 's/^go //p' go.mod)
 GO ?= go
 TOOLS := -modfile=tools/go.mod
 
+# The tooling module is checked exactly like the application: it is a separate
+# module, so its targets enter the module from its own directory.
+TOOLS_MODULE := tools
+
 CHART := charts/go-cluster-backup
 HELM_RELEASE ?= check
 CHART_EXAMPLES := minimal k3s-single-node
@@ -39,6 +43,8 @@ export KUBECONFORM_SCHEMA_LOCATION KUBECONFORM_CACHE
 # the unit and e2e profiles. Both use the same reporter and the same threshold.
 COVERAGE_THRESHOLD ?= 100
 COVERAGE_PROFILE ?= coverage.out
+TOOLS_COVERAGE_PROFILE ?= coverage-tools.out
+COMBINED_COVERAGE_PROFILE ?= coverage-combined.out
 E2E_COVERAGE_PROFILE ?= coverage-e2e.out
 COVERAGE_REPORT := scripts/coverage-report.sh
 
@@ -72,17 +78,18 @@ NOLINT_PATTERN := //[[:space:]]*nolint([[:space:]:,]|$$)
 
 IMAGE ?= go-cluster-backup
 
-.PHONY: check vet test unit-cover test-gate cover lint vuln chart docs e2e image hooks
+.PHONY: check vet test unit-cover tools-cover test-gate cover lint rules vuln chart docs e2e image hooks generate
 
 # check is the whole gate, in the order a failure is cheapest to act on.
 check: vet test lint vuln chart
 
 vet:
 	$(GO) vet ./...
+	cd $(TOOLS_MODULE) && $(GO) vet ./...
 
-# test runs the unit suite and enforces the coverage gate on the unit profile.
-# `make cover` is the full gate — the union of unit and e2e coverage.
-test: unit-cover test-gate
+# test runs both suites and enforces the coverage gate on their union.
+# `make cover` is the full gate — that union plus the e2e coverage.
+test: unit-cover tools-cover test-gate
 
 # unit-cover runs the unit suite and writes the unit profile without gating it.
 # GORACE=atexit_sleep_ms=0 drops the race runtime's one-second sleep at every
@@ -93,10 +100,19 @@ unit-cover:
 	@$(GO) tool -n $(TOOLS) helm > /dev/null
 	GORACE=atexit_sleep_ms=0 $(GO) test -race -trimpath -timeout=5m -coverprofile=$(COVERAGE_PROFILE) ./...
 
-# test-gate enforces the threshold on an existing unit profile, without running
-# the suite again — the same reporter `make test` uses.
+# tools-cover runs the tooling module's suite. Its own profile is separate
+# because the module is: test-gate concatenates the two disjoint block sets.
+tools-cover:
+	cd $(TOOLS_MODULE) && GORACE=atexit_sleep_ms=0 $(GO) test -race -trimpath -timeout=5m -coverprofile=../$(TOOLS_COVERAGE_PROFILE) ./...
+
+# test-gate enforces the threshold on the existing profiles, without running a
+# suite again — the same reporter `make test` uses. The application and tooling
+# modules hold disjoint packages, so their profiles concatenate into one block
+# set; the reporter merges blocks by key as usual.
 test-gate:
-	@COVERAGE_THRESHOLD=$(COVERAGE_THRESHOLD) $(COVERAGE_REPORT) $(COVERAGE_PROFILE)
+	@test -f $(TOOLS_COVERAGE_PROFILE) || { echo "test-gate: $(TOOLS_COVERAGE_PROFILE) is missing: run 'make test'"; exit 1; }
+	@{ echo "mode: set"; tail -n +2 $(COVERAGE_PROFILE); tail -n +2 $(TOOLS_COVERAGE_PROFILE); } > $(COMBINED_COVERAGE_PROFILE)
+	@COVERAGE_THRESHOLD=$(COVERAGE_THRESHOLD) $(COVERAGE_REPORT) $(COMBINED_COVERAGE_PROFILE)
 
 # cover merges the unit profile and the e2e profile and enforces the threshold
 # on the union. The unit profile owns the denominator — the blocks of the
@@ -113,10 +129,21 @@ cover:
 		fi; \
 		exit 1; \
 	}
-	@COVERAGE_THRESHOLD=$(COVERAGE_THRESHOLD) $(COVERAGE_REPORT) $(COVERAGE_PROFILE) $(E2E_COVERAGE_PROFILE)
+	@test -f $(TOOLS_COVERAGE_PROFILE) || { echo "cover: $(TOOLS_COVERAGE_PROFILE) is missing: run 'make test' first"; exit 1; }
+	@{ echo "mode: set"; tail -n +2 $(COVERAGE_PROFILE); tail -n +2 $(TOOLS_COVERAGE_PROFILE); } > $(COMBINED_COVERAGE_PROFILE)
+	@COVERAGE_THRESHOLD=$(COVERAGE_THRESHOLD) $(COVERAGE_REPORT) $(COMBINED_COVERAGE_PROFILE) $(E2E_COVERAGE_PROFILE)
 
-lint:
+# rules proves the repository's structural invariants and the freshness of the
+# generated composition root. Both are tracked-file checks no compiler runs:
+# the generated copies must match their sources, and a plugin must obey the
+# protocol and the Go internal-boundary rule.
+rules:
+	cd $(TOOLS_MODULE) && $(GO) run ./rules -root ..
+	cd $(TOOLS_MODULE) && $(GO) run ./gen -root .. -check
+
+lint: rules
 	$(GO) tool $(TOOLS) golangci-lint run
+	cd $(TOOLS_MODULE) && $(GO) tool golangci-lint run ./...
 	@if git grep -nE '$(NOLINT_PATTERN)' -- '*.go'; then \
 		echo "lint: //nolint directives are banned in this repository (see CONTRIBUTING.md)"; \
 		exit 1; \
@@ -124,6 +151,12 @@ lint:
 
 vuln:
 	$(GO) tool $(TOOLS) govulncheck ./...
+	cd $(TOOLS_MODULE) && $(GO) tool govulncheck ./...
+
+# generate rewrites the tracked composition root and Floor manifest from the
+# plugin packages. The output is committed, so a build never needs it.
+generate:
+	cd $(TOOLS_MODULE) && $(GO) run ./gen -root ..
 
 # chart lints both examples, renders each of them once, validates every rendered
 # object against the Kubernetes API schema of each version the chart claims

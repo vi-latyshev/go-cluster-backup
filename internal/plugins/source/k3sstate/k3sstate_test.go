@@ -16,11 +16,13 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/k3sstate"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source/sourcetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sourcetest"
 )
 
 const (
@@ -151,22 +153,22 @@ func build(t *testing.T, cfg map[string]any) source.Source {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := plugin.NewRegistry()
-	if err := k3sstate.Register(r); err != nil {
-		t.Fatal(err)
-	}
-	s, err := plugin.Build(context.Background(), r, source.Kind, "k3s_state", raw,
-		plugin.Deps{Instance: "k3s_state", Log: slog.New(slog.DiscardHandler)})
+	r := testRegistry(t)
+	s, err := instances.Build(context.Background(), r, source.Kind, "k3s_state", raw,
+		instances.Deps{Instance: "k3s_state", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
 }
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := k3sstate.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, k3sstate.Spec, func(lr *loader.Registry) error {
+		return k3sstate.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -174,7 +176,7 @@ func testRegistry(t *testing.T) *plugin.Registry {
 
 func check(t *testing.T, s source.Source) error {
 	t.Helper()
-	checker, ok := s.(plugin.Checker)
+	checker, ok := s.(instances.Checker)
 	if !ok {
 		t.Fatal("k3s_state does not implement plugin.Checker, so this failure would surface mid-run")
 	}
@@ -394,7 +396,7 @@ func TestIntegrityCheckModes(t *testing.T) {
 		if !strings.Contains(err.Error(), "missing from index") {
 			t.Errorf("the error does not carry sqlite's verdict: %v", err)
 		}
-		if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 			t.Errorf("a failed integrity check is %q, want permanent", class)
 		}
 	})
@@ -462,7 +464,7 @@ func TestCheckIsThePreflight(t *testing.T) {
 			if err == nil {
 				t.Fatalf("%s passed the preflight", name)
 			}
-			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+			if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 				t.Errorf("%s is %q, want permanent", name, class)
 			}
 		})
@@ -485,8 +487,8 @@ func TestCheckLeavesNothingBehind(t *testing.T) {
 func TestConstructionIsFilesystemFree(t *testing.T) {
 	raw := jsontext.Value(`{"datastore": "/k3s-db/state.db", "token": {"file": "/k3s-token"}, "scratch_dir": "/plain", ` +
 		`"busy_timeout": "10s", "integrity_check": "quick", "timeout": "5m"}`)
-	if _, err := plugin.Build(context.Background(), testRegistry(t), source.Kind, "k3s_state", raw,
-		plugin.Deps{Instance: "k3s_state", Log: slog.New(slog.DiscardHandler)}); err != nil {
+	if _, err := instances.Build(context.Background(), testRegistry(t), source.Kind, "k3s_state", raw,
+		instances.Deps{Instance: "k3s_state", Log: slog.New(slog.DiscardHandler)}); err != nil {
 		t.Fatalf("construction touched the filesystem: %v", err)
 	}
 }
@@ -504,7 +506,7 @@ func TestReturnsOnCancellation(t *testing.T) {
 
 // TestConfigValidation pins the config contract: the paths a run needs absolute
 // and the depths sqlite3 understands. A single quote in a path is NOT refused —
-// the copy escapes it (see internal/sqlitecopy) — so it is absent here.
+// the copy escapes it (see internal/plugins/sqlitecopy) — so it is absent here.
 func TestConfigValidation(t *testing.T) {
 	cases := map[string]string{
 		"relative datastore":   `{"datastore": "state.db", "token": {"file": "/t"}, "scratch_dir": "/p", "busy_timeout": "10s", "integrity_check": "quick", "timeout": "5m"}`,
@@ -527,13 +529,13 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-// TestRequiresNamesTheBinary keeps `doctor` able to check the tool this source
+// TestBinariesNamesTheBinary keeps `doctor` able to check the tool this source
 // shells out to.
-func TestRequiresNamesTheBinary(t *testing.T) {
+func TestBinariesNamesTheBinary(t *testing.T) {
 	for _, d := range testRegistry(t).Descriptors() {
 		if d.Kind == "source" && d.Type == "k3s_state" {
-			if len(d.Requires) != 1 || d.Requires[0] != "sqlite3" {
-				t.Fatalf("Requires = %v, want [sqlite3]", d.Requires)
+			if len(d.Binaries) != 1 || d.Binaries[0] != "sqlite3" {
+				t.Fatalf("Binaries = %v, want [sqlite3]", d.Binaries)
 			}
 			return
 		}
@@ -570,8 +572,8 @@ func TestErrorsNeverCarryTheToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := testRegistry(t)
-	s, err := plugin.Build(context.Background(), r, source.Kind, "k3s_state", raw,
-		plugin.Deps{Instance: "k3s_state", Log: slog.New(slog.NewTextHandler(&logged, nil))})
+	s, err := instances.Build(context.Background(), r, source.Kind, "k3s_state", raw,
+		instances.Deps{Instance: "k3s_state", Log: slog.New(slog.NewTextHandler(&logged, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,12 +693,12 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	env := newStub(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := plugin.Build(ctx, testRegistry(t), source.Kind, "k3s_state",
-		jsontext.Value(mustJSON(t, env.config())), plugin.Deps{Instance: "k3s_state"}); err == nil {
+	if _, err := instances.Build(ctx, testRegistry(t), source.Kind, "k3s_state",
+		jsontext.Value(mustJSON(t, env.config())), instances.Deps{Instance: "k3s_state"}); err == nil {
 		t.Error("New accepted a cancelled context")
 	}
 	s := build(t, env.config())
-	if err := s.(plugin.Checker).Check(ctx); err == nil {
+	if err := s.(instances.Checker).Check(ctx); err == nil {
 		t.Error("Check accepted a cancelled context")
 	}
 	if _, err := s.Describe(ctx); err == nil {
@@ -746,7 +748,7 @@ func TestDumpFailsWhenTheDatastoreIsMissing(t *testing.T) {
 	if err == nil {
 		t.Fatal("Dump accepted a missing datastore")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }

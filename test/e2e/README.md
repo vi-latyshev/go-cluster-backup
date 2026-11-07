@@ -64,6 +64,21 @@ pinned by multi-arch digest. MinIO is gone from the public registries (Docker
 Hub removed it, quay.io requires a login), so the S3 endpoint is SeaweedFS — a
 real S3 server, not a mock.
 
+## Readiness
+
+Nothing the suite runs until the dependencies are usable, so a broken dependency
+fails here with its own message instead of a five-minute Job timeout:
+
+- **CoreDNS** must answer a Service name from a pod. A k3s first start pulls its
+  system images — measured at over four minutes on a loaded runner — so a run
+  started earlier fails every lookup with "connection refused".
+- **SeaweedFS** must store a real object (`PUT` of `e2e-probe/ready`) before any
+  tool Job runs. A volume count is not proof: the image's entrypoint injects
+  `-volume.max=0`, which lets the node derive its volume-slot count from free
+  disk, and on a full disk the bucket's collection can end up with no writable
+  volume ("No writable volumes and no free volumes left"). The fixture states
+  `-volume.max=64` explicitly and still probes a write.
+
 ## Images
 
 Every dependency is pinned by the digest of its multi-arch index, so the same
@@ -89,7 +104,7 @@ its name.
 | Subtest | Proves |
 |---|---|
 | `install` | the chart installs; the pre-install `validate` hook ran; every object exists |
-| `manual_run` | a manual Job completes; the catalog records it `delivered`; the receiver got `run_finished` |
+| `manual_run` | a manual Job completes; the writer lease is released; the catalog carries no run history; the receiver got `run_finished` |
 | `restore` | `restore list` shows the run; `restore apply --mode side-by-side` puts the rows in a database beside the original |
 | `previous_run_failure` | a Job that failed before the tool started (exit 7) is reported by the next run's notification |
 | `writer_lease` | with a claim left behind by a killed holder, a second manual run is refused, never a second writer |

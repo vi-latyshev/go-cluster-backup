@@ -11,66 +11,27 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/extcmd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // Config is the plugin config. Every field is required.
 type Config struct {
-	Address         string         `json:"address" required:"true" doc:"host:port of the Redis server"`
-	Password        plugin.Secret  `json:"password" doc:"file holding the server password; passed to redis-cli in REDISCLI_AUTH, never on the command line"`
-	ScratchDir      string         `json:"scratch_dir" required:"true" doc:"existing writable directory the snapshot's temporary file is spooled into, e.g. the big emptyDir a run mounts; the process temp dir is not used"`
-	ConnectAttempts int            `json:"connect_attempts" doc:"TCP connect attempts before a snapshot gives up"`
-	ConnectInterval model.Duration `json:"connect_interval" doc:"wait between connect attempts; also the per-attempt dial timeout"`
-}
-
-// Register adds the redis source to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, source.Kind, plugin.Spec[Config, source.Source]{
-		Type:      "redis",
-		Summary:   "one Redis instance, snapshotted with redis-cli --rdb",
-		Stability: plugin.Stable,
-		Requires:  []string{"redis-cli"},
-		Example:   []byte(`{"address": "redis.example.svc.cluster.local:6379", "password": {"file": "/run/secrets/redis/password"}, "scratch_dir": "/scratch", "connect_attempts": 6, "connect_interval": "5s"}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (source.Source, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			host, port, err := net.SplitHostPort(cfg.Address)
-			if err != nil {
-				return nil, fmt.Errorf("address %q must be host:port: %w", cfg.Address, err)
-			}
-			if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-				return nil, fmt.Errorf("address %q: port %q is not a number", cfg.Address, port)
-			}
-			if cfg.Password.File == "" {
-				return nil, errors.New("password/file is empty")
-			}
-			if cfg.ScratchDir == "" {
-				return nil, errors.New("scratch_dir is empty")
-			}
-			if !filepath.IsAbs(cfg.ScratchDir) {
-				return nil, fmt.Errorf("scratch_dir %q must be absolute", cfg.ScratchDir)
-			}
-			if cfg.ConnectAttempts < 1 {
-				return nil, fmt.Errorf("connect_attempts must be at least 1, got %d", cfg.ConnectAttempts)
-			}
-			if cfg.ConnectInterval.Std() <= 0 {
-				return nil, errors.New("connect_interval must be positive")
-			}
-			return &Source{cfg: cfg, host: host, port: port}, nil
-		},
-	})
+	Address         string               `json:"address" required:"true" doc:"host:port of the Redis server"`
+	Password        configuration.Secret `json:"password" doc:"file holding the server password; passed to redis-cli in REDISCLI_AUTH, never on the command line"`
+	ScratchDir      string               `json:"scratch_dir" required:"true" doc:"existing writable directory the snapshot's temporary file is spooled into, e.g. the big emptyDir a run mounts; the process temp dir is not used"`
+	ConnectAttempts int                  `json:"connect_attempts" doc:"TCP connect attempts before a snapshot gives up"`
+	ConnectInterval model.Duration       `json:"connect_interval" doc:"wait between connect attempts; also the per-attempt dial timeout"`
 }
 
 type Source struct {
@@ -97,13 +58,13 @@ func (s *Source) Check(ctx context.Context) error {
 		return err
 	}
 	if err := extcmd.CheckScratchDir(s.cfg.ScratchDir); err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	if err := extcmd.WaitTCP(ctx, s.host, s.port, s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
 	if err != nil {
@@ -111,12 +72,12 @@ func (s *Source) Check(ctx context.Context) error {
 	}
 	cmd := exec.CommandContext(ctx, "redis-cli", "-h", s.host, "-p", s.port, "PING")
 	cmd.Env = extcmd.ReplaceEnv(os.Environ(), "REDISCLI_AUTH="+pass)
-	out, err := extcmd.Output(ctx, cmd, classifyExit)
+	out, err := extcmd.Output(ctx, cmd, classifyExit())
 	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(out) != "PONG" {
-		return plugin.Permanent(fmt.Errorf("redis-cli PING answered %q", strings.TrimSpace(out)))
+		return pluginerrors.Permanent(fmt.Errorf("redis-cli PING answered %q", strings.TrimSpace(out)))
 	}
 	return nil
 }
@@ -145,49 +106,57 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	tmp, err := os.CreateTemp(s.cfg.ScratchDir, "redis-rdb-*")
 	if err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	name := tmp.Name()
 	// redis-cli opens the path itself; an already-open handle would only
 	// conflict with it.
 	if err := closeSnapshot(tmp); err != nil {
 		_ = os.Remove(name)
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	defer func() { _ = os.Remove(name) }()
 
 	cmd := exec.CommandContext(ctx, "redis-cli", "-h", s.host, "-p", s.port, "--rdb", name)
 	cmd.Env = extcmd.ReplaceEnv(os.Environ(), "REDISCLI_AUTH="+pass)
-	if _, err := extcmd.Output(ctx, cmd, classifyExit); err != nil {
+	if _, err := extcmd.Output(ctx, cmd, classifyExit()); err != nil {
 		return err
 	}
 	f, err := os.Open(name)
 	if err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	defer func() { _ = f.Close() }()
 	st, err := statSnapshot(f)
 	if err != nil {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	if st.Size() == 0 {
-		return plugin.Transient(errors.New("redis-cli exited 0 but wrote an empty snapshot"))
+		return pluginerrors.Transient(errors.New("redis-cli exited 0 but wrote an empty snapshot"))
 	}
-	_, err = plugin.CopyContext(ctx, dst, f)
+	_, err = pluginio.CopyContext(ctx, dst, f)
 	return err
 }
 
+// The patterns and the classifier they build are lazily-built singletons: a
+// package initializer does no work.
 var (
-	transientRe = regexp.MustCompile(`(?i)could not connect|connection refused|connection reset|connection timed out|timeout|broken pipe|loading`)
+	transientRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`(?i)could not connect|connection refused|connection reset|connection timed out|timeout|broken pipe|loading`)
+	})
 	// A refused password or a denied command is not worth another attempt.
-	permanentRe = regexp.MustCompile(`(?i)wrongpass|invalid password|noauth|authentication required|denied|unknown command`)
+	permanentRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`(?i)wrongpass|invalid password|noauth|authentication required|denied|unknown command`)
+	})
 )
 
 // classifyExit marks a failed redis-cli run with this plugin's patterns; text
-// matching neither stays unclassified and the engine's config decides what
+// matching neither stays unclassified and the operation's owner decides what
 // that means.
-var classifyExit = extcmd.Classifier(permanentRe, transientRe)
+var classifyExit = sync.OnceValue(func() func(bin string, err error, detail string) error {
+	return extcmd.Classifier(permanentRe(), transientRe())
+})

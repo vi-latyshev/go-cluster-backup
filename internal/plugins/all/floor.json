@@ -1,0 +1,594 @@
+{
+  "plugins": [
+    {
+      "id": "assembly",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "catalog",
+        "configuration",
+        "discovery",
+        "execution",
+        "instances",
+        "inventory",
+        "layout",
+        "lifecycle",
+        "model",
+        "must",
+        "notifier",
+        "pipeline",
+        "planning",
+        "processor",
+        "protection",
+        "reporting",
+        "retention",
+        "source",
+        "storage",
+        "storage-guard",
+        "workflow-backup",
+        "workflow-restore",
+        "workflow/stage"
+      ]
+    },
+    {
+      "id": "catalog",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "catalog/kubernetes_configmap",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "catalog",
+        "configuration",
+        "errors",
+        "instances",
+        "kubeapi",
+        "model",
+        "must"
+      ]
+    },
+    {
+      "id": "cli",
+      "factory": true,
+      "floor": true,
+      "imports": [
+        "assembly",
+        "configuration",
+        "errors",
+        "human",
+        "instances",
+        "inventory",
+        "lifecycle",
+        "model",
+        "must",
+        "planning",
+        "source",
+        "storage",
+        "storage-guard",
+        "workflow-backup",
+        "workflow-restore"
+      ]
+    },
+    {
+      "id": "configuration",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "human",
+        "model"
+      ]
+    },
+    {
+      "id": "discovery",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "discovery/kubernetes_labels",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "discovery",
+        "errors",
+        "instances",
+        "kubeapi",
+        "model",
+        "must"
+      ]
+    },
+    {
+      "id": "errors",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "execution",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "human"
+      ]
+    },
+    {
+      "id": "extcmd",
+      "factory": false,
+      "floor": false,
+      "imports": [
+        "errors"
+      ]
+    },
+    {
+      "id": "human",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "instances",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "configuration"
+      ]
+    },
+    {
+      "id": "inventory",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "configuration",
+        "errors",
+        "execution",
+        "human",
+        "layout",
+        "model",
+        "storage"
+      ]
+    },
+    {
+      "id": "io",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "kubeapi",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors"
+      ]
+    },
+    {
+      "id": "layout",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "configuration",
+        "model"
+      ]
+    },
+    {
+      "id": "lifecycle",
+      "factory": true,
+      "floor": true,
+      "imports": [
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "model",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "must",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "notifier",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "notifier/webhook",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "instances",
+        "model",
+        "must",
+        "notifier"
+      ]
+    },
+    {
+      "id": "pipeline",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "execution",
+        "human",
+        "model",
+        "processor",
+        "source",
+        "spool"
+      ]
+    },
+    {
+      "id": "planning",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "discovery",
+        "errors",
+        "execution",
+        "instances",
+        "model",
+        "processor",
+        "source"
+      ]
+    },
+    {
+      "id": "processor",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "instances"
+      ]
+    },
+    {
+      "id": "processor/age",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "instances",
+        "io",
+        "must",
+        "processor"
+      ]
+    },
+    {
+      "id": "processor/zstd",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "instances",
+        "io",
+        "model",
+        "must",
+        "processor"
+      ]
+    },
+    {
+      "id": "protection",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "catalog",
+        "errors",
+        "execution",
+        "human",
+        "inventory",
+        "model",
+        "retention",
+        "storage-guard"
+      ]
+    },
+    {
+      "id": "reporting",
+      "factory": true,
+      "floor": true,
+      "imports": [
+        "configuration",
+        "instances",
+        "kubeapi",
+        "model"
+      ]
+    },
+    {
+      "id": "retention",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "retention/gfs",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "instances",
+        "model",
+        "retention"
+      ]
+    },
+    {
+      "id": "retention/keep_last",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "instances",
+        "retention"
+      ]
+    },
+    {
+      "id": "source",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "source/files",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "human",
+        "instances",
+        "io",
+        "model",
+        "must",
+        "source"
+      ]
+    },
+    {
+      "id": "source/k3s_state",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "extcmd",
+        "instances",
+        "io",
+        "model",
+        "source",
+        "sqlitecopy"
+      ]
+    },
+    {
+      "id": "source/postgres",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "extcmd",
+        "instances",
+        "io",
+        "model",
+        "must",
+        "source"
+      ]
+    },
+    {
+      "id": "source/redis",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "extcmd",
+        "instances",
+        "io",
+        "model",
+        "source"
+      ]
+    },
+    {
+      "id": "source/sqlite",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "extcmd",
+        "instances",
+        "io",
+        "model",
+        "source",
+        "sqlitecopy"
+      ]
+    },
+    {
+      "id": "source/staged",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "errors",
+        "instances",
+        "io",
+        "model",
+        "source"
+      ]
+    },
+    {
+      "id": "spool",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "sqlitecopy",
+      "factory": false,
+      "floor": false
+    },
+    {
+      "id": "storage",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "configuration",
+        "instances",
+        "model"
+      ]
+    },
+    {
+      "id": "storage-guard",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "instances",
+        "model",
+        "storage"
+      ]
+    },
+    {
+      "id": "storage/local",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "errors",
+        "instances",
+        "io",
+        "model",
+        "storage"
+      ]
+    },
+    {
+      "id": "storage/s3",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "instances",
+        "model",
+        "storage"
+      ]
+    },
+    {
+      "id": "storage/yandex_disk",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "human",
+        "instances",
+        "model",
+        "must",
+        "storage",
+        "treewalk"
+      ]
+    },
+    {
+      "id": "transfer",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "execution",
+        "human",
+        "model",
+        "pipeline",
+        "protection",
+        "spool",
+        "storage",
+        "storage-guard"
+      ]
+    },
+    {
+      "id": "treewalk",
+      "factory": false,
+      "floor": false,
+      "imports": [
+        "errors"
+      ]
+    },
+    {
+      "id": "workflow-backup",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "catalog",
+        "discovery",
+        "errors",
+        "execution",
+        "human",
+        "instances",
+        "inventory",
+        "layout",
+        "lifecycle",
+        "model",
+        "notifier",
+        "pipeline",
+        "planning",
+        "processor",
+        "protection",
+        "reporting",
+        "retention",
+        "source",
+        "spool",
+        "storage",
+        "storage-guard",
+        "transfer"
+      ]
+    },
+    {
+      "id": "workflow-restore",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "execution",
+        "human",
+        "inventory",
+        "io",
+        "layout",
+        "model",
+        "pipeline",
+        "processor",
+        "source",
+        "spool",
+        "storage",
+        "storage-guard"
+      ]
+    },
+    {
+      "id": "workflow/stage",
+      "factory": false,
+      "floor": true,
+      "imports": [
+        "errors",
+        "execution",
+        "human",
+        "model",
+        "pipeline",
+        "planning",
+        "source"
+      ]
+    }
+  ]
+}

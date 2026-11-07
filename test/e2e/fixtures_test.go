@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -107,29 +106,61 @@ func (e *Env) installWorkloads(t *testing.T, ns string) {
 	e.seedPostgres(t, ns)
 }
 
-// installStorage deploys the S3 endpoint and creates the bucket.
+// installStorage deploys the S3 endpoint and creates the bucket, then proves the
+// endpoint really stores an object and that a pod resolves it by Service name.
 func (e *Env) installStorage(t *testing.T, ns string) {
 	t.Helper()
 	e.apply(t, e.storageManifests(ns))
 	e.waitDeployment(t, ns, "seaweedfs")
 	e.createBucket(t, ns)
-	e.waitVolumeServer(t, ns)
+	e.waitS3Write(t, ns)
+	e.waitClusterDNS(t, ns)
 }
 
-// volumeFreeRe matches the topology's free-slot count; free:0 is a master with
-// no registered volume server.
-var volumeFreeRe = regexp.MustCompile("free:[1-9]")
-
-// waitVolumeServer waits until the master has a volume server with a writable
-// slot. Until it does, every write answers 500 "no writable volumes", which no
-// amount of engine retry outlasts on a cold cluster: the S3 port answers long
-// before the volume server has announced itself to the master.
-func (e *Env) waitVolumeServer(t *testing.T, ns string) {
+// waitS3Write proves the S3 endpoint stores an object end to end: the bucket,
+// the filer and a writable volume of the bucket's collection. `volume.list` is
+// not proof — the pinned image's entrypoint injects `-volume.max=0`, so the
+// node advertises as many volume slots as its free disk allows, and on a full
+// disk every slot can sit in the empty collection while the bucket's own
+// collection has none ("No writable volumes and no free volumes left"). A real
+// PUT is the check that fails on exactly that, with the server's own answer.
+func (e *Env) waitS3Write(t *testing.T, ns string) {
 	t.Helper()
-	waitFor(t, "the S3 volume server to register", 2*time.Minute, func() (bool, string) {
-		out, _ := e.exec("", "kubectl", "exec", "-n", ns, "deploy/seaweedfs", "--",
-			"sh", "-c", "printf 'volume.list\n' | weed shell -master=localhost:9333")
-		return volumeFreeRe.MatchString(out), out
+	url := "http://localhost:8333/" + bucket + "/e2e-probe/ready"
+	waitFor(t, "a real S3 write to bucket "+bucket, 2*time.Minute, func() (bool, string) {
+		out, err := e.exec("", "kubectl", "exec", "-n", ns, "deploy/seaweedfs", "--",
+			"curl", "-sS", "-w", "\n%{http_code}", "-X", "PUT", "--data-binary", "e2e-probe", url)
+		if err != nil {
+			return false, out
+		}
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		// The body is kept for the failure message: SeaweedFS answers a write
+		// with no writable volume with its own XML error, and that text names
+		// the collection.
+		return lines[len(lines)-1] == "200", out
+	})
+	// The probe key is outside the tool's storage prefix, so no survey counts
+	// it; removing it keeps the bucket readback clean anyway.
+	if out, err := e.exec("", "kubectl", "exec", "-n", ns, "deploy/seaweedfs", "--",
+		"curl", "-sS", "-o", "/dev/null", "-X", "DELETE", url); err != nil {
+		t.Logf("removing the S3 probe object: %v\n%s", err, out)
+	}
+}
+
+// waitClusterDNS proves CoreDNS answers a Service name from a pod. A k3s first
+// start pulls its system images — measured at over four minutes on a loaded
+// VM — so a run started before CoreDNS is ready fails every lookup with
+// "connection refused"; this gate turns that into one clear message.
+func (e *Env) waitClusterDNS(t *testing.T, ns string) {
+	t.Helper()
+	url := "http://seaweedfs." + ns + ".svc.cluster.local:9333/dir/status"
+	waitFor(t, "CoreDNS to answer a Service name from a pod", 5*time.Minute, func() (bool, string) {
+		out, err := e.exec("", "kubectl", "exec", "-n", ns, "deploy/seaweedfs", "--",
+			"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", url)
+		if err != nil {
+			return false, out
+		}
+		return strings.TrimSpace(out) == "200", out
 	})
 }
 
@@ -236,6 +267,13 @@ spec:
 }
 
 // storageManifests is the S3 endpoint: SeaweedFS, a real S3 server.
+//
+// `-volume.max` is stated explicitly: the pinned image's entrypoint injects
+// `-volume.max=0` for `server`, which leaves the node's volume-slot count to its
+// free disk. On a full disk that is as few as six slots, all taken by the empty
+// collection before a bucket's own collection asks for one, and every S3 write
+// then answers 500 "No writable volumes and no free volumes left". A fixed
+// count keeps the fixture independent of the runner's disk.
 func (e *Env) storageManifests(ns string) string {
 	return fmt.Sprintf(`
 apiVersion: apps/v1
@@ -251,7 +289,7 @@ spec:
         - name: seaweedfs
           image: %[2]s
           imagePullPolicy: IfNotPresent
-          args: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-master.port=9333", "-volume.port=8080"]
+          args: ["server", "-dir=/data", "-volume.max=64", "-s3", "-s3.port=8333", "-master.port=9333", "-volume.port=8080"]
           ports:
             - {name: s3, containerPort: 8333}
             - {name: master, containerPort: 9333}
@@ -370,9 +408,7 @@ func (e *Env) toolConfig(ns, catalog string) string {
 	).Replace(toolConfigTemplate)
 }
 
-const toolConfigTemplate = `version: 1
-
-run:
+const toolConfigTemplate = `run:
   spool_dir: /spool
   spool_reserve_bytes: 1GiB
   max_artifact_bytes: 3GiB
@@ -493,9 +529,7 @@ func (e *Env) k3sConfig(ns, catalog string) string {
 	).Replace(k3sConfigTemplate)
 }
 
-const k3sConfigTemplate = `version: 1
-
-run:
+const k3sConfigTemplate = `run:
   spool_dir: /spool
   spool_reserve_bytes: 1GiB
   max_artifact_bytes: 3GiB

@@ -12,10 +12,11 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi/kubeapitest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery/kuberneteslabels"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
 )
 
 // buildFrom builds the plugin instance from a config fixture, the way a run
@@ -23,8 +24,8 @@ import (
 // deployment meets.
 func buildFrom(t *testing.T, cfg configFixture) discovery.Discoverer {
 	t.Helper()
-	d, err := plugin.Build(context.Background(), registry(t), discovery.Kind, "kubernetes_labels",
-		jsontext.Value(mustJSON(cfg)), plugin.Deps{Instance: "workloads", Log: slog.New(slog.DiscardHandler)})
+	d, err := instances.Build(context.Background(), registry(t), discovery.Kind, "kubernetes_labels",
+		jsontext.Value(mustJSON(cfg)), instances.Deps{Instance: "workloads", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,8 +48,17 @@ func configFor(hostEnv, portEnv, tokenFile, caFile, secretsPath string, rules ..
 func TestNewHonoursACancelledContextDirectly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := kuberneteslabels.New(ctx, kuberneteslabels.Config{}, plugin.Deps{}); !errors.Is(err, context.Canceled) {
+	if _, err := kuberneteslabels.New(ctx, kuberneteslabels.Config{}, instances.Deps{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("New = %v, want the cancellation", err)
+	}
+}
+
+// TestNewWithoutALogger: an instance built without a logger is a working
+// instance — the nil logger falls back to a discard handler instead of a panic
+// on the first log line.
+func TestNewWithoutALogger(t *testing.T) {
+	if d, err := kuberneteslabels.New(context.Background(), kuberneteslabels.Config{}, instances.Deps{}); err != nil || d == nil {
+		t.Fatalf("New without a logger = (%v, %v), want a discoverer", d, err)
 	}
 }
 
@@ -65,7 +75,7 @@ func TestBrokenConnectionIsOneDiscoveryFailure(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), unsetHost) {
 		t.Fatalf("Discover = %v, want the unset environment variable named", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent", class)
 	}
 	if err := check(t, d); err == nil {

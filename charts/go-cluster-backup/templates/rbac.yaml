@@ -37,11 +37,12 @@ subjects:
     namespace: {{ $namespace }}
 ---
 {{/*
-In the release namespace: `get` and `list` on pods, and on Jobs, for the two
-things the tool does there — proving the lease holder's pod terminated, and
-reading the previous Job of its own CronJob when a run failed before the tool
-started — plus `list` on Events, which the previous-run report reads by
-`involvedObject.uid` to explain why that Job failed before the tool ran. A
+In the release namespace: `get` on a pod, for the catalog's lease liveness proof
+(the holder's pod, by name and UID); `list` on pods, and `get`/`list` on Jobs,
+plus `list` on Events, for the reporting plugin's previous-Job report — it walks
+this run's pod to its Job to its CronJob, then reads the newest other Job of
+that CronJob: its Failed condition, its pods' container statuses and its own
+Warning events, which are the only record when admission refused every pod. A
 missing grant degrades to a visible message, never a failed run.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
@@ -81,10 +82,11 @@ subjects:
     namespace: {{ $namespace }}
 ---
 {{/*
-The catalog ConfigMap is the one object the tool writes: get and patch on
-exactly that object, nothing else in the namespace. `patch`, not `update` — the
-tool writes a JSON merge patch of `data` alone, so the reconciler's annotations
-survive, and RBAC maps PATCH to its own verb.
+The catalog ConfigMap carries the one cluster record the tool writes: its writer
+lease, under one key of `data`. get and patch on exactly that object, nothing
+else in the namespace. `patch`, not `update` — the tool writes a JSON merge patch
+of `data` alone, so the reconciler's annotations survive, and RBAC maps PATCH to
+its own verb.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

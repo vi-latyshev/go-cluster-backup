@@ -17,17 +17,22 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/postgres"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source/sourcetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sourcetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := postgres.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, postgres.Spec, func(lr *loader.Registry) error {
+		return postgres.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -35,8 +40,8 @@ func testRegistry(t *testing.T) *plugin.Registry {
 
 func build(t *testing.T, cfg string) (source.Source, error) {
 	t.Helper()
-	return plugin.Build(context.Background(), testRegistry(t), source.Kind, "postgres",
-		jsontext.Value(cfg), plugin.Deps{Instance: "postgres", Log: slog.New(slog.DiscardHandler)})
+	return instances.Build(context.Background(), testRegistry(t), source.Kind, "postgres",
+		jsontext.Value(cfg), instances.Deps{Instance: "postgres", Log: slog.New(slog.DiscardHandler)})
 }
 
 func config(t *testing.T, addr string) string {
@@ -299,7 +304,7 @@ func TestDumpRefusedCredentialsArePermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("a refused credential was not an error")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -316,7 +321,7 @@ func TestDumpConnectionRefusedIsTransient(t *testing.T) {
 	if err == nil {
 		t.Fatal("a refused connection was not an error")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -331,7 +336,7 @@ func TestDumpUnreachableTargetIsTransient(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unreachable target was not an error")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -386,7 +391,7 @@ func TestCheckComparesMajors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err != nil {
+	if err := s.(instances.Checker).Check(context.Background()); err != nil {
 		t.Fatalf("Check: %v", err)
 	}
 	got := strings.Split(strings.TrimSpace(stubLog(t, "argv.psql")), "\n")
@@ -403,11 +408,11 @@ func TestCheckComparesMajors(t *testing.T) {
 	}
 
 	stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 17.5\n")
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil {
 		t.Fatal("a major version mismatch was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("mismatch class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -418,7 +423,7 @@ func TestCheckWithoutBinaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil {
 		t.Fatal("a missing pg_dump was accepted")
 	}
@@ -594,7 +599,7 @@ func TestApplyJobsRefuseAnArtifactFromAStream(t *testing.T) {
 	if err == nil {
 		t.Fatal("jobs > 1 accepted a stream with no path to hand pg_restore")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	if !strings.Contains(err.Error(), "jobs 4") {
@@ -720,7 +725,7 @@ func TestErrorsAreJoined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	var joined interface{ Unwrap() []error }
 	if !errors.As(err, &joined) {
 		t.Fatalf("expected every missing binary reported at once, got %v", err)
@@ -746,7 +751,7 @@ func TestApplyInPlaceRefusesJobs(t *testing.T) {
 	if err == nil {
 		t.Fatal("in_place with jobs > 1 was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	if !strings.Contains(err.Error(), "jobs 4") || !strings.Contains(err.Error(), "in_place") {
@@ -771,8 +776,8 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	stubs(t, "pg_dump", "psql", "pg_restore")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := plugin.Build(ctx, testRegistry(t), source.Kind, "postgres",
-		jsontext.Value(config(t, listener(t))), plugin.Deps{Instance: "postgres"}); err == nil {
+	if _, err := instances.Build(ctx, testRegistry(t), source.Kind, "postgres",
+		jsontext.Value(config(t, listener(t))), instances.Deps{Instance: "postgres"}); err == nil {
 		t.Error("New accepted a cancelled context")
 	}
 	s, err := build(t, config(t, listener(t)))
@@ -782,7 +787,7 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	if _, err := s.Describe(ctx); err == nil {
 		t.Error("Describe accepted a cancelled context")
 	}
-	if err := s.(plugin.Checker).Check(ctx); err == nil {
+	if err := s.(instances.Checker).Check(ctx); err == nil {
 		t.Error("Check accepted a cancelled context")
 	}
 	if err := s.Dump(ctx, io.Discard); err == nil {
@@ -809,8 +814,8 @@ func TestCheckUnreachableIsTransient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	err = s.(instances.Checker).Check(context.Background())
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -828,7 +833,7 @@ func TestCheckCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 		time.Sleep(150 * time.Millisecond)
 		cancel()
 	}()
-	if err := s.(plugin.Checker).Check(ctx); !errors.Is(err, context.Canceled) {
+	if err := s.(instances.Checker).Check(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Check = %v, want context.Canceled", err)
 	}
 }
@@ -845,7 +850,7 @@ func TestCheckFailsWithoutThePasswordFile(t *testing.T) {
 	if err := os.Remove(pass); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("Check passed without the password file")
 	}
 }
@@ -861,7 +866,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+		if err := s.(instances.Checker).Check(context.Background()); err == nil {
 			t.Fatal("a failing pg_dump --version passed Check")
 		}
 	})
@@ -872,7 +877,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+		if err := s.(instances.Checker).Check(context.Background()); err == nil {
 			t.Fatal("an unreadable pg_dump version passed Check")
 		}
 	})
@@ -883,7 +888,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+		if err := s.(instances.Checker).Check(context.Background()); err == nil {
 			t.Fatal("an unparsable pg_dump version passed Check")
 		}
 	})
@@ -896,7 +901,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+		if err := s.(instances.Checker).Check(context.Background()); err == nil {
 			t.Fatal("a failing psql query passed Check")
 		}
 	})
@@ -908,7 +913,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+		if err := s.(instances.Checker).Check(context.Background()); err == nil {
 			t.Fatal("an unparsable server version passed Check")
 		}
 	})
@@ -946,7 +951,7 @@ func TestDumpFailsWhenPgDumpIsMissing(t *testing.T) {
 	if err == nil {
 		t.Fatal("Dump reported success without pg_dump")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -987,7 +992,7 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		_, err = s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
 			Mode: source.ApplyInPlace, Label: "l", Options: jsontext.Value(restoreOptions),
 		}, strings.NewReader("x"))
-		if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 			t.Fatalf("class = %q, want transient (%v)", class, err)
 		}
 	})
@@ -1103,7 +1108,7 @@ func TestApplyJobsNeedsARegularFile(t *testing.T) {
 	if err == nil {
 		t.Fatal("jobs > 1 accepted an artifact that is not a regular file")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }

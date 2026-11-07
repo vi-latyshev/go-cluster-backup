@@ -18,17 +18,22 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/files"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source/sourcetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sourcetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := files.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, files.Spec, func(lr *loader.Registry) error {
+		return files.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -41,8 +46,8 @@ func build(t *testing.T, cfg string) (source.Source, error) {
 
 func buildLogged(t *testing.T, cfg string, log *slog.Logger) (source.Source, error) {
 	t.Helper()
-	return plugin.Build(context.Background(), testRegistry(t), source.Kind, "files",
-		jsontext.Value(cfg), plugin.Deps{Instance: "files", Log: log})
+	return instances.Build(context.Background(), testRegistry(t), source.Kind, "files",
+		jsontext.Value(cfg), instances.Deps{Instance: "files", Log: log})
 }
 
 func config(root string, ignoreVanished bool) string {
@@ -232,14 +237,14 @@ func TestCheckRefusesMissingRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a missing root passed Check")
 	}
 	ok, err := build(t, config(tree(t), true))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ok.(plugin.Checker).Check(context.Background()); err != nil {
+	if err := ok.(instances.Checker).Check(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -437,7 +442,7 @@ func TestReviewCreatedSymlinkThroughInitiallySafeLiveChain(t *testing.T) {
 		{Name: "restored", Typeflag: tar.TypeSymlink, Linkname: "a/live"},
 		{Name: "a/x", Typeflag: tar.TypeSymlink, Linkname: ".."},
 	}, []string{"", ""})
-	if class, _ := plugin.ClassOf(err); err == nil || class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); err == nil || class != pluginerrors.ClassPermanent {
 		t.Fatalf("Apply = %v, want a permanent refusal of the live link", err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "restored")); err == nil {
@@ -525,7 +530,7 @@ func TestLifecycleL15LiveLinkTargetClosure(t *testing.T) {
 			tc.live(t, root, true)
 			err := applyAs(t, root, source.ApplyInPlace, tc.headers, make([]string, len(tc.headers)))
 			if tc.wantErr {
-				if class, _ := plugin.ClassOf(err); err == nil || class != plugin.ClassPermanent {
+				if class, _ := pluginerrors.ClassOf(err); err == nil || class != pluginerrors.ClassPermanent {
 					t.Fatalf("Apply = %v, want a permanent refusal", err)
 				}
 				if _, statErr := os.Lstat(filepath.Join(root, "restored")); statErr == nil {
@@ -612,7 +617,7 @@ func TestLifecycleL16SymlinkedRootIsTheOperatorsChoice(t *testing.T) {
 	err := applyAs(t, root, source.ApplyInPlace, []tar.Header{
 		{Name: "b.txt", Typeflag: tar.TypeReg, Mode: 0o644},
 	}, []string{"y"})
-	if class, _ := plugin.ClassOf(err); err == nil || class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); err == nil || class != pluginerrors.ClassPermanent {
 		t.Fatalf("Apply with a nonconforming inner link = %v, want permanent", err)
 	}
 	if !strings.Contains(err.Error(), `live symlink "bad"`) || !strings.Contains(err.Error(), "side_by_side") {
@@ -680,7 +685,7 @@ func TestLifecycleL1EntryBelowAnArchivedSymlink(t *testing.T) {
 			if err == nil {
 				t.Fatal("an entry below an archived symlink was applied")
 			}
-			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+			if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 				t.Fatalf("class = %q, want permanent (%v)", class, err)
 			}
 			target := applyTarget(root, mode)
@@ -711,7 +716,7 @@ func TestLifecycleL2TargetThatClimbsAfterAName(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "climbs after descending") {
 				t.Fatalf("Apply = %v, want the lexical refusal", err)
 			}
-			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+			if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 				t.Fatalf("class = %q, want permanent", class)
 			}
 			entries, readErr := os.ReadDir(applyTarget(root, mode))
@@ -738,7 +743,7 @@ func TestLifecycleL2bHardLinkToANonRegularTarget(t *testing.T) {
 			if err == nil {
 				t.Fatal("a hard link to a missing target was created")
 			}
-			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+			if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 				t.Fatalf("class = %q, want permanent (%v)", class, err)
 			}
 			target := applyTarget(root, mode)
@@ -770,11 +775,11 @@ func TestLifecycleL3HardLinkThroughANameAlias(t *testing.T) {
 	// Where the volume merges the two names, the target is the aliased
 	// symlink and the link is refused; where they are distinct, it is the
 	// regular file and the link is created.
-	wantClass := plugin.ClassPermanent
+	wantClass := pluginerrors.ClassPermanent
 	if !aliases {
 		wantClass = ""
 	}
-	if class, _ := plugin.ClassOf(err); class != wantClass {
+	if class, _ := pluginerrors.ClassOf(err); class != wantClass {
 		t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
 	}
 	_, statErr := os.Lstat(filepath.Join(root, "escape"))
@@ -802,11 +807,11 @@ func TestLifecycleL4EntryThroughANameAlias(t *testing.T) {
 			}
 			// The merged name is refused at the archived symlink; a distinct
 			// parent is simply absent, as it always was.
-			wantClass := plugin.ClassTransient
+			wantClass := pluginerrors.ClassTransient
 			if aliases {
-				wantClass = plugin.ClassPermanent
+				wantClass = pluginerrors.ClassPermanent
 			}
-			if class, _ := plugin.ClassOf(err); class != wantClass {
+			if class, _ := pluginerrors.ClassOf(err); class != wantClass {
 				t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
 			}
 			if _, err := os.Lstat(filepath.Join(applyTarget(root, mode), "foo")); err == nil {
@@ -833,11 +838,11 @@ func TestLifecycleL5EntryThroughANormalizationAlias(t *testing.T) {
 	}
 	// Normalized names meet the archived symlink; distinct ones leave an
 	// absent parent and the same transient fault as any missing directory.
-	wantClass := plugin.ClassTransient
+	wantClass := pluginerrors.ClassTransient
 	if aliases {
-		wantClass = plugin.ClassPermanent
+		wantClass = pluginerrors.ClassPermanent
 	}
-	if class, _ := plugin.ClassOf(err); class != wantClass {
+	if class, _ := pluginerrors.ClassOf(err); class != wantClass {
 		t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "foo")); err == nil {
@@ -862,7 +867,7 @@ func TestLifecycleL6LiveSymlinkParent(t *testing.T) {
 	if err == nil {
 		t.Fatal("an entry below a live symlink was applied")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "x")); err == nil {
@@ -1132,11 +1137,11 @@ func TestLifecycleL12ADirectoryIsNeverReplaced(t *testing.T) {
 			// directory where the volume merges the names, and a fresh link
 			// where it does not.
 			refused := !tc.alias || aliases
-			wantClass := plugin.Class("")
+			wantClass := pluginerrors.Class("")
 			if refused {
-				wantClass = plugin.ClassPermanent
+				wantClass = pluginerrors.ClassPermanent
 			}
-			if class, _ := plugin.ClassOf(err); class != wantClass {
+			if class, _ := pluginerrors.ClassOf(err); class != wantClass {
 				t.Fatalf("class = %q, want %q (%v)", class, wantClass, err)
 			}
 			if refused && !strings.Contains(err.Error(), "is a directory") {
@@ -1166,7 +1171,7 @@ func TestLifecycleL13HardLinkToAnArchivedSymlink(t *testing.T) {
 	if err == nil {
 		t.Fatal("a hard link to an archived symlink was created")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	if _, err := os.Lstat(filepath.Join(root, "h")); err == nil {
@@ -1419,7 +1424,7 @@ func TestDescribeAndCheckRespectCancellationAndShape(t *testing.T) {
 	if _, err := s.Describe(ctx); err == nil {
 		t.Error("Describe accepted a cancelled context")
 	}
-	if err := s.(plugin.Checker).Check(ctx); err == nil {
+	if err := s.(instances.Checker).Check(ctx); err == nil {
 		t.Error("Check accepted a cancelled context")
 	}
 
@@ -1431,7 +1436,7 @@ func TestDescribeAndCheckRespectCancellationAndShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := notDir.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := notDir.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a file passed Check as a root")
 	}
 }
@@ -1654,7 +1659,7 @@ func TestApplyRejectsUnsupportedEntryTypesBeforeWriting(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unsupported entry type was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	entries, err := os.ReadDir(root)
@@ -1695,16 +1700,16 @@ func (c *cancelOnRead) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
-func TestRegisterRefusesACancelledContextAndDefaultsTheLog(t *testing.T) {
+func TestApplyRefusesACancelledContextAndDefaultsTheLog(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := plugin.Build(ctx, testRegistry(t), source.Kind, "files",
-		jsontext.Value(config(tree(t), true)), plugin.Deps{Instance: "files"}); err == nil {
+	if _, err := instances.Build(ctx, testRegistry(t), source.Kind, "files",
+		jsontext.Value(config(tree(t), true)), instances.Deps{Instance: "files"}); err == nil {
 		t.Fatal("New accepted a cancelled context")
 	}
 	// A nil logger is replaced rather than dereferenced later.
-	s, err := plugin.Build(context.Background(), testRegistry(t), source.Kind, "files",
-		jsontext.Value(config(tree(t), true)), plugin.Deps{Instance: "files"})
+	s, err := instances.Build(context.Background(), testRegistry(t), source.Kind, "files",
+		jsontext.Value(config(tree(t), true)), instances.Deps{Instance: "files"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1754,7 +1759,7 @@ func TestApplyReportsARootItCannotCreate(t *testing.T) {
 	if err == nil {
 		t.Fatal("Apply made a restore root of a plain file")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -1772,7 +1777,7 @@ func TestLifecycleL12bDirectoryEntryOnAnArchivedSymlink(t *testing.T) {
 	if err == nil {
 		t.Fatal("a directory entry was materialised through an archived symlink")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	if link, err := os.Readlink(filepath.Join(root, "a", "x")); err != nil || link != ".." {
@@ -1827,7 +1832,7 @@ func TestApplyReadsTheArtifactInPlace(t *testing.T) {
 
 // TestApplyRefusesANonSeekableArtifact: the archive is probed and then
 // rewound, so a stream that cannot seek is refused before anything is written
-// — the engine hands this plugin a file.
+// — the restore workflow hands this plugin a file.
 func TestApplyRefusesANonSeekableArtifact(t *testing.T) {
 	root := t.TempDir()
 	s, err := build(t, config(root, true))
@@ -1840,7 +1845,7 @@ func TestApplyRefusesANonSeekableArtifact(t *testing.T) {
 	if err == nil {
 		t.Fatal("Apply accepted a stream that cannot be rewound")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	entries, err := os.ReadDir(root)
@@ -2270,7 +2275,7 @@ func TestApplyRefusesAnOwnerItCannotRestore(t *testing.T) {
 	if err == nil {
 		t.Fatal("a restore to another owner was accepted without the privilege")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }

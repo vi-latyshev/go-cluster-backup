@@ -2,9 +2,15 @@ package kubernetesconfigmap_test
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	"encoding/pem"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -12,13 +18,15 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/catalog"
-	"github.com/vi-latyshev/go-cluster-backup/internal/catalog/catalogtest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi/kubeapitest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog/catalogtest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog/kubernetesconfigmap"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 const (
@@ -27,284 +35,190 @@ const (
 
 	namespace = "infrastructure"
 	name      = "cluster-backup-catalog"
-	key       = "catalog.json"
+	leaseKey  = "lease.json"
 )
 
-var base = time.Date(2026, 10, 10, 4, 20, 0, 0, time.UTC)
-
 type configFixture struct {
-	APIHostEnv      string `json:"api_host_env"`
-	APIPortEnv      string `json:"api_port_env"`
-	TokenFile       string `json:"token_file"`
-	CAFile          string `json:"ca_file"`
-	RequestTimeout  string `json:"request_timeout"`
-	Namespace       string `json:"namespace"`
-	Name            string `json:"name"`
-	Key             string `json:"key"`
-	LeaseKeySuffix  string `json:"lease_key_suffix"`
-	MaxRuns         int    `json:"max_runs"`
-	MaxHistoryBytes int64  `json:"max_history_bytes"`
+	APIHostEnv     string `json:"api_host_env"`
+	APIPortEnv     string `json:"api_port_env"`
+	TokenFile      string `json:"token_file"`
+	CAFile         string `json:"ca_file"`
+	RequestTimeout string `json:"request_timeout"`
+	Namespace      string `json:"namespace"`
+	Name           string `json:"name"`
+	LeaseKey       string `json:"lease_key"`
 }
 
-func registry(t *testing.T) *plugin.Registry {
+func registry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := kubernetesconfigmap.Register(r); err != nil {
+	lr := loader.New()
+	factories := instances.NewRegistry()
+	if err := loader.Add(lr, kubernetesconfigmap.Spec, func(lr *loader.Registry) error {
+		return kubernetesconfigmap.Apply(lr, factories)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	return r
+	return factories
 }
 
-func newCatalogIn(t *testing.T, srv *kubeapitest.Server, maxRuns int) catalog.Catalog {
-	t.Helper()
-	return newCatalogInBytes(t, srv, maxRuns, 512<<10)
-}
-
-func newCatalogInBytes(t *testing.T, srv *kubeapitest.Server, maxRuns int, maxBytes int64) catalog.Catalog {
+func newCatalogIn(t *testing.T, srv *kubeapitest.Server) catalog.Catalog {
 	t.Helper()
 	opts := srv.Connection(t, testHostEnv, testPortEnv)
-	cfg := configFixture{
+	return buildCatalog(t, configFixture{
 		APIHostEnv: testHostEnv, APIPortEnv: testPortEnv,
 		TokenFile: opts.TokenFile, CAFile: opts.CAFile,
 		RequestTimeout: "10s",
-		Namespace:      namespace, Name: name, Key: key, LeaseKeySuffix: ".lease",
-		MaxRuns: maxRuns, MaxHistoryBytes: maxBytes,
-	}
+		Namespace:      namespace, Name: name, LeaseKey: leaseKey,
+	})
+}
+
+func buildCatalog(t *testing.T, cfg configFixture) catalog.Catalog {
+	t.Helper()
 	raw, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c, err := plugin.Build(context.Background(), registry(t), catalog.Kind, "kubernetes_configmap",
-		jsontext.Value(raw), plugin.Deps{Instance: "catalog", Log: slog.New(slog.DiscardHandler)})
+	c, err := instances.Build(context.Background(), registry(t), catalog.Kind, "kubernetes_configmap",
+		jsontext.Value(raw), instances.Deps{Instance: "catalog", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return c
 }
 
-func report(id string, at time.Time, outcome model.Outcome) model.RunReport {
-	return model.RunReport{RunID: id, StartedAt: at, Outcome: outcome}
+func leaseConfig(hostEnv, portEnv, tokenFile, caFile string) configFixture {
+	return configFixture{
+		APIHostEnv: hostEnv, APIPortEnv: portEnv, TokenFile: tokenFile, CAFile: caFile,
+		RequestTimeout: "10s", Namespace: namespace, Name: name, LeaseKey: leaseKey,
+	}
 }
 
 func TestGeneralConformance(t *testing.T) {
 	plugintest.CheckSpec(t, registry(t))
 }
 
+// TestApplyContributesCompiledDescriptor: registration is memory-only and the
+// descriptor stays visible whatever the selection, so merge, schema and
+// `plugins describe` never depend on the deployment enabling the catalog.
+func TestApplyContributesCompiledDescriptor(t *testing.T) {
+	lr := loader.New()
+	factories := instances.NewRegistry()
+	if err := loader.Add(lr, kubernetesconfigmap.Spec, func(lr *loader.Registry) error {
+		return kubernetesconfigmap.Apply(lr, factories)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ds := loader.All(lr, instances.Descriptors)
+	if len(ds) != 1 {
+		t.Fatalf("descriptors %+v", ds)
+	}
+	if ds[0].ID != "catalog/kubernetes_configmap" || ds[0].ID != kubernetesconfigmap.Spec.ID {
+		t.Fatalf("descriptor id %q, spec id %q", ds[0].ID, kubernetesconfigmap.Spec.ID)
+	}
+	if ds[0].Summary != kubernetesconfigmap.Spec.Summary {
+		t.Fatalf("descriptor summary %q, spec summary %q", ds[0].Summary, kubernetesconfigmap.Spec.Summary)
+	}
+}
+
 func TestCatalogConformance(t *testing.T) {
 	catalogtest.Run(t, func(t *testing.T) catalog.Catalog {
 		srv := kubeapitest.New(t)
-		// The manifest creates the object; an empty history lives in it.
+		// The deployment manifest creates the object; the record inside it
+		// starts with no holder.
 		srv.AddConfigMap(namespace, name, map[string]string{})
-		return newCatalogIn(t, srv, 60)
+		return newCatalogIn(t, srv)
 	})
 }
 
-// TestAbsentConfigMap: reads of an object that does not exist yet see an empty
-// history, and a save reports not_found — nothing here creates it.
+// TestAbsentConfigMap: without the object there is no claim to take, mark or
+// clear, and each of those reports not_found; Release is a no-op because no
+// claim can exist, and preflight passes because the deployment manifest creates
+// the object before the first run.
 func TestAbsentConfigMap(t *testing.T) {
 	srv := kubeapitest.New(t)
-	c := newCatalogIn(t, srv, 10)
+	c := newCatalogIn(t, srv)
 	ctx := context.Background()
+	lease := catalog.Lease{Holder: "run-a", Token: "t"}
 
-	runs, err := c.Load(ctx, catalog.LoadRequest{})
-	if err != nil || len(runs) != 0 {
-		t.Fatalf("Load = %v, %v", runs, err)
+	_, err := c.Acquire(ctx, catalog.LeaseRequest{Holder: "run-a"})
+	if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "deployment manifest creates it") {
+		t.Fatalf("Acquire = %v, want the missing ConfigMap named", err)
 	}
-	if err := c.Forget(ctx, []string{"r1"}); err != nil {
-		t.Fatalf("Forget = %v", err)
-	}
-	err = c.Save(ctx, report("r1", base, model.OutcomeRunning))
-	if err == nil || !strings.Contains(err.Error(), name) {
-		t.Fatalf("Save = %v, want the missing ConfigMap named", err)
-	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassNotFound {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassNotFound {
 		t.Fatalf("class = %q, want not_found", class)
 	}
+	if err := c.MarkUncertainty(ctx, lease); err == nil {
+		t.Fatal("MarkUncertainty on an absent ConfigMap = nil")
+	}
+	if err := c.ClearUncertainty(ctx, lease); err == nil {
+		t.Fatal("ClearUncertainty on an absent ConfigMap = nil")
+	}
+	if err := c.(catalog.UncertaintyObserver).ObserveUncertainty(ctx, lease, "d"); err == nil {
+		t.Fatal("ObserveUncertainty on an absent ConfigMap = nil")
+	}
+	if err := c.Release(ctx, lease); err != nil {
+		t.Fatalf("Release without a ConfigMap = %v, want a no-op", err)
+	}
+	if err := c.(instances.Checker).Check(ctx); err != nil {
+		t.Fatalf("Check without a ConfigMap = %v; the deployment manifest creates it", err)
+	}
 	if srv.ConfigMapData(namespace, name) != nil {
-		t.Fatal("Save created the ConfigMap")
+		t.Fatal("the catalog created the ConfigMap")
 	}
 }
 
-// TestSaveUpsertsAndTrims: the history keeps the newest max_runs entries, and
-// the final outcome of a run replaces its own "running" entry.
-func TestSaveUpsertsAndTrims(t *testing.T) {
+// TestCheckSurfacesADeniedRead: RBAC that refuses the ConfigMap fails preflight
+// with a permanent error naming the status.
+func TestCheckSurfacesADeniedRead(t *testing.T) {
 	srv := kubeapitest.New(t)
 	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogIn(t, srv, 2)
-	ctx := context.Background()
-
-	if err := c.Save(ctx, report("r1", base, model.OutcomeDelivered)); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Save(ctx, report("r2", base.AddDate(0, 0, 1), model.OutcomeRunning)); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Save(ctx, report("r3", base.AddDate(0, 0, 2), model.OutcomeDelivered)); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Save(ctx, report("r2", base.AddDate(0, 0, 1), model.OutcomeDelivered)); err != nil {
-		t.Fatal(err)
-	}
-	runs, err := c.Load(ctx, catalog.LoadRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 2 || runs[0].RunID != "r3" || runs[1].RunID != "r2" || runs[1].Outcome != model.OutcomeDelivered {
-		t.Fatalf("stored runs = %+v", runs)
-	}
-	if raw := srv.ConfigMapData(namespace, name)[key]; raw == "" {
-		t.Fatal("the history was not written under the configured key")
-	}
-}
-
-// TestLoadSortsWhatItReads: entries are served newest first even when the
-// stored order is not.
-func TestLoadSortsWhatItReads(t *testing.T) {
-	srv := kubeapitest.New(t)
-	stored, err := json.Marshal([]model.RunReport{
-		report("old", base, model.OutcomeDelivered),
-		report("new", base.AddDate(0, 0, 5), model.OutcomeDelivered),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv.AddConfigMap(namespace, name, map[string]string{key: string(stored)})
-	c := newCatalogIn(t, srv, 10)
-
-	runs, err := c.Load(context.Background(), catalog.LoadRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 2 || runs[0].RunID != "new" || runs[1].RunID != "old" {
-		t.Fatalf("Load = %+v", runs)
-	}
-	runs, err = c.Load(context.Background(), catalog.LoadRequest{Limit: 1})
-	if err != nil || len(runs) != 1 || runs[0].RunID != "new" {
-		t.Fatalf("limited Load = %+v, %v", runs, err)
-	}
-}
-
-// TestConflictIsTransient: a stale resourceVersion comes back as a transient
-// conflict; the engine's retry repeats the whole read-modify-write and the
-// second attempt succeeds.
-func TestConflictIsTransient(t *testing.T) {
-	srv := kubeapitest.New(t)
-	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogIn(t, srv, 10)
-	ctx := context.Background()
-
-	if err := c.Save(ctx, report("r1", base, model.OutcomeDelivered)); err != nil {
-		t.Fatal(err)
-	}
-	// The next update loses the version race: someone wrote between this
-	// Save's read and its write.
-	srv.ConflictNextPut = true
-	err := c.Save(ctx, report("r2", base.AddDate(0, 0, 1), model.OutcomeDelivered))
-	if err == nil || !strings.Contains(err.Error(), "409") {
-		t.Fatalf("Save = %v, want a 409", err)
-	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
-		t.Fatalf("class = %q, want transient", class)
-	}
-	if err := c.Save(ctx, report("r2", base.AddDate(0, 0, 1), model.OutcomeDelivered)); err != nil {
-		t.Fatalf("the retry after the conflict failed: %v", err)
-	}
-	runs, err := c.Load(ctx, catalog.LoadRequest{})
-	if err != nil || len(runs) != 2 {
-		t.Fatalf("Load = %+v, %v", runs, err)
-	}
-}
-
-// TestSizeGuard: a history over the limit fails with a message naming the
-// limit and max_runs, instead of letting the API server refuse the write.
-func TestSizeGuard(t *testing.T) {
-	srv := kubeapitest.New(t)
-	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogIn(t, srv, 10)
-	run := report("r1", base, model.OutcomeDelivered)
-	run.Artifacts = nil
-	err := c.Save(context.Background(), model.RunReport{
-		RunID: run.RunID, StartedAt: run.StartedAt, Outcome: run.Outcome,
-		Storages: []model.StorageResult{{Storage: "yandex", Error: strings.Repeat("x", 600<<10)}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "max_runs or max_history_bytes") {
-		t.Fatalf("Save = %v, want the size limit named", err)
-	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
-		t.Fatalf("class = %q, want permanent", class)
-	}
-	if data := srv.ConfigMapData(namespace, name); len(data) != 0 {
-		t.Fatalf("the oversized history was written: %v", data)
-	}
-}
-
-// TestForbiddenIsPermanent: RBAC that refuses the ConfigMap fails the save and
-// the preflight with a permanent error naming the status.
-func TestForbiddenIsPermanent(t *testing.T) {
-	srv := kubeapitest.New(t)
 	srv.Deny("configmaps/" + namespace + "/" + name)
-	c := newCatalogIn(t, srv, 10)
-	ctx := context.Background()
-
-	err := c.Save(ctx, report("r1", base, model.OutcomeDelivered))
+	err := newCatalogIn(t, srv).(instances.Checker).Check(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "403") {
-		t.Fatalf("Save = %v, want a 403", err)
-	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
-		t.Fatalf("class = %q, want permanent", class)
-	}
-	checker, ok := c.(plugin.Checker)
-	if !ok {
-		t.Fatal("the catalog does not implement plugin.Checker")
-	}
-	if err := checker.Check(ctx); err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("Check = %v, want a 403", err)
 	}
-}
-
-// TestCheckToleratesAnAbsentConfigMap: the first run legitimately finds the
-// object missing, and preflight must not refuse to start because of it.
-func TestCheckToleratesAnAbsentConfigMap(t *testing.T) {
-	srv := kubeapitest.New(t)
-	c := newCatalogIn(t, srv, 10)
-	checker, ok := c.(plugin.Checker)
-	if !ok {
-		t.Fatal("the catalog does not implement plugin.Checker")
-	}
-	if err := checker.Check(context.Background()); err != nil {
-		t.Fatalf("Check = %v", err)
-	}
-}
-
-// TestCorruptHistoryIsRefused: bytes that are not a run history are a
-// permanent error, not a silent wipe.
-func TestCorruptHistoryIsRefused(t *testing.T) {
-	srv := kubeapitest.New(t)
-	srv.AddConfigMap(namespace, name, map[string]string{key: "not json"})
-	c := newCatalogIn(t, srv, 10)
-	_, err := c.Load(context.Background(), catalog.LoadRequest{})
-	if err == nil || !strings.Contains(err.Error(), key) {
-		t.Fatalf("Load = %v, want the corrupt key named", err)
-	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent", class)
 	}
 }
 
-func TestCancelledContext(t *testing.T) {
-	srv := kubeapitest.New(t)
-	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogIn(t, srv, 10)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := c.Save(ctx, report("r1", base, model.OutcomeDelivered)); err == nil {
-		t.Error("Save returned success on a cancelled context")
+// TestAClientThatCannotBeBuiltIsPermanent: every call reports the same
+// construction failure, so a misconfigured deployment fails loudly instead of
+// retrying a name that will never resolve.
+func TestAClientThatCannotBeBuiltIsPermanent(t *testing.T) {
+	const unsetHostEnv = "GCB_COVERAGE_UNSET_HOST"
+	t.Setenv(unsetHostEnv, "")
+	c := buildCatalog(t, leaseConfig(unsetHostEnv, testPortEnv, "/var/run/token", "/var/run/ca.crt"))
+	ctx := context.Background()
+
+	failures := map[string]func() error{
+		"Check": func() error { return c.(instances.Checker).Check(ctx) },
+		"Acquire": func() error {
+			_, err := c.Acquire(ctx, catalog.LeaseRequest{Holder: "run"})
+			return err
+		},
+		"MarkUncertainty":  func() error { return c.MarkUncertainty(ctx, catalog.Lease{Token: "t"}) },
+		"ClearUncertainty": func() error { return c.ClearUncertainty(ctx, catalog.Lease{Token: "t"}) },
+		"ObserveUncertainty": func() error {
+			return c.(catalog.UncertaintyObserver).ObserveUncertainty(ctx, catalog.Lease{Token: "t"}, "d")
+		},
+		"Release": func() error { return c.Release(ctx, catalog.Lease{Token: "t"}) },
+		"HolderState": func() error {
+			_, _, err := c.(catalog.Liveness).HolderState(ctx, catalog.Lease{
+				HolderNamespace: namespace, HolderPod: "backup-a", HolderUID: "uid-a"})
+			return err
+		},
 	}
-	if _, err := c.Load(ctx, catalog.LoadRequest{}); err == nil {
-		t.Error("Load returned success on a cancelled context")
-	}
-	if err := c.Forget(ctx, []string{"r1"}); err == nil {
-		t.Error("Forget returned success on a cancelled context")
+	for name, call := range failures {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if err == nil {
+				t.Fatal("a client that cannot be built was not reported")
+			}
+			if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+				t.Fatalf("class = %q, want permanent: %v", class, err)
+			}
+		})
 	}
 }
 
@@ -313,8 +227,7 @@ func TestConfigValidation(t *testing.T) {
 		cfg := configFixture{
 			APIHostEnv: testHostEnv, APIPortEnv: testPortEnv,
 			TokenFile: "/var/run/token", CAFile: "/var/run/ca.crt",
-			RequestTimeout: "10s", Namespace: namespace, Name: name, Key: key,
-			MaxRuns: 10, MaxHistoryBytes: 512 << 10,
+			RequestTimeout: "10s", Namespace: namespace, Name: name, LeaseKey: leaseKey,
 		}
 		mutate(&cfg)
 		raw, err := json.Marshal(cfg)
@@ -323,17 +236,21 @@ func TestConfigValidation(t *testing.T) {
 		}
 		return jsontext.Value(raw)
 	}
+	if err := registry(t).Check("catalog", "kubernetes_configmap", base(func(*configFixture) {})); err != nil {
+		t.Fatalf("the valid config = %v", err)
+	}
 	cases := map[string]struct {
 		raw  jsontext.Value
 		want string
 	}{
-		"relative token file":   {base(func(c *configFixture) { c.TokenFile = "token" }), "/token_file"},
-		"empty key":             {base(func(c *configFixture) { c.Key = "" }), "/key is empty"},
-		"empty name":            {base(func(c *configFixture) { c.Name = "" }), "/name is empty"},
-		"zero max_runs":         {base(func(c *configFixture) { c.MaxRuns = 0 }), "/max_runs"},
-		"zero history bound":    {base(func(c *configFixture) { c.MaxHistoryBytes = 0 }), "/max_history_bytes"},
-		"history bound too big": {base(func(c *configFixture) { c.MaxHistoryBytes = 1 << 20 }), "ConfigMap object limit"},
-		"zero timeout":          {base(func(c *configFixture) { c.RequestTimeout = "0s" }), "/request_timeout"},
+		"empty host env":      {base(func(c *configFixture) { c.APIHostEnv = "" }), "/api_host_env is empty"},
+		"empty port env":      {base(func(c *configFixture) { c.APIPortEnv = "" }), "/api_port_env is empty"},
+		"relative token file": {base(func(c *configFixture) { c.TokenFile = "token" }), "/token_file"},
+		"relative ca file":    {base(func(c *configFixture) { c.CAFile = "ca.crt" }), "/ca_file"},
+		"zero timeout":        {base(func(c *configFixture) { c.RequestTimeout = "0s" }), "/request_timeout"},
+		"empty namespace":     {base(func(c *configFixture) { c.Namespace = "" }), "/namespace is empty"},
+		"empty name":          {base(func(c *configFixture) { c.Name = "" }), "/name is empty"},
+		"empty lease key":     {base(func(c *configFixture) { c.LeaseKey = "" }), "/lease_key is empty"},
 	}
 	for testName, tc := range cases {
 		t.Run(testName, func(t *testing.T) {
@@ -345,126 +262,105 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-// TestHistoryOverByteLimitDropsOldest: the byte bound trims the oldest entries
-// until the history fits — it is a backstop under max_runs, and refusing the
-// whole save would fail every later Save on an unchanged, still oversized
-// history. What trimming cannot fix (the newest entry alone over the bound)
-// stays a named permanent error and leaves the stored history untouched.
-func TestHistoryOverByteLimitDropsOldest(t *testing.T) {
-	srv := kubeapitest.New(t)
-	srv.AddConfigMap(namespace, name, map[string]string{})
-	ctx := context.Background()
-
-	// The newest entry is the last-good one, which byte trimming protects; the
-	// older, failed entry is what the backstop may drop.
-	small := report("r1", base, model.OutcomeFailed)
-	fat := report("r2", base.Add(time.Minute), model.OutcomeDelivered)
-	fat.Storages = []model.StorageResult{{Storage: "yandex", Error: strings.Repeat("x", 400)}}
-	smallRaw, err := json.Marshal([]model.RunReport{small})
-	if err != nil {
-		t.Fatal(err)
+// TestNewRefusesACancelledContext: a cancelled context stops the constructor
+// before it builds anything.
+func TestNewRefusesACancelledContext(t *testing.T) {
+	cfg := kubernetesconfigmap.Config{
+		APIHostEnv: "GCB_HOST", APIPortEnv: "GCB_PORT", TokenFile: "/var/run/token", CAFile: "/var/run/ca.crt",
+		RequestTimeout: model.Duration(10 * time.Second), Namespace: namespace, Name: name, LeaseKey: leaseKey,
 	}
-	fatRaw, err := json.Marshal([]model.RunReport{fat})
-	if err != nil {
-		t.Fatal(err)
+	c, err := kubernetesconfigmap.New(context.Background(), cfg, instances.Deps{})
+	if err != nil || c == nil {
+		t.Fatalf("New = %v, %v", c, err)
 	}
-	// The bound admits the fat run alone but not the small one beside it.
-	c := newCatalogInBytes(t, srv, 10, int64(len(fatRaw)+8))
-	if err := c.Save(ctx, small); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Save(ctx, fat); err != nil {
-		t.Fatalf("Save with an over-bound history = %v, want the oldest entry dropped", err)
-	}
-	runs, err := c.Load(ctx, catalog.LoadRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(runs) != 1 || runs[0].RunID != "r2" {
-		t.Fatalf("stored runs = %+v, want r2 alone", runs)
-	}
-	if len(fatRaw) <= len(smallRaw) {
-		t.Fatalf("the fixture sizes did not order as intended: small %d, fat %d", len(smallRaw), len(fatRaw))
-	}
-
-	huge := report("r3", base.Add(2*time.Minute), model.OutcomeDelivered)
-	huge.Storages = []model.StorageResult{{Storage: "yandex", Error: strings.Repeat("x", 900)}}
-	err = c.Save(ctx, huge)
-	if err == nil || !strings.Contains(err.Error(), "the newest run alone is") {
-		t.Fatalf("Save = %v, want the single-entry refusal", err)
-	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
-		t.Fatalf("class = %q, want permanent", class)
-	}
-	if runs, _ = c.Load(ctx, catalog.LoadRequest{}); len(runs) != 1 || runs[0].RunID != "r2" {
-		t.Fatalf("the refused save changed the history: %+v", runs)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := kubernetesconfigmap.New(ctx, cfg, instances.Deps{}); err == nil {
+		t.Fatal("New built a catalog on a cancelled context")
 	}
 }
 
-// TestLeaseLifecycle: the writer lease lives in a second key of the same
-// ConfigMap, taken under the resourceVersion CAS. A held claim refuses; a claim
-// is taken over only by a request carrying its exact token (the engine sets it
-// after proving the holder terminated); Release with a foreign token is a no-op;
-// and the run history in the other key is untouched by any of it.
-func TestLeaseLifecycle(t *testing.T) {
+// TestConfigMapWithoutAVersionIsNotOneToWriteTo: a read answered without a
+// resourceVersion is not an object to take, mark, clear or release a claim
+// against, because an unconditional patch is not a compare-and-swap.
+func TestConfigMapWithoutAVersionIsNotOneToWriteTo(t *testing.T) {
+	c := emptyVersionCatalog(t)
+	ctx := context.Background()
+	lease := catalog.Lease{Token: "t"}
+
+	_, err := c.Acquire(ctx, catalog.LeaseRequest{Holder: "run", Kind: model.RunKindManual})
+	if err == nil || !strings.Contains(err.Error(), "is not a claim to write to") {
+		t.Fatalf("Acquire = %v, want the unversioned-ConfigMap refusal", err)
+	}
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassNotFound {
+		t.Fatalf("class = %q, want not_found", class)
+	}
+	if err := c.MarkUncertainty(ctx, lease); err == nil {
+		t.Fatal("MarkUncertainty on an unversioned ConfigMap = nil")
+	}
+	if err := c.ClearUncertainty(ctx, lease); err == nil {
+		t.Fatal("ClearUncertainty on an unversioned ConfigMap = nil")
+	}
+	if err := c.(catalog.UncertaintyObserver).ObserveUncertainty(ctx, lease, "d"); err == nil {
+		t.Fatal("ObserveUncertainty on an unversioned ConfigMap = nil")
+	}
+	if err := c.Release(ctx, lease); err != nil {
+		t.Fatalf("Release = %v, want a no-op", err)
+	}
+	if err := c.(instances.Checker).Check(ctx); err != nil {
+		t.Fatalf("Check = %v", err)
+	}
+}
+
+// emptyVersionCatalog points the plugin at an API server that answers a
+// ConfigMap read with an object carrying no resourceVersion — the one shape the
+// real API server never produces, and the reason an empty version reads as "not
+// there".
+func emptyVersionCatalog(t *testing.T) catalog.Catalog {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"metadata":{"name":"`+name+`","namespace":"`+namespace+`"},"data":{}}`); err != nil {
+			t.Errorf("stub: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	caPath := filepath.Join(dir, "ca.crt")
+	ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caPath, ca, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("token-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const hostEnv, portEnv = "GCB_STUB_HOST", "GCB_STUB_PORT"
+	t.Setenv(hostEnv, u.Hostname())
+	t.Setenv(portEnv, u.Port())
+	return buildCatalog(t, leaseConfig(hostEnv, portEnv, tokenPath, caPath))
+}
+
+// TestUnencodableLeaseIsPermanent: an identity string the JSON encoder cannot
+// render is refused as permanent, not silently dropped from the claim.
+func TestUnencodableLeaseIsPermanent(t *testing.T) {
 	srv := kubeapitest.New(t)
 	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogIn(t, srv, 60)
-	l, ok := c.(catalog.Leaser)
-	if !ok {
-		t.Fatal("the configmap catalog does not hold the writer lease")
+	c := newCatalogIn(t, srv)
+
+	_, err := c.Acquire(context.Background(), catalog.LeaseRequest{Holder: string([]byte{0xff})})
+	if err == nil || !strings.Contains(err.Error(), "encode lease") {
+		t.Fatalf("Acquire = %v, want the encode refusal", err)
 	}
-	ctx := context.Background()
-	first, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "20260101T040000Z", Kind: model.RunKindManual,
-		HolderPod: "backup-a", HolderUID: "uid-a"})
-	if err != nil {
-		t.Fatal(err)
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Fatalf("class = %q, want permanent", class)
 	}
-	if first.Token == "" || first.HolderPod != "backup-a" || first.HolderUID != "uid-a" {
-		t.Fatalf("the claim does not record its identity: %+v", first)
-	}
-	// A held claim refuses, and names itself.
-	held, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "other", Kind: model.RunKindScheduled})
-	if !errors.Is(err, catalog.ErrLeaseHeld) {
-		t.Fatalf("a held claim was taken over: %v", err)
-	}
-	if held.Holder != first.Holder || held.Token != first.Token {
-		t.Fatalf("the refusal does not name the holder: %+v", held)
-	}
-	// The wrong takeover token is refused: the engine must prove THIS claim.
-	if _, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "other", Kind: model.RunKindScheduled,
-		TakeoverToken: "not-the-token"}); !errors.Is(err, catalog.ErrLeaseHeld) {
-		t.Fatalf("a foreign takeover token was accepted: %v", err)
-	}
-	// The exact token takes it over.
-	taken, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "20260101T050000Z", Kind: model.RunKindScheduled,
-		TakeoverToken: first.Token})
-	if err != nil {
-		t.Fatalf("a proven-dead claim was not taken over: %v", err)
-	}
-	if taken.Holder != "20260101T050000Z" || taken.Token == first.Token {
-		t.Fatalf("takeover returned %+v", taken)
-	}
-	// Release with the stale token is a no-op; the new holder's claim survives.
-	if err := l.Release(ctx, first); err != nil {
-		t.Fatal(err)
-	}
-	if held, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "third", Kind: model.RunKindScheduled}); !errors.Is(err, catalog.ErrLeaseHeld) || held.Holder != taken.Holder {
-		t.Fatalf("a stale release dropped the new holder's claim: %+v, %v", held, err)
-	}
-	// The run history in the other key is untouched by any of this.
-	if err := c.Save(ctx, report("r1", base, model.OutcomeDelivered)); err != nil {
-		t.Fatal(err)
-	}
-	if runs, err := c.Load(ctx, catalog.LoadRequest{}); err != nil || len(runs) != 1 {
-		t.Fatalf("the run history was disturbed by the lease: %+v, %v", runs, err)
-	}
-	// The holder's own release drops the claim; the next acquire takes it.
-	if err := l.Release(ctx, taken); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "next", Kind: model.RunKindManual}); err != nil {
-		t.Fatalf("a released claim was not takeable: %v", err)
+	if data := srv.ConfigMapData(namespace, name); len(data) != 0 {
+		t.Fatalf("the unencodable claim was written: %v", data)
 	}
 }
 
@@ -472,7 +368,7 @@ func TestLeaseLifecycle(t *testing.T) {
 // phase Succeeded/Failed is DEFINITIVE termination. An absent pod or a different
 // UID is proof only of the object being gone — a forced deletion can produce it
 // while the process still runs — so it is reported non-definitively and the
-// engine applies its hard bound. A running or pending pod, a partial identity
+// the protection lease applies its hard bound. A running or pending pod, a partial identity
 // and a failed read are all "not terminated".
 func TestHolderStateProvesTermination(t *testing.T) {
 	cases := []struct {
@@ -499,7 +395,7 @@ func TestHolderStateProvesTermination(t *testing.T) {
 			if tc.pod != "" {
 				srv.AddPod(tc.pod)
 			}
-			l := newCatalogIn(t, srv, 60).(catalog.Liveness)
+			l := newCatalogIn(t, srv).(catalog.Liveness)
 			terminated, definitive, err := l.HolderState(context.Background(), catalog.Lease{
 				Holder: "h", HolderNamespace: tc.namespace, HolderPod: "backup-a", HolderUID: tc.uid})
 			if err != nil {
@@ -514,102 +410,58 @@ func TestHolderStateProvesTermination(t *testing.T) {
 	srv := kubeapitest.New(t)
 	srv.AddConfigMap(namespace, name, map[string]string{})
 	srv.Fail("pods", 500)
-	l := newCatalogIn(t, srv, 60).(catalog.Liveness)
+	l := newCatalogIn(t, srv).(catalog.Liveness)
 	if terminated, _, err := l.HolderState(context.Background(), catalog.Lease{
 		Holder: "h", HolderNamespace: "infrastructure", HolderPod: "backup-a", HolderUID: "uid-a"}); terminated || err == nil {
 		t.Fatalf("a failed liveness read = %v, %v; want not terminated with an error", terminated, err)
 	}
 }
 
-// TestMaxRunsIsPerKind (C7): max_runs applies to each kind's own window, so a
-// manual flood cannot evict the scheduled history the nightly health reads.
-func TestMaxRunsIsPerKind(t *testing.T) {
+// TestTheObjectHoldsOnlyTheLease: the ConfigMap carries the lease record under
+// the configured key and nothing else — there is no run history to keep.
+func TestTheObjectHoldsOnlyTheLease(t *testing.T) {
 	srv := kubeapitest.New(t)
 	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogIn(t, srv, 2)
+	c := newCatalogIn(t, srv)
 	ctx := context.Background()
-	for i := 0; i < 4; i++ {
-		if err := c.Save(ctx, report(fmt.Sprintf("s%d", i), base.Add(time.Duration(i)*time.Minute), model.OutcomeDelivered)); err != nil {
-			t.Fatal(err)
-		}
-		manual := report(fmt.Sprintf("m%d-manual", i), base.Add(time.Duration(i)*time.Minute+30*time.Second), model.OutcomeDelivered)
-		manual.Kind = model.RunKindManual
-		if err := c.Save(ctx, manual); err != nil {
-			t.Fatal(err)
-		}
+	if err := c.(instances.Checker).Check(ctx); err != nil {
+		t.Fatalf("Check on a readable ConfigMap = %v", err)
 	}
-	runs, err := c.Load(ctx, catalog.LoadRequest{})
+
+	held, err := c.Acquire(ctx, catalog.LeaseRequest{Holder: "run-a", Kind: model.RunKindScheduled})
 	if err != nil {
 		t.Fatal(err)
 	}
-	count := map[model.RunKind]int{}
-	for _, r := range runs {
-		count[model.NormalizeKind(r.Kind)]++
+	if err := c.MarkUncertainty(ctx, markedLease(held, "run-a")); err != nil {
+		t.Fatal(err)
 	}
-	if count[model.RunKindScheduled] != 2 || count[model.RunKindManual] != 2 {
-		t.Fatalf("windows = %v, want 2 scheduled and 2 manual", count)
+	if err := c.Release(ctx, held); err != nil {
+		t.Fatal(err)
 	}
-	seen := map[string]bool{}
-	for _, r := range runs {
-		seen[r.RunID] = true
+	data := srv.ConfigMapData(namespace, name)
+	if len(data) != 1 {
+		t.Fatalf("stored keys = %v, want the lease key alone", data)
 	}
-	for _, id := range []string{"s3", "s2", "m3-manual", "m2-manual"} {
-		if !seen[id] {
-			t.Fatalf("%s was evicted from its own kind's window: %v", id, seen)
-		}
+	// The released record carries no holder fields and keeps the uncertainty.
+	second, err := c.Acquire(ctx, catalog.LeaseRequest{Holder: "run-b", Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Uncertainty == nil || !slices.Equal(second.Uncertainty.RunIDs, []string{"run-a"}) {
+		t.Fatalf("the released record's uncertainty was not inherited: %+v", second.Uncertainty)
+	}
+	record := readRecord(t, srv)
+	if record.Holder != "run-b" || record.Kind != model.RunKindScheduled {
+		t.Fatalf("stored claim = %+v, want run-b", record)
 	}
 }
 
-// TestByteTrimDropsManualFirstAndProtectsScheduledHealth (C7): the byte backstop
-// sheds extra manual entries first, and never the newest scheduled running or
-// last-good record.
-func TestByteTrimDropsManualFirstAndProtectsScheduledHealth(t *testing.T) {
-	ctx := context.Background()
-	running := report("running", base.Add(4*time.Minute), model.OutcomeRunning)
-	lastGood := report("lastgood", base.Add(2*time.Minute), model.OutcomeDelivered)
-	older := report("older", base.Add(time.Minute), model.OutcomeDelivered)
-	manualRun := report("manual", base.Add(3*time.Minute), model.OutcomeDelivered)
-	manualRun.RunID = "manual-manual"
-	manualRun.Kind = model.RunKindManual
-
-	// Newest first: the newest entry (the running one) always stays; the manual
-	// entry sits behind it and is what the backstop sheds.
-	base3 := []model.RunReport{running, manualRun, lastGood, older}
-	full, err := json.Marshal(base3)
-	if err != nil {
-		t.Fatal(err)
+// readRecord decodes the lease record the fake API server stores.
+func readRecord(t *testing.T, srv *kubeapitest.Server) catalog.Lease {
+	t.Helper()
+	var lease catalog.Lease
+	if err := json.Unmarshal([]byte(srv.ConfigMapData(namespace, name)[leaseKey]), &lease); err != nil {
+		t.Fatalf("the stored lease record: %v", err)
 	}
-	// A bound that fits the scheduled trio and the newest manual? We size it so
-	// the manual entry has to go and the scheduled trio fits.
-	withoutManual, err := json.Marshal([]model.RunReport{running, lastGood, older})
-	if err != nil {
-		t.Fatal(err)
-	}
-	bound := int64(len(withoutManual) + 8)
-	if int64(len(full)) <= bound {
-		t.Fatalf("the fixture does not overflow: full %d, bound %d", len(full), bound)
-	}
-
-	srv := kubeapitest.New(t)
-	srv.AddConfigMap(namespace, name, map[string]string{})
-	c := newCatalogInBytes(t, srv, 10, bound)
-	for _, r := range []model.RunReport{older, lastGood, manualRun, running} {
-		if err := c.Save(ctx, r); err != nil {
-			t.Fatalf("Save %s: %v", r.RunID, err)
-		}
-	}
-	runs, err := c.Load(ctx, catalog.LoadRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	for _, r := range runs {
-		seen[r.RunID] = true
-	}
-	if seen["manual-manual"] {
-		t.Fatalf("the manual entry survived the byte backstop: %v", seen)
-	}
-	if !seen["running"] || !seen["lastgood"] {
-		t.Fatalf("the byte backstop dropped a scheduled health record: %v", seen)
-	}
+	return lease
 }

@@ -3,6 +3,9 @@
 /dist/
 *.test
 *.out
+# Tools built in place: `go build ./gen` / `go build ./rules` inside tools/.
+/tools/gen/gen
+/tools/rules/rules
 coverage.out
 coverage-e2e/
 

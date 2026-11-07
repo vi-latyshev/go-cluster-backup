@@ -14,39 +14,15 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 )
 
 type Config struct {
 	Root     string `json:"root" required:"true" doc:"directory acting as the storage root; every key lives under it"`
 	PageSize int    `json:"page_size" doc:"objects per listing page"`
-}
-
-// Register adds the local storage to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, storage.Kind, plugin.Spec[Config, storage.Storage]{
-		Type:      "local",
-		Summary:   "a local directory",
-		Stability: plugin.Stable,
-		Example:   []byte(`{"root": "/backup/exchange", "page_size": 1000}`),
-		New: func(ctx context.Context, cfg Config, deps plugin.Deps) (storage.Storage, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if cfg.Root == "" {
-				return nil, errors.New("root is empty")
-			}
-			if cfg.PageSize < 1 {
-				return nil, fmt.Errorf("page_size must be at least 1, got %d", cfg.PageSize)
-			}
-			if !filepath.IsAbs(cfg.Root) {
-				return nil, fmt.Errorf("root %q must be absolute", cfg.Root)
-			}
-			return &Storage{root: cfg.Root, page: cfg.PageSize}, nil
-		},
-	})
 }
 
 type Storage struct {
@@ -74,17 +50,17 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 	}
 	path, err := s.path(req.Key)
 	if err != nil {
-		return model.ObjectInfo{}, plugin.Permanent(err)
+		return model.ObjectInfo{}, pluginerrors.Permanent(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return model.ObjectInfo{}, plugin.Transient(err)
+		return model.ObjectInfo{}, pluginerrors.Transient(err)
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".put-*")
 	if err != nil {
-		return model.ObjectInfo{}, plugin.Transient(err)
+		return model.ObjectInfo{}, pluginerrors.Transient(err)
 	}
 	tmpName := tmp.Name()
-	n, err := plugin.CopyContext(ctx, tmp, body)
+	n, err := pluginio.CopyContext(ctx, tmp, body)
 	if err == nil {
 		if req.Size >= 0 && n != req.Size {
 			err = fmt.Errorf("read %d bytes, want %d", n, req.Size)
@@ -95,11 +71,11 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 	}
 	if err != nil {
 		_ = os.Remove(tmpName)
-		return model.ObjectInfo{}, plugin.Transient(err)
+		return model.ObjectInfo{}, pluginerrors.Transient(err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
-		return model.ObjectInfo{}, plugin.Transient(err)
+		return model.ObjectInfo{}, pluginerrors.Transient(err)
 	}
 	// The bytes landed, but the metadata read after the rename is still an OS
 	// call: a filesystem can refuse it (EIO, a network mount's ESTALE), and that
@@ -107,7 +83,7 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 	// run down without its retry classification.
 	st, err := statPath(path)
 	if err != nil {
-		return model.ObjectInfo{}, plugin.Transient(err)
+		return model.ObjectInfo{}, pluginerrors.Transient(err)
 	}
 	return model.ObjectInfo{Key: req.Key, Size: st.Size(), ModTime: st.ModTime()}, nil
 }
@@ -118,14 +94,14 @@ func (s *Storage) Stat(ctx context.Context, key string) (model.ObjectInfo, error
 	}
 	path, err := s.path(key)
 	if err != nil {
-		return model.ObjectInfo{}, plugin.Permanent(err)
+		return model.ObjectInfo{}, pluginerrors.Permanent(err)
 	}
 	st, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return model.ObjectInfo{}, plugin.NotFound(err)
+			return model.ObjectInfo{}, pluginerrors.NotFound(err)
 		}
-		return model.ObjectInfo{}, plugin.Transient(err)
+		return model.ObjectInfo{}, pluginerrors.Transient(err)
 	}
 	return model.ObjectInfo{Key: key, Size: st.Size(), ModTime: st.ModTime()}, nil
 }
@@ -135,7 +111,7 @@ func (s *Storage) List(ctx context.Context, req storage.ListRequest) (storage.Li
 		return storage.ListPage{}, err
 	}
 	if strings.HasPrefix(req.Prefix, "/") || strings.Contains(req.Prefix, "..") {
-		return storage.ListPage{}, plugin.Permanent(fmt.Errorf("prefix %q must be a relative path without \"..\"", req.Prefix))
+		return storage.ListPage{}, pluginerrors.Permanent(fmt.Errorf("prefix %q must be a relative path without \"..\"", req.Prefix))
 	}
 	var keys []string
 	// The walk is rooted at the storage root and yields paths already relative
@@ -161,7 +137,7 @@ func (s *Storage) List(ctx context.Context, req storage.ListRequest) (storage.Li
 		if ctx.Err() != nil {
 			return storage.ListPage{}, ctx.Err()
 		}
-		return storage.ListPage{}, plugin.Transient(err)
+		return storage.ListPage{}, pluginerrors.Transient(err)
 	}
 	sort.Strings(keys)
 	res := storage.ListPage{}
@@ -185,10 +161,10 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 	}
 	path, err := s.path(key)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	return nil
 }
@@ -199,18 +175,18 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 	}
 	path, err := s.path(key)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return plugin.NotFound(err)
+			return pluginerrors.NotFound(err)
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := plugin.CopyContext(ctx, dst, f); err != nil {
-		return plugin.Transient(err)
+	if _, err := pluginio.CopyContext(ctx, dst, f); err != nil {
+		return pluginerrors.Transient(err)
 	}
 	return nil
 }

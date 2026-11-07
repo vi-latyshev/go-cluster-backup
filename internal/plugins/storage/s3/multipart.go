@@ -11,8 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 )
 
 var _ storage.MultipartUploader = (*Storage)(nil)
@@ -22,30 +22,24 @@ var _ storage.MultipartUploader = (*Storage)(nil)
 // before a single part is sent.
 const maxParts = 10000
 
-// abortTimeoutDivisor scales the request timeout down for an abort: an abort
-// carries no body, so it neither needs nor deserves the time a large request is
-// allowed — and it runs exactly when the upload's deadline has just fired, where
-// every second it can spend is a second the run's ending needs.
-const abortTimeoutDivisor = 10
-
 // BeginMultipart opens one multipart upload. An object that fits one part is
-// answered with errors.ErrUnsupported and no request at all: the engine reads
+// answered with errors.ErrUnsupported and no request at all: transfer reads
 // that as "use Put", which is the one-request path this plugin stores a small
 // object with. An object that would need more parts than the service accepts is
 // refused here, permanently and before any request — the alternative is
 // uploading it for hours and failing the commit. The part size is this plugin's
-// configured part_bytes — the engine slices the object with it and sends every
+// configured part_bytes — transfer slices the object with it and sends every
 // part as its own call.
 func (s *Storage) BeginMultipart(ctx context.Context, req storage.PutRequest) (storage.MultipartSession, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.MultipartSession{}, err
 	}
 	if req.Size > s.cfg.MaxObjectBytes.Int64() {
-		return storage.MultipartSession{}, plugin.Permanent(
+		return storage.MultipartSession{}, pluginerrors.Permanent(
 			fmt.Errorf("object %s is %d bytes, above the endpoint limit of %d", req.Key, req.Size, s.cfg.MaxObjectBytes))
 	}
 	if parts := (req.Size + s.cfg.PartBytes.Int64() - 1) / s.cfg.PartBytes.Int64(); parts > maxParts {
-		return storage.MultipartSession{}, plugin.Permanent(fmt.Errorf(
+		return storage.MultipartSession{}, pluginerrors.Permanent(fmt.Errorf(
 			"object %s is %d bytes: %d parts of %d bytes, above the %d parts the service accepts in one upload",
 			req.Key, req.Size, parts, s.cfg.PartBytes, int64(maxParts)))
 	}
@@ -71,27 +65,27 @@ func (s *Storage) BeginMultipart(ctx context.Context, req storage.PutRequest) (s
 	}
 	id := aws.ToString(created.UploadId)
 	if id == "" {
-		return storage.MultipartSession{}, plugin.Transient(
+		return storage.MultipartSession{}, pluginerrors.Transient(
 			fmt.Errorf("create multipart upload %s answered no upload id", full))
 	}
 	return storage.MultipartSession{Key: req.Key, UploadID: id, PartSize: s.cfg.PartBytes.Int64()}, nil
 }
 
 // PutPart sends one part. Sending the same number again replaces it, which is
-// exactly what the engine's retry of one part relies on; the body is the reader
-// the engine handed over — a section of its spool file, seekable and bounded, so
+// exactly what execution's retry of one part relies on; the body is the reader
+// transfer handed over — a section of its spool file, seekable and bounded, so
 // no buffer of the part is held here — and the SDK signs the request over that
-// section. One attempt: a failed part is the engine's to retry.
+// section. One attempt: a failed part is execution's to retry.
 func (s *Storage) PutPart(ctx context.Context, session storage.MultipartSession, part storage.Part) (storage.PartResult, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.PartResult{}, err
 	}
 	if part.Number < 1 {
-		return storage.PartResult{}, plugin.Permanent(
+		return storage.PartResult{}, pluginerrors.Permanent(
 			fmt.Errorf("part number %d is not 1-based", part.Number))
 	}
 	if part.Size <= 0 || part.Size > s.cfg.PartBytes.Int64() {
-		return storage.PartResult{}, plugin.Permanent(fmt.Errorf(
+		return storage.PartResult{}, pluginerrors.Permanent(fmt.Errorf(
 			"part %d is %d bytes, and a part carries between 1 and %d", part.Number, part.Size, s.cfg.PartBytes))
 	}
 	// The object's final size is not known while it is produced: BeginMultipart's
@@ -102,7 +96,7 @@ func (s *Storage) PutPart(ctx context.Context, session storage.MultipartSession,
 	// even that bound past the endpoint's limit is refused before it is sent.
 	limit := s.cfg.MaxObjectBytes.Int64()
 	if part.Size > limit || int64(part.Number-1) > (limit-part.Size)/s.cfg.PartBytes.Int64() {
-		return storage.PartResult{}, plugin.Permanent(fmt.Errorf(
+		return storage.PartResult{}, pluginerrors.Permanent(fmt.Errorf(
 			"part %d of %s: a part of %d bytes at part size %d crosses max_object_bytes %d",
 			part.Number, session.Key, part.Size, s.cfg.PartBytes.Int64(), limit))
 	}
@@ -126,7 +120,7 @@ func (s *Storage) PutPart(ctx context.Context, session storage.MultipartSession,
 	}
 	etag := aws.ToString(out.ETag)
 	if etag == "" {
-		return storage.PartResult{}, plugin.Transient(
+		return storage.PartResult{}, pluginerrors.Transient(
 			fmt.Errorf("upload part %d of %s answered without an ETag: the part cannot be committed", part.Number, full))
 	}
 	return storage.PartResult{Number: part.Number, ETag: etag}, nil
@@ -134,17 +128,17 @@ func (s *Storage) PutPart(ctx context.Context, session storage.MultipartSession,
 
 // CompleteMultipart commits the upload. Retrying it is safe: parts the service
 // already holds are matched by number and ETag, and an upload that did commit is
-// answered "not found" on a second attempt — which the engine reads as the upload
+// answered "not found" on a second attempt — which transfer reads as the upload
 // being gone and settles with its own Stat of the object. A 200 that carries no
 // completion ETag is the service's "the upload did not commit" answer and must
-// not pass: the engine would otherwise verify a part list that was never
+// not pass: transfer would otherwise verify a part list that was never
 // assembled.
 func (s *Storage) CompleteMultipart(ctx context.Context, session storage.MultipartSession, parts []storage.PartResult) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if len(parts) == 0 {
-		return plugin.Permanent(fmt.Errorf("complete multipart upload %s: no parts were sent", session.Key))
+		return pluginerrors.Permanent(fmt.Errorf("complete multipart upload %s: no parts were sent", session.Key))
 	}
 	c, err := s.client()
 	if err != nil {
@@ -167,31 +161,31 @@ func (s *Storage) CompleteMultipart(ctx context.Context, session storage.Multipa
 		return s.classify(ctx, err, "complete multipart upload "+full)
 	}
 	if aws.ToString(out.ETag) == "" {
-		return plugin.Transient(fmt.Errorf(
+		return pluginerrors.Transient(fmt.Errorf(
 			"complete multipart upload %s answered 200 without a completion ETag: the upload is not committed", full))
 	}
 	return nil
 }
 
-// AbortMultipart discards the upload and every part it holds. The engine calls it
-// when the upload failed — including when the context that upload ran under is
-// already dead — so the call runs on its own context, detached from that one and
-// bounded by request_timeout divided by abortTimeoutDivisor. One attempt is all
-// it gets: an abort that fails leaves parts that are billed, which is worth a
-// line, never another upload. An upload already gone (NoSuchUpload) is nothing
-// left to clean, not an error.
+// AbortMultipart discards the upload and every part it holds. It runs under the
+// caller's context: the cleanup owner hands it a detached, bounded context, so
+// the abort spends the one cleanup deadline instead of inventing a budget of its
+// own. One attempt is all it gets: an abort that fails leaves parts that are
+// billed, which is worth a line, never another upload. An upload already gone
+// (NoSuchUpload) is nothing left to clean, not an error.
 func (s *Storage) AbortMultipart(ctx context.Context, session storage.MultipartSession) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if session.UploadID == "" {
-		return plugin.Permanent(fmt.Errorf("abort multipart upload %s: the session carries no upload id", session.Key))
+		return pluginerrors.Permanent(fmt.Errorf("abort multipart upload %s: the session carries no upload id", session.Key))
 	}
 	c, err := s.client()
 	if err != nil {
 		return err
 	}
 	full := s.key(session.Key)
-	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.RequestTimeout.Std()/abortTimeoutDivisor)
-	defer cancel()
-	_, err = c.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{
+	_, err = c.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(s.cfg.Bucket),
 		Key:      aws.String(full),
 		UploadId: aws.String(session.UploadID),
@@ -199,7 +193,7 @@ func (s *Storage) AbortMultipart(ctx context.Context, session storage.MultipartS
 	if err == nil || isNotFound(err) {
 		return nil
 	}
-	return s.classify(actx, err, "abort multipart upload "+full)
+	return s.classify(ctx, err, "abort multipart upload "+full)
 }
 
 // StaleMultipart lists the incomplete uploads under this storage's own prefix
@@ -209,7 +203,7 @@ func (s *Storage) AbortMultipart(ctx context.Context, session storage.MultipartS
 // skipped rather than handed to the caller — the prefix lookup never returns
 // one, and the guard costs nothing.
 // Inventory lists every incomplete upload under this storage's own prefix, of
-// any age, including one the service does not date: the engine uses it to know
+// any age, including one the service does not date: the protection ledger uses it to know
 // whether an earlier writer's parts make the storage's occupancy unknown.
 func (s *Storage) Inventory(ctx context.Context) ([]storage.StaleUpload, error) {
 	return s.listUploads(ctx, nil)
@@ -265,7 +259,7 @@ func (s *Storage) listUploads(ctx context.Context, olderThan *time.Time) ([]stor
 		// error rather than spending the storage's budget on the same page.
 		nextKey, nextID := aws.ToString(out.NextKeyMarker), aws.ToString(out.NextUploadIdMarker)
 		if nextKey == aws.ToString(in.KeyMarker) && nextID == aws.ToString(in.UploadIdMarker) {
-			return nil, plugin.Transient(fmt.Errorf("list multipart uploads %s: the markers did not advance", base))
+			return nil, pluginerrors.Transient(fmt.Errorf("list multipart uploads %s: the markers did not advance", base))
 		}
 		in.KeyMarker = out.NextKeyMarker
 		in.UploadIdMarker = out.NextUploadIdMarker

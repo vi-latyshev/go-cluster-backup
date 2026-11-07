@@ -10,27 +10,40 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/gfs"
-	"github.com/vi-latyshev/go-cluster-backup/internal/retention"
-	"github.com/vi-latyshev/go-cluster-backup/internal/retention/retentiontest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/retentiontest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testPlugin(t *testing.T) (*loader.Registry, *instances.Registry) {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := gfs.Register(r); err != nil {
+	lr := loader.New()
+	factories := instances.NewRegistry()
+	if err := loader.Add(lr, gfs.Spec, func(lr *loader.Registry) error {
+		return gfs.Apply(lr, factories)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	return r
+	if descs := loader.All(lr, instances.Descriptors); len(descs) != 1 || descs[0].ID != gfs.Spec.ID {
+		t.Fatalf("descriptors %v, want only %q", descs, gfs.Spec.ID)
+	}
+	return lr, factories
+}
+
+func testRegistry(t *testing.T) *instances.Registry {
+	t.Helper()
+	_, factories := testPlugin(t)
+	return factories
 }
 
 func newPolicy(t *testing.T, cfg string) retention.Retention {
 	t.Helper()
-	p, err := plugin.Build(context.Background(), testRegistry(t), retention.Kind, "gfs", jsontext.Value(cfg),
-		plugin.Deps{Instance: "gfs", Log: slog.New(slog.DiscardHandler)})
+	p, err := instances.Build(context.Background(), testRegistry(t), retention.Kind, "gfs", jsontext.Value(cfg),
+		instances.Deps{Instance: "gfs", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +192,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		`{"daily": 1, "weekly": 1, "monthly": 0, "timezone": "Not/AZone", "min_keep": 1, "count_incomplete": false}`,
 		`{"daily": 1, "weekly": 1, "monthly": 0, "timezone": "UTC", "min_keep": 0, "count_incomplete": false}`,
 	} {
-		if _, err := r.BuildAny(context.Background(), "retention", "gfs", jsontext.Value(raw), plugin.Deps{Instance: "gfs"}); err == nil {
+		if _, err := r.BuildAny(context.Background(), "retention", "gfs", jsontext.Value(raw), instances.Deps{Instance: "gfs"}); err == nil {
 			t.Errorf("config %s accepted", raw)
 		}
 	}
@@ -190,9 +203,9 @@ func TestNewRejectsBadConfig(t *testing.T) {
 func TestBuildReturnsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := plugin.Build(ctx, testRegistry(t), retention.Kind, "gfs",
+	_, err := instances.Build(ctx, testRegistry(t), retention.Kind, "gfs",
 		jsontext.Value(`{"daily": 7, "weekly": 4, "monthly": 0, "timezone": "UTC", "min_keep": 1, "count_incomplete": true}`),
-		plugin.Deps{Instance: "gfs", Log: slog.New(slog.DiscardHandler)})
+		instances.Deps{Instance: "gfs", Log: slog.New(slog.DiscardHandler)})
 	if err == nil {
 		t.Fatal("Build with a cancelled context succeeded")
 	}
@@ -212,7 +225,7 @@ func keepSet(t *testing.T, p retention.Retention, now time.Time, runs ...model.S
 
 // gfsCfg renders a complete gfs config: every test states the members it
 // cares about, and a strict decoder never sees one repeated. The byte cap is not
-// here — it belongs to the engine, on the storage envelope.
+// here — it belongs to the protection ledger, on the storage envelope.
 func gfsCfg(daily, weekly, monthly int, tz string, minKeep int, countIncomplete bool) string {
 	return fmt.Sprintf(
 		`{"daily": %d, "weekly": %d, "monthly": %d, "timezone": %q, "min_keep": %d, "count_incomplete": %t}`,
