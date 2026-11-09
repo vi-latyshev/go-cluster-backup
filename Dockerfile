@@ -1,7 +1,7 @@
 # The image ships the generic distribution: every plugin under internal/plugins
 # plus the k3s_state source. The build is multi-platform: the builder runs on the
 # build host's platform and cross-compiles the target.
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 # COVER=1 instruments the binary for coverage collection (it writes counters to
