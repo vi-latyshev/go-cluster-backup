@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"text/template"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // blankMarker is what {{ blank }} renders: one byte no message line may carry

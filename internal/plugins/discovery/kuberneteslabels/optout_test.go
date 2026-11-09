@@ -4,9 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi/kubeapitest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // foundWant is one line of the decision table: the source instance a rule

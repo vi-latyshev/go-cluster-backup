@@ -8,10 +8,14 @@ Backup and restore for Kubernetes clusters: label-driven discovery, one object p
 
 ## Everything is a plugin
 
-The engine only orchestrates. Discovery, sources, processors, storages,
-retention, catalog and notifications are plugins: a `type` plus the `config` a
-deployment states in one YAML file. A new plugin is one package and one
-registration line ([CONTRIBUTING.md](CONTRIBUTING.md)).
+The generic `internal/loader` composes compiled plugins. The flat Floor host
+`internal/plugins/cli` is registered by the generated root. `assembly` builds from
+Config; workflow plugins run backup, stage and restore over planning, execution,
+pipeline, transfer, inventory and protection plugins. Storage writes are guarded;
+only the protection ledger deletes ([architecture](CLAUDE.md#runtime-composition)).
+One document, without a `version` key, combines backup settings with
+[`plugins`](docs/configuration.md#plugins) selection and per-type settings.
+`plugins check` validates the compiled composition offline.
 
 ## Plugin catalogue
 
@@ -45,7 +49,7 @@ Type names are exactly as written in the configuration.
 | Type | Purpose |
 |---|---|
 | `s3` | any S3-compatible endpoint |
-| `yandex_disk` | the Yandex Disk REST API, scoped to one folder |
+| `yandex_disk` | the Yandex Disk REST API, scoped to one folder; bounded parallel listing |
 | `local` | a local directory |
 
 ### Retention
@@ -65,7 +69,10 @@ Type names are exactly as written in the configuration.
 
 | Type | Purpose |
 |---|---|
-| `kubernetes_configmap` | run history, writer lease and previous-run record in one ConfigMap |
+| `kubernetes_configmap` | writer lease in one ConfigMap; no run history |
+
+The `reporting` plugin derives previous-run information from storage manifests
+and the previous Job's status only for finished notifications.
 
 ### Notifications
 
@@ -78,7 +85,8 @@ artifact back — [docs/restore.md](docs/restore.md).
 
 ## How it works
 
-discovery → sources → processors → storages → retention → catalog + notify
+Discovery feeds sources, processors and storages. The catalog leases writes;
+retention manages stored runs, and notifications report results.
 
 ## Install
 
@@ -137,8 +145,9 @@ cosign verify ghcr.io/vi-latyshev/charts/go-cluster-backup:X.Y.Z \
 
 ## Versioning, third party, license
 
-Releases follow Semantic Versioning: a breaking change to the configuration
-schema or the chart is a major release; the stored backup format never breaks.
+Releases follow Semantic Versioning: breaking configuration, chart or
+stored-format changes require a major release. Only the
+[current strict backup format](docs/configuration.md#manifest) is supported.
 The image ships `redis-cli` from Alpine's `redis` package (AGPL-3.0-only OR
 SSPL-1.0) as an external client only.
 

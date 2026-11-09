@@ -3,18 +3,49 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/cli"
-	"github.com/vi-latyshev/go-cluster-backup/internal/defaults"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/all"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/cli"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration/defaults"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
 )
+
+// distribution is the production graph over a factory registry the test owns:
+// every compiled plugin, the CLI host and its roles.
+func distribution(t *testing.T) (*loader.Registry, *instances.Registry) {
+	t.Helper()
+	lr := loader.New()
+	reg := instances.NewRegistry()
+	if err := all.Compose(lr, reg); err != nil {
+		t.Fatal(err)
+	}
+	return lr, reg
+}
+
+// factories is the composition root's factory registry: every compiled plugin
+// registered once into a fresh registry.
+func factories(t *testing.T) *instances.Registry {
+	t.Helper()
+	_, reg := distribution(t)
+	return reg
+}
+
+// options is the distribution's command options: the compiled graph, its
+// factories and the module's embedded defaults.
+func options(t *testing.T) cli.Options {
+	t.Helper()
+	lr, reg := distribution(t)
+	return cli.Options{Program: "go-cluster-backup", Loader: lr, Factories: reg, Defaults: [][]byte{defaults.Defaults}}
+}
 
 // TestExamplesValidate keeps the shipped examples honest: every file under
 // examples/config is a configuration the strict decoder accepts, so the
@@ -30,9 +61,7 @@ func TestExamplesValidate(t *testing.T) {
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := cli.Main(context.Background(), cli.Options{
-				Program: "go-cluster-backup", Register: cli.Generic, Defaults: [][]byte{defaults.Defaults},
-			}, []string{"validate", "--config", path}, &stdout, &stderr)
+			code := cli.Main(context.Background(), options(t), []string{"validate", "--config", path}, &stdout, &stderr)
 			if code != 0 {
 				t.Fatalf("validate %s: exit %d\nstdout: %s\nstderr: %s", path, code, stdout.String(), stderr.String())
 			}
@@ -41,7 +70,7 @@ func TestExamplesValidate(t *testing.T) {
 }
 
 // TestExamplesResolveAManualRun: a shipped example must be able to start the
-// manual CronJob the chart enables by default. The engine refuses a manual run
+// manual CronJob the chart enables by default. The backup workflow refuses a manual run
 // on a storage with no `manual` retention partition before it does anything
 // else, so a config that only declares `scheduled` retention fails here — a
 // later failure (missing client binaries, no cluster reachable) is not this
@@ -57,9 +86,7 @@ func TestExamplesResolveAManualRun(t *testing.T) {
 	for _, path := range paths {
 		t.Run(filepath.Base(path), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			cli.Main(context.Background(), cli.Options{
-				Program: "go-cluster-backup", Register: cli.Generic, Defaults: [][]byte{defaults.Defaults},
-			}, []string{"run", "--config", path, "--kind", "manual", "--dry-run"}, &stdout, &stderr)
+			cli.Main(context.Background(), options(t), []string{"run", "--config", path, "--kind", "manual", "--dry-run"}, &stdout, &stderr)
 			if strings.Contains(stderr.String(), "retention/manual") {
 				t.Fatalf("the example cannot start a manual run:\n%s", stderr.String())
 			}
@@ -72,8 +99,7 @@ func TestExamplesResolveAManualRun(t *testing.T) {
 // command builds, secret files absent and all.
 func TestExampleConfigValidates(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := cli.Main(context.Background(),
-		cli.Options{Program: "go-cluster-backup", Register: cli.Generic, Defaults: [][]byte{defaults.Defaults}},
+	code := cli.Main(context.Background(), options(t),
 		[]string{"validate", "--config", filepath.Join("testdata", "config.yaml")},
 		&stdout, &stderr)
 	if code != 0 {
@@ -155,11 +181,7 @@ func TestExampleConfigDocumentsEveryPlugin(t *testing.T) {
 		}
 	}
 
-	reg := plugin.NewRegistry()
-	if err := cli.Generic(reg); err != nil {
-		t.Fatal(err)
-	}
-	for _, d := range reg.Descriptors() {
+	for _, d := range factories(t).Descriptors() {
 		if !present[d.Kind][d.Type] {
 			t.Errorf("the reference config has no %s instance of type %q", d.Kind, d.Type)
 		}
@@ -170,9 +192,7 @@ func TestExampleConfigDocumentsEveryPlugin(t *testing.T) {
 // plugin like any other — resolved by this distribution's own registration.
 func TestDistributionResolvesEveryPlugin(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := cli.Main(context.Background(), cli.Options{
-		Program: "go-cluster-backup", Register: cli.Generic, Defaults: [][]byte{defaults.Defaults},
-	}, []string{"plugins", "describe", "source/k3s_state"}, &stdout, &stderr)
+	code := cli.Main(context.Background(), options(t), []string{"plugins", "describe", "source/k3s_state"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("describe source/k3s_state: exit %d\nstderr: %s", code, stderr.String())
 	}
@@ -192,14 +212,16 @@ func TestDefaultsAreCheckedBeforeAnyCommand(t *testing.T) {
 	if bytes.Equal(broken, defaults.Defaults) {
 		t.Fatal("the document no longer carries the line this mutant rewrites")
 	}
+	lr, reg := distribution(t)
 	var stdout, stderr bytes.Buffer
 	code := cli.Main(context.Background(), cli.Options{
-		Program: "go-cluster-backup", Register: cli.Generic, Defaults: [][]byte{broken},
+		Program: "go-cluster-backup", Loader: lr, Factories: reg, Defaults: [][]byte{broken},
 	}, []string{"plugins"}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("a broken defaults document passed the check:\n%s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "/plugins/source/postgres/connect_attempts") {
+	// The pointer is RFC 6901: the plugin id's slash is escaped as ~1.
+	if !strings.Contains(stderr.String(), "/plugins/config/source~1postgres/connect_attempts") {
 		t.Errorf("the failure does not name the broken key:\n%s", stderr.String())
 	}
 }
@@ -208,9 +230,7 @@ func TestDefaultsAreCheckedBeforeAnyCommand(t *testing.T) {
 // document the defaults package embeds, comments included.
 func TestDefaultsArePrintedAsTheyAre(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := cli.Main(context.Background(), cli.Options{
-		Program: "go-cluster-backup", Register: cli.Generic, Defaults: [][]byte{defaults.Defaults},
-	}, []string{"config", "defaults"}, &stdout, &stderr)
+	code := cli.Main(context.Background(), options(t), []string{"config", "defaults"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("exit %d\n%s", code, stderr.String())
 	}
@@ -235,6 +255,52 @@ func TestRunWiresTheDistribution(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "go-cluster-backup — the service's defaults") {
 		t.Errorf("run did not answer with the embedded document:\n%s", stdout.String())
+	}
+}
+
+// TestRunDispatchesRoles drives the production wiring through the loader: the
+// default cli role keeps argv as it came, an explicit role token is stripped,
+// and an operational role completes the argv with its command.
+func TestRunDispatchesRoles(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"the default role keeps the argv", []string{"config", "defaults"}, "go-cluster-backup — the service's defaults"},
+		{"the cli role token is stripped", []string{"cli", "config", "defaults"}, "go-cluster-backup — the service's defaults"},
+		{"config-check is the validate command", []string{"config-check", "--config", filepath.Join("testdata", "config.yaml")}, "valid"},
+		{"the compiled schema answers plugins describe", []string{"plugins", "describe", "source/k3s_state"}, "sqlite3"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(context.Background(), tc.args, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run %v: exit %d\nstderr: %s", tc.args, code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), tc.want) {
+				t.Errorf("run %v answered %q, want %q", tc.args, stdout.String(), tc.want)
+			}
+		})
+	}
+}
+
+// TestRunReportsARefusedRegistration: a composition root that refuses to
+// register fails before any role runs, and the loader names the failure.
+func TestRunReportsARefusedRegistration(t *testing.T) {
+	original := registerAll
+	registerAll = func(*loader.Registry) error { return errors.New("boom") }
+	t.Cleanup(func() { registerAll = original })
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"config", "defaults"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("a refused registration exited %d, want 1\nstdout: %s\nstderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "registration failed: boom") {
+		t.Errorf("the refusal does not name the failure:\n%s", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("a refused registration ran a role:\n%s", stdout.String())
 	}
 }
 

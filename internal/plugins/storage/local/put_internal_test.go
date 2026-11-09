@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 )
 
 func TestPutReportsAStatFailureAfterTheRename(t *testing.T) {
@@ -26,7 +26,7 @@ func TestPutReportsAStatFailureAfterTheRename(t *testing.T) {
 	if err == nil {
 		t.Fatal("a stat failure after the rename was accepted")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 }

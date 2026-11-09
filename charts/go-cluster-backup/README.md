@@ -23,7 +23,7 @@ Kubernetes: `>=1.31.0-0`
 | CronJob | `<fullname>-manual` | never scheduled; start one Job from it by hand |
 | CronJob | `<fullname>-restore` | never scheduled; its args come from `restore.args` |
 | ConfigMap | `<fullname>-config` | the configuration, mounted at `/etc/go-cluster-backup/config.yaml` |
-| ConfigMap | `catalog.name` (default `<fullname>-catalog`) | the run index the tool writes; no `data`, annotated `helm.sh/resource-policy: keep` |
+| ConfigMap | `catalog.name` (default `<fullname>-catalog`) | the writer lease the tool writes; no `data`, annotated `helm.sh/resource-policy: keep` |
 | ServiceAccount | `<fullname>` | |
 | ClusterRole + binding | `<fullname>` | `list` on pods, PVCs and PVs |
 | Role + binding | `<fullname>` | `get`/`list` on pods and Jobs, `list` on Events, in the release namespace (lease liveness and the previous-run report) |
@@ -57,9 +57,12 @@ names, because the catalog ConfigMap is created in the release namespace.
 
 A pre-install/pre-upgrade hook Job runs `go-cluster-backup validate` against the
 new configuration before anything else is applied. It is offline — a secret
-reference is resolved, never read — so it needs no secret mount. When it fails,
-the install or upgrade aborts, and with Flux's `upgrade.remediation.strategy:
-rollback` the previous release stays in place.
+reference is resolved, never read — so it needs no secret mount. The chart sets
+`terminationGracePeriodSeconds: 360` by default and passes the same literal as
+`validate --termination-grace-seconds` to check the effective cleanup budget.
+Raise chart grace when raising lifecycle budgets; the gate rejects a value below
+the computed bound. When validation fails, install or upgrade aborts; with Flux's
+`upgrade.remediation.strategy: rollback` the previous release stays in place.
 
 ### Upgrading: the image and the configuration move together
 
@@ -137,6 +140,7 @@ kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <nam
 | fullnameOverride | string | `""` | Override the full object-name prefix. Every generated object name derives from this, so a consumer binding a NetworkPolicy or a RoleBinding to a generated name must keep it stable. |
 | component | string | `"backup"` | Value of the app.kubernetes.io/component label on every object and on every CronJob pod template. |
 | labels | object | `{}` | Extra labels added to every object and to every CronJob pod template. |
+| terminationGracePeriodSeconds | int | `360` | Seconds Kubernetes gives a writer or restore pod between SIGTERM and SIGKILL (the stage initContainer shares the writer pod, so the same value covers it). The tool's shutdown needs `G = join + finish_allowance + abort_total + close + margin`, read from the configuration's `run.finish_allowance` and `plugins.config.lifecycle`; at the shipped defaults G = 1m + 2m + 2m + 30s + 30s = 360s. The config-gate hook passes this same value to `validate --termination-grace-seconds`, which refuses a configuration whose own G exceeds it — raise this when the configuration raises any input, never lower it below the effective G. |
 | schedule | string | `"0 3 * * *"` | Cron schedule of the scheduled run. |
 | timeZone | string | `""` | IANA time zone of the schedule. Empty omits the field (the cluster's UTC). |
 | suspend | string | `""` | Suspend the scheduled CronJob. Left out of the manifest when empty, so a pause applied to the live object is not reset by an upgrade. The manual and restore CronJobs are always suspended. |
@@ -168,7 +172,7 @@ kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n <nam
 | rbac.create | bool | `true` | Create the ServiceAccount's RBAC. |
 | rbac.workloadNamespaces | list | `[]` | Namespaces whose Secrets and ConfigMaps the tool may read, through one RoleBinding each onto the `<fullname>-workload-access` ClusterRole. That ClusterRole is not bound to anything when this list is empty. |
 | rbac.secretNames | list | `[]` | Names of Secrets in the release namespace the tool may get (the credentials its configuration's templates resolve). |
-| catalog.create | bool | `true` | Create the catalog ConfigMap the tool writes its run index into. It is created without `data` and annotated `helm.sh/resource-policy: keep`, so an uninstall never takes the run history with it. Set to false when the ConfigMap is managed by the consumer's own manifests — such a manifest must never declare `data` either: every reconcile of it would revert the run index the tool wrote. |
+| catalog.create | bool | `true` | Create the catalog ConfigMap the tool keeps its writer-lease record in. It is created without `data` and annotated `helm.sh/resource-policy: keep`, so an uninstall never takes a live claim away. Set to false when the ConfigMap is managed by the consumer's own manifests — such a manifest must never declare `data` either: every reconcile of it would revert the lease record the tool wrote. |
 | catalog.name | string | `""` | Name of the catalog ConfigMap. Empty uses `<fullname>-catalog`, and the chart refuses to render when the config names a different one. |
 | secretMounts | list | `[]` | Secrets mounted read-only into every container, for the credential files the configuration references. |
 | extraVolumes | list | `[]` | Extra volumes of every pod — the writer, the restore Job and the config-gate hook Job alike. Only an innocuous shared volume belongs here (a coverage directory, a CA bundle); a node hostPath holding state or secrets goes in `writer.volumes` or `restore.volumes`, which one pod alone declares. |

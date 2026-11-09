@@ -43,7 +43,6 @@ spec:
       # Everything this file omits is a default in the service's own document
       # (`go-cluster-backup config defaults`). The labels here are the deployment's
       # own; `backup.example/` is a placeholder, not a name this project reserves.
-      version: 1
 
       run:
         spool_dir: /spool

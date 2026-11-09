@@ -10,9 +10,9 @@ import (
 	"text/template/parse"
 	"unicode/utf8"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
 )
 
 // The message model of this plugin: a message is plain text the config file
@@ -66,7 +66,7 @@ func (m Message) Text() string {
 }
 
 // payloadData is what a payload template is executed with: the message as the
-// message templates rendered it, and the engine's event as it arrived.
+// message templates rendered it, and the run event as it arrived.
 type payloadData struct {
 	Title string
 	Lines []Line
@@ -85,13 +85,13 @@ type eventMessage struct {
 // the span rule, and parses again with each markup backtick replaced by its
 // marker. Every error names the event and, where the line is at fault, the line
 // of the template.
-func newMessage(event string, tmpl plugin.Template) (*eventMessage, error) {
+func newMessage(event string, tmpl configuration.Template) (*eventMessage, error) {
 	src := tmpl.Text()
 	if strings.ContainsAny(src, "\x01\x02") {
 		return nil, fmt.Errorf("events/%s: the template carries a control character this plugin marks a code span with", event)
 	}
 	funcs := messageFuncs()
-	// The source was parsed once already, by plugin.Decode, with this same
+	// The source was parsed once already, by configuration.Decode, with this same
 	// function set and missingkey=error: a syntax error is reported there, so
 	// parsing it here cannot fail.
 	parsed := must.Do(parseSource(event, src, funcs))
@@ -117,10 +117,10 @@ func parseSource(name, src string, funcs template.FuncMap) (*template.Template, 
 
 // messageFuncs is what a message template may call: the framework's core set
 // plus this plugin's own (see funcs.go). The payload template gets the same set
-// from plugin.Decode; a message template is parsed here, so it has to be handed
+// from configuration.Decode; a message template is parsed here, so it has to be handed
 // the same one.
 func messageFuncs() template.FuncMap {
-	funcs := plugin.CoreFuncs()
+	funcs := configuration.CoreFuncs()
 	for name, fn := range (Config{}).TemplateFuncs() {
 		funcs[name] = fn
 	}
@@ -417,8 +417,8 @@ func foldLines(s string) string {
 // documentRune reports whether one rune of data may stand in the body's YAML
 // document: the set the YAML 1.2 grammar calls printable, in the ranges the
 // parser's own check uses — #x9, #xA, #xD, #x20-#x7E, #x85, #xA0-#xD7FF,
-// #xE000-#xFFFD and #x10000-#x10FFFF (go.yaml.in/yaml/v3, readerc.go). A C1
-// control, a noncharacter and a lone surrogate's bytes fall outside it; a
+// #xE000-#xFFFD and #x10000-#x10FFFF (go.yaml.in/yaml/v4, the scanner's reader).
+// A C1 control, a noncharacter and a lone surrogate's bytes fall outside it; a
 // carriage return and a next-line are inside it and are refused here, because
 // the lexer reads both as a line break — a CR rewrites the line it lands in and
 // a NEL is folded away, so either would silently rewrite the data.

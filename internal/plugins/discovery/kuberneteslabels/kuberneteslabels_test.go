@@ -14,13 +14,15 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
-	"github.com/vi-latyshev/go-cluster-backup/internal/discovery/discoverytest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi/kubeapitest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery/discoverytest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery/kuberneteslabels"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 const (
@@ -28,10 +30,13 @@ const (
 	testPortEnv = "GCB_TEST_PORT"
 )
 
-func registry(t *testing.T) *plugin.Registry {
+func registry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := kuberneteslabels.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, kuberneteslabels.Spec, func(lr *loader.Registry) error {
+		return kuberneteslabels.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -298,8 +303,8 @@ func newDiscovererIn(t *testing.T, srv *kubeapitest.Server, secretsPath string, 
 		Rules:      rules,
 	}
 	raw := mustJSON(cfg)
-	d, err := plugin.Build(context.Background(), registry(t), discovery.Kind, "kubernetes_labels",
-		jsontext.Value(raw), plugin.Deps{Instance: "workloads", Log: slog.New(slog.DiscardHandler)})
+	d, err := instances.Build(context.Background(), registry(t), discovery.Kind, "kubernetes_labels",
+		jsontext.Value(raw), instances.Deps{Instance: "workloads", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,9 +323,9 @@ func discover(t *testing.T, d discovery.Discoverer) []discovery.Found {
 // check runs preflight with the caller's test reporting.
 func check(t *testing.T, d discovery.Discoverer) error {
 	t.Helper()
-	c, ok := d.(plugin.Checker)
+	c, ok := d.(instances.Checker)
 	if !ok {
-		t.Fatal("the discoverer does not implement plugin.Checker")
+		t.Fatal("the discoverer does not implement instances.Checker")
 	}
 	return c.Check(context.Background())
 }
@@ -1015,7 +1020,7 @@ func TestMinMatches(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tc.want) {
 					t.Fatalf("%s = %v, want a message containing %q", name, err, tc.want)
 				}
-				if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+				if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 					t.Fatalf("%s class = %q, want permanent", name, class)
 				}
 			}
@@ -1056,7 +1061,7 @@ func TestCancelledContext(t *testing.T) {
 	if _, err := d.Discover(ctx); err == nil {
 		t.Fatal("Discover returned success on a cancelled context")
 	}
-	c, _ := d.(plugin.Checker)
+	c, _ := d.(instances.Checker)
 	if err := c.Check(ctx); err == nil {
 		t.Fatal("Check returned success on a cancelled context")
 	}
@@ -1306,8 +1311,8 @@ func TestNewHonoursCancelledContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := plugin.Build(ctx, registry(t), discovery.Kind, "kubernetes_labels", jsontext.Value(mustJSON(cfg)),
-		plugin.Deps{Instance: "workloads", Log: slog.New(slog.DiscardHandler)})
+	_, err := instances.Build(ctx, registry(t), discovery.Kind, "kubernetes_labels", jsontext.Value(mustJSON(cfg)),
+		instances.Deps{Instance: "workloads", Log: slog.New(slog.DiscardHandler)})
 	if err == nil {
 		t.Fatal("New returned success on a cancelled context")
 	}
@@ -1326,7 +1331,7 @@ func TestBrokenAPI(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Fatalf("Check = %v, want a 500", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient", class)
 	}
 	if strings.Contains(err.Error(), "want at least") {
@@ -1339,7 +1344,7 @@ func TestBrokenAPI(t *testing.T) {
 }
 
 // TestPerObjectReadClassification: an error the API client classed transient
-// marks its Found ProblemRetryable — the engine may re-run Discover while its
+// marks its Found ProblemRetryable — execution may re-run Discover while its
 // budget lasts — while every other class is final. Either way the problem stays
 // with its one artifact: Discover itself returns no per-object error and Check
 // stays nil, so the discovery's other artifacts are never denied.

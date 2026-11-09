@@ -6,7 +6,8 @@ metadata:
   labels:
     {{- include "go-cluster-backup.labels" . | nindent 4 }}
   annotations:
-    # The tool owns everything under `data`; helm must never prune it away with
-    # the release, or the whole run history goes with it.
+    # The tool owns everything under `data` — the writer-lease record alone;
+    # the chart never writes it, and helm must never prune the object away with
+    # the release, or an uninstall would drop a live claim.
     helm.sh/resource-policy: keep
 {{- end }}

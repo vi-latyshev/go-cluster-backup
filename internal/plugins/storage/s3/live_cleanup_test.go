@@ -16,8 +16,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 // s3Conformance is the only key prefix a live harness may write to or delete:

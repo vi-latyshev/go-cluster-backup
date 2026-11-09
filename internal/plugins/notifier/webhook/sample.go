@@ -3,7 +3,7 @@ package webhook
 import (
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // The samples every template of this plugin is rendered against while a
@@ -82,22 +82,23 @@ func samples() []sample {
 	finished := func(name string, rep model.RunReport) sample {
 		return sample{name: name, ev: model.Event{Name: model.EventFinished, At: at, Run: rep}}
 	}
-	started := func(name string, previous model.PreviousRun) sample {
-		return sample{name: name, ev: model.Event{Name: model.EventStarted, At: at, Run: report(model.OutcomeRunning, nil, nil, nil, previous)}}
+	// started is the start of a run: the previous-run record is filled only for
+	// the finished event, so a started sample carries none.
+	started := func(name string) sample {
+		return sample{name: name, ev: model.Event{Name: model.EventStarted, At: at, Run: report(model.OutcomeRunning, nil, nil, nil, model.PreviousRun{})}}
 	}
 	// startedManual is the start of a manual run: a template that branches on
 	// the kind renders here, not only on a night that happens to be manual.
-	startedManual := func(name string, previous model.PreviousRun) sample {
-		rep := report(model.OutcomeRunning, nil, nil, nil, previous)
+	startedManual := func(name string) sample {
+		rep := report(model.OutcomeRunning, nil, nil, nil, model.PreviousRun{})
 		rep.RunID = "20260102T030405Z-manual"
 		rep.Kind = model.RunKindManual
 		return sample{name: name, ev: model.Event{Name: model.EventStarted, At: at, Run: rep}}
 	}
 
 	return []sample{
-		started("a run that just started", model.PreviousRun{RunID: "20260101T030405Z", LastGoodAt: lastGood}),
-		started("a run that started after one which never reported", model.PreviousRun{RunID: "20260101T030405Z", Unfinished: true, LastGoodAt: lastGood}),
-		startedManual("a manual run that just started", model.PreviousRun{RunID: "20260101T030405Z", LastGoodAt: lastGood}),
+		started("a run that just started"),
+		startedManual("a manual run that just started"),
 		finished("a delivered run", report(model.OutcomeDelivered,
 			[]model.ArtifactResult{okArtifact}, []model.StorageResult{verified},
 			[]model.Exclusion{{Name: "volumes/example/cache", Group: "volumes", Kind: model.ExclusionIgnored, Reason: "carries the exclusion marker"}},

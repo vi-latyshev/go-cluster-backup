@@ -14,17 +14,22 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sourcetest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sqlite"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source/sourcetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := sqlite.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, sqlite.Spec, func(lr *loader.Registry) error {
+		return sqlite.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -32,8 +37,8 @@ func testRegistry(t *testing.T) *plugin.Registry {
 
 func build(t *testing.T, cfg string) (source.Source, error) {
 	t.Helper()
-	return plugin.Build(context.Background(), testRegistry(t), source.Kind, "sqlite",
-		jsontext.Value(cfg), plugin.Deps{Instance: "sqlite", Log: slog.New(slog.DiscardHandler)})
+	return instances.Build(context.Background(), testRegistry(t), source.Kind, "sqlite",
+		jsontext.Value(cfg), instances.Deps{Instance: "sqlite", Log: slog.New(slog.DiscardHandler)})
 }
 
 func config(t *testing.T, path string) string {
@@ -171,7 +176,7 @@ func TestDumpDatabaseMissingIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("a missing database was not an error")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -185,7 +190,7 @@ func TestDumpLockedDatabaseIsTransient(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.Dump(context.Background(), io.Discard)
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -199,7 +204,7 @@ func TestDumpMalformedDatabaseIsPermanent(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.Dump(context.Background(), io.Discard)
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -221,7 +226,7 @@ func TestCheckFindsTheFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err != nil {
+	if err := s.(instances.Checker).Check(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -229,12 +234,12 @@ func TestCheckFindsTheFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := missing.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := missing.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a missing database passed Check")
 	}
 
 	t.Setenv("PATH", t.TempDir())
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "sqlite3") {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "sqlite3") {
 		t.Fatalf("Check = %v, want a missing sqlite3 named", err)
 	}
 }
@@ -246,7 +251,7 @@ func TestCheckJudgesTheScratchDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
 		t.Fatalf("Check = %v, want the missing scratch_dir named", err)
 	}
 
@@ -258,7 +263,7 @@ func TestCheckJudgesTheScratchDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := notDir.(plugin.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
+	if err := notDir.(instances.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
 		t.Fatalf("Check = %v, want a scratch_dir that is a file refused", err)
 	}
 
@@ -272,7 +277,7 @@ func TestCheckJudgesTheScratchDir(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := denied.(plugin.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
+		if err := denied.(instances.Checker).Check(context.Background()); err == nil || !strings.Contains(err.Error(), "scratch_dir") {
 			t.Fatalf("Check = %v, want an unwritable scratch_dir refused", err)
 		}
 	}
@@ -297,7 +302,7 @@ func TestCheckRefusesADirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(plugin.Checker).Check(context.Background())
+	err = s.(instances.Checker).Check(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "directory") {
 		t.Fatalf("Check = %v, want a directory named as the problem", err)
 	}
@@ -702,15 +707,15 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	stubs(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := plugin.Build(ctx, testRegistry(t), source.Kind, "sqlite",
-		jsontext.Value(config(t, databaseFile(t))), plugin.Deps{Instance: "sqlite"}); err == nil {
+	if _, err := instances.Build(ctx, testRegistry(t), source.Kind, "sqlite",
+		jsontext.Value(config(t, databaseFile(t))), instances.Deps{Instance: "sqlite"}); err == nil {
 		t.Error("New accepted a cancelled context")
 	}
 	s, err := build(t, config(t, databaseFile(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(ctx); err == nil {
+	if err := s.(instances.Checker).Check(ctx); err == nil {
 		t.Error("Check accepted a cancelled context")
 	}
 	if err := s.Dump(ctx, io.Discard); err == nil {
@@ -740,7 +745,7 @@ func TestCheckRefusesAnUnreadableDatabaseFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("an unreadable database file passed Check")
 	}
 }
@@ -949,7 +954,7 @@ func TestCheckCommandFailureIsReported(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failing integrity-check command was reported as a clean copy")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }

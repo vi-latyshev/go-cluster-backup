@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 )
 
 const (
@@ -292,8 +292,9 @@ func TestConfigIsRequired(t *testing.T) {
 	}
 }
 
-// TestCatalogConfigMapIsKeptAndOwnsNoData: the tool writes `data`, so the chart
-// must never render it, and an uninstall must not take the run history away.
+// TestCatalogConfigMapIsKeptAndOwnsNoData: the tool writes `data` (the writer
+// lease), so the chart must never render it, and an uninstall must not take the
+// lease record away.
 func TestCatalogConfigMapIsKeptAndOwnsNoData(t *testing.T) {
 	docs := documents(t, renderExample(t, "minimal"))
 	cm := find(t, docs, "ConfigMap", catalogName)
@@ -481,6 +482,53 @@ func TestConfigGateHookRunsBeforeInstallAndUpgrade(t *testing.T) {
 	}
 }
 
+// TestTerminationGraceCoversTheShutdown: the writer and restore pods carry the
+// chart's explicit terminationGracePeriodSeconds — the kubelet's implicit
+// default proves nothing about the cleanup this image runs — and the config gate
+// receives the same literal, so a configuration whose own shutdown need exceeds
+// it fails the install instead of being SIGKILLed mid-cleanup.
+func TestTerminationGraceCoversTheShutdown(t *testing.T) {
+	root := repoRoot(t)
+	base := []string{
+		"-f", filepath.Join(root, "examples", "values", "minimal.yaml"),
+		"--set-file", "config=" + filepath.Join(root, "examples", "config", "minimal.yaml"),
+	}
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{"the shipped value", nil, "360"},
+		{"a value the deployment raises", []string{"--set", "terminationGracePeriodSeconds=400"}, "400"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append(append([]string{}, base...), tc.extra...)
+			manifest, err := render(t, args...)
+			if err != nil {
+				t.Fatalf("rendering the chart with terminationGracePeriodSeconds %s: %v", tc.want, err)
+			}
+			docs := documents(t, manifest)
+			checked := 0
+			for _, job := range cronJobs(t, docs) {
+				pod := at(t, job, "spec", "jobTemplate", "spec", "template", "spec")
+				checked++
+				if got := fmt.Sprint(pod["terminationGracePeriodSeconds"]); got != tc.want {
+					t.Errorf("CronJob %s: terminationGracePeriodSeconds is %s, want %s", name(job), got, tc.want)
+				}
+			}
+			if checked != 3 {
+				t.Fatalf("checked %d CronJobs, want the scheduled, the manual and the restore one", checked)
+			}
+			hook := find(t, docs, "Job", fullname+"-validate")
+			got := strings.Join(stringsOf(firstContainer(t, at(t, hook, "spec", "template", "spec"))["args"]), " ")
+			want := "validate --config /etc/go-cluster-backup/config.yaml --termination-grace-seconds " + tc.want
+			if got != want {
+				t.Errorf("the config gate runs %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 // TestObjectNamesDeriveFromFullname: a consumer binds a NetworkPolicy or a
 // RoleBinding to these names, so they must be stable and documented.
 func TestObjectNamesDeriveFromFullname(t *testing.T) {
@@ -599,7 +647,7 @@ func stubConfig(t *testing.T, leaseHardBound string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	// Quoted: `0` must stay a string, and `.5h` must not be read as a float.
-	body := fmt.Sprintf("version: 1\nrun:\n  lease_hard_bound: %q\n", leaseHardBound)
+	body := fmt.Sprintf("run:\n  lease_hard_bound: %q\n", leaseHardBound)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("writing the stub configuration: %v", err)
 	}
@@ -762,8 +810,9 @@ func buildValidator(t *testing.T, root string) string {
 	return validatorPath
 }
 
-// TestReleaseNamespaceRoleReadsEvents: the previous-run report explains a Job
-// that failed before the tool started by listing the Events of that Job's uid.
+// TestReleaseNamespaceRoleReadsEvents: the reporting plugin explains a Job that
+// failed before the tool started by listing the Events of that Job, and the
+// catalog proves the lease holder's pod terminated with a get on that pod.
 func TestReleaseNamespaceRoleReadsEvents(t *testing.T) {
 	docs := documents(t, renderExample(t, "minimal"))
 	role := find(t, docs, "Role", fullname)

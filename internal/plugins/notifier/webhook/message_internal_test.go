@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // TestSpanMarksWalksBothBranchesOfAWith: the markup backticks of a template are

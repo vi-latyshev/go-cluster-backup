@@ -1,0 +1,80 @@
+{
+  "plugins": [
+    {
+      "id": "cli",
+      "factory": true,
+      "floor": true,
+      "imports": [
+        "instances"
+      ]
+    },
+    {
+      "id": "configuration",
+      "factory": false,
+      "floor": false
+    },
+    {
+      "id": "errors",
+      "factory": false,
+      "floor": false
+    },
+    {
+      "id": "instances",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "model",
+      "factory": false,
+      "floor": true
+    },
+    {
+      "id": "notifier/webhook",
+      "factory": true,
+      "floor": true,
+      "imports": [
+        "instances",
+        "model"
+      ],
+      "requires": [
+        "model"
+      ]
+    },
+    {
+      "id": "reporting",
+      "factory": false,
+      "floor": false,
+      "imports": [
+        "errors",
+        "model"
+      ],
+      "requires": [
+        "model"
+      ]
+    },
+    {
+      "id": "source/files",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "instances",
+        "source/postgres"
+      ]
+    },
+    {
+      "id": "source/postgres",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "instances",
+        "model"
+      ],
+      "requires": [
+        "configuration"
+      ],
+      "after": [
+        "discovery/kubernetes_labels"
+      ]
+    }
+  ]
+}

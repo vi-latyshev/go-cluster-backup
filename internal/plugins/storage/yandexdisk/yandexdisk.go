@@ -4,7 +4,10 @@
 // only place an OAuth token with the disk.app_folder scope can reach — so the
 // old archives under app:/Backups stay invisible here and are never deleted.
 // Each call is ONE attempt, classified like every storage plugin: a 500 on a
-// folder creation is a transient error the engine retries the whole Put for.
+// folder creation is a transient error execution retries the whole Put for.
+// The same holds for List: one call is one whole depth-first walk of the
+// prefix, run through the treewalk library with the instance's
+// call_parallelism, and a failed walk returns no objects and one cause.
 //
 // Two facts of this API shape the code:
 //   - an upload href serves exactly one upload: a second PUT to the same URL is
@@ -15,9 +18,14 @@
 //     proves the object landed. Put polls for that (commit_poll_interval /
 //     commit_poll_timeout) and fails when it never becomes visible.
 //
+// Because an accepted upload can settle after Put returns, the storage declares
+// storage.AsynchronousWriter: the safety owner records this holder as uncertain
+// before its first such write, not after a multipart path this plugin does not
+// have.
+//
 // This plugin implements no storage.MultipartUploader: its Put is one
 // whole-object request per attempt, so a retry of this storage re-sends the
-// object from the start, and the engine's part-by-part path never applies here.
+// object from the start, and transfer's part-by-part path never applies here.
 package yandexdisk
 
 import (
@@ -36,11 +44,14 @@ import (
 
 	json "encoding/json/v2"
 
-	backuphuman "github.com/vi-latyshev/go-cluster-backup/internal/human"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	backuphuman "github.com/vi-latyshev/go-cluster-backup/internal/plugins/human"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/treewalk"
 )
 
 // appPrefix is where an app-folder OAuth token can write; a root outside it is
@@ -49,36 +60,26 @@ import (
 const appPrefix = "app:/"
 
 type Config struct {
-	APIURL             string         `json:"api_url" doc:"base URL of the Disk REST API, e.g. https://cloud-api.yandex.net/v1/disk"`
-	Token              plugin.Secret  `json:"token" doc:"file holding the OAuth token (scope disk.app_folder)"`
-	Root               string         `json:"root" required:"true" doc:"folder under app:/ acting as the storage root, e.g. app:/cluster-backup"`
-	PermanentDelete    bool           `json:"permanent_delete" required:"true" doc:"true deletes an object instead of moving it to the trash, so space is freed at once"`
-	PruneKeepDepth     int            `json:"prune_keep_depth" doc:"leading path segments under the root the emptiness cleanup never removes: 1 keeps the first key segment (the runs/ grouping) unpruned, 0 prunes every folder below the root"`
-	RequestTimeout     model.Duration `json:"request_timeout" doc:"timeout of one API request; the bulk upload and download stream under the caller's deadline instead"`
-	CommitPollInterval model.Duration `json:"commit_poll_interval" doc:"wait between visibility polls after an accepted upload"`
-	CommitPollTimeout  model.Duration `json:"commit_poll_timeout" doc:"total time a Put waits for the uploaded object to become visible"`
+	APIURL             string               `json:"api_url" doc:"base URL of the Disk REST API, e.g. https://cloud-api.yandex.net/v1/disk"`
+	Token              configuration.Secret `json:"token" doc:"file holding the OAuth token (scope disk.app_folder)"`
+	Root               string               `json:"root" required:"true" doc:"folder under app:/ acting as the storage root, e.g. app:/cluster-backup"`
+	PermanentDelete    bool                 `json:"permanent_delete" required:"true" doc:"true deletes an object instead of moving it to the trash, so space is freed at once"`
+	PruneKeepDepth     int                  `json:"prune_keep_depth" doc:"leading path segments under the root the emptiness cleanup never removes: 1 keeps the first key segment (the runs/ grouping) unpruned, 0 prunes every folder below the root"`
+	RequestTimeout     model.Duration       `json:"request_timeout" doc:"timeout of one API request; the bulk upload and download stream under the caller's deadline instead"`
+	CommitPollInterval model.Duration       `json:"commit_poll_interval" doc:"wait between visibility polls after an accepted upload"`
+	CommitPollTimeout  model.Duration       `json:"commit_poll_timeout" doc:"total time a Put waits for the uploaded object to become visible"`
 }
 
-// Register adds the Yandex Disk storage to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, storage.Kind, plugin.Spec[Config, storage.Storage]{
-		Type:      "yandex_disk",
-		Summary:   "the Yandex Disk REST API, scoped to one folder of the application folder",
-		Stability: plugin.Stable,
-		Example: []byte(`{"api_url": "https://cloud-api.yandex.net/v1/disk",` +
-			` "token": {"file": "/run/secrets/yandex/token"}, "root": "app:/cluster-backup",` +
-			` "permanent_delete": true, "prune_keep_depth": 1, "request_timeout": "30s",` +
-			` "commit_poll_interval": "5s", "commit_poll_timeout": "2m"}`),
-		New: func(ctx context.Context, cfg Config, deps plugin.Deps) (storage.Storage, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return newStorage(cfg, deps.Log)
-		},
-	})
+// newStorage is the storage factory: the only construction path of this
+// plugin, called through storage.Build with the instance's construction input.
+func newStorage(ctx context.Context, cfg Config, deps instances.Deps, in storage.BuildInput) (storage.Storage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return open(cfg, deps.Log, in.CallParallelism)
 }
 
-func newStorage(cfg Config, log *slog.Logger) (*Storage, error) {
+func open(cfg Config, log *slog.Logger, parallelism int) (*Storage, error) {
 	u, err := url.Parse(cfg.APIURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("api_url %q is not an absolute URL", cfg.APIURL)
@@ -108,15 +109,24 @@ func newStorage(cfg Config, log *slog.Logger) (*Storage, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Storage{cfg: cfg, root: root, http: &http.Client{}, log: log}, nil
+	return &Storage{cfg: cfg, root: root, http: &http.Client{}, log: log, parallelism: parallelism}, nil
 }
 
 type Storage struct {
-	cfg  Config
-	root string
-	http *http.Client
-	log  *slog.Logger
+	cfg         Config
+	root        string
+	http        *http.Client
+	log         *slog.Logger
+	parallelism int
 }
+
+// WritesAsynchronously declares the capability Put's accepted-upload path
+// proves: a 201/202 answers with the bytes taken, and the visibility poll is
+// after-write evidence, never a pre-write excuse. The safety owner marks this
+// holder uncertain before its first Put because of this answer.
+func (s *Storage) WritesAsynchronously() bool { return true }
+
+var _ storage.AsynchronousWriter = (*Storage)(nil)
 
 func (s *Storage) Describe(ctx context.Context) (storage.StorageTraits, error) {
 	if err := ctx.Err(); err != nil {
@@ -129,13 +139,13 @@ func (s *Storage) Describe(ctx context.Context) (storage.StorageTraits, error) {
 	return storage.StorageTraits{}, nil
 }
 
-var _ plugin.Checker = (*Storage)(nil)
+var _ instances.Checker = (*Storage)(nil)
 
 // Check is the instance's preflight: one read-only metadata request for the
 // configured root proves the token is accepted and the root is reachable. An
 // absent root is not an error — Put creates it and the folders on the way to a
 // key on the first run — and no path outside the root is ever named, so the
-// old app:/Backups archives stay untouched. One attempt: the engine retries a
+// old app:/Backups archives stay untouched. One attempt: execution retries a
 // transient answer under the configured policy.
 func (s *Storage) Check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -150,13 +160,13 @@ func (s *Storage) Check(ctx context.Context) error {
 	case http.StatusOK:
 		var r resource
 		if err := json.Unmarshal(resp.body, &r); err != nil {
-			return plugin.Transient(fmt.Errorf("check root %s: unreadable answer: %w", s.root, err))
+			return pluginerrors.Transient(fmt.Errorf("check root %s: unreadable answer: %w", s.root, err))
 		}
 		if r.Type == "file" {
-			return plugin.Permanent(fmt.Errorf("root %s is a file, not a folder", s.root))
+			return pluginerrors.Permanent(fmt.Errorf("root %s is a file, not a folder", s.root))
 		}
 		if r.Type != "dir" {
-			return plugin.Transient(fmt.Errorf("check root %s: the answer names type %q", s.root, r.Type))
+			return pluginerrors.Transient(fmt.Errorf("check root %s: the answer names type %q", s.root, r.Type))
 		}
 		return nil
 	case http.StatusNotFound:
@@ -164,7 +174,7 @@ func (s *Storage) Check(ctx context.Context) error {
 		// otherwise — and that the root is simply not there yet.
 		return nil
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return plugin.Permanent(fmt.Errorf("check root %s: the token was rejected: HTTP %d: %s",
+		return pluginerrors.Permanent(fmt.Errorf("check root %s: the token was rejected: HTTP %d: %s",
 			s.root, resp.status, apiMessage(resp.body)))
 	default:
 		return classifyAPI(resp, "check root "+s.root)
@@ -180,7 +190,7 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 	}
 	full, err := s.objectPath(req.Key)
 	if err != nil {
-		return model.ObjectInfo{}, plugin.Permanent(err)
+		return model.ObjectInfo{}, pluginerrors.Permanent(err)
 	}
 	if err := s.mkdirAll(ctx, path.Dir(full)); err != nil {
 		return model.ObjectInfo{}, err
@@ -197,12 +207,12 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 
 // mkdirAll creates every folder on the way to dir, one request per segment,
 // each classified like any other call: a 500 on a folder creation must reach
-// the engine as a transient error it retries the whole Put for, never as a
+// execution as a transient error it retries the whole Put for, never as a
 // failure that loses the night's archive.
 func (s *Storage) mkdirAll(ctx context.Context, dir string) error {
 	rest, ok := strings.CutPrefix(dir, appPrefix)
 	if !ok {
-		return plugin.Permanent(fmt.Errorf("folder %q is not inside %q", dir, appPrefix))
+		return pluginerrors.Permanent(fmt.Errorf("folder %q is not inside %q", dir, appPrefix))
 	}
 	current := strings.TrimSuffix(appPrefix, "/")
 	for _, seg := range strings.Split(rest, "/") {
@@ -237,7 +247,7 @@ func (s *Storage) uploadHref(ctx context.Context, full string) (string, error) {
 		Href string `json:"href"`
 	}
 	if err := json.Unmarshal(resp.body, &answer); err != nil || answer.Href == "" {
-		return "", plugin.Transient(fmt.Errorf("upload href for %s: unreadable answer %q", full, resp.body))
+		return "", pluginerrors.Transient(fmt.Errorf("upload href for %s: unreadable answer %q", full, resp.body))
 	}
 	return answer.Href, nil
 }
@@ -251,7 +261,7 @@ func (s *Storage) uploadHref(ctx context.Context, full string) (string, error) {
 func (s *Storage) send(ctx context.Context, href, full string, body io.Reader, size int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, href, body)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	req.ContentLength = size
 	resp, err := s.http.Do(req)
@@ -287,13 +297,13 @@ func (s *Storage) awaitVisible(ctx context.Context, key, full string, size int64
 			return info, nil
 		}
 		if err != nil {
-			if class, _ := plugin.ClassOf(err); class == plugin.ClassPermanent {
+			if class, _ := pluginerrors.ClassOf(err); class == pluginerrors.ClassPermanent {
 				return model.ObjectInfo{}, err
 			}
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return model.ObjectInfo{}, plugin.Transient(
+			return model.ObjectInfo{}, pluginerrors.Transient(
 				fmt.Errorf("upload of %s was accepted but is not visible with %d bytes after %s",
 					full, size, s.cfg.CommitPollTimeout))
 		}
@@ -311,7 +321,7 @@ func (s *Storage) Stat(ctx context.Context, key string) (model.ObjectInfo, error
 	}
 	full, err := s.objectPath(key)
 	if err != nil {
-		return model.ObjectInfo{}, plugin.Permanent(err)
+		return model.ObjectInfo{}, pluginerrors.Permanent(err)
 	}
 	return s.stat(ctx, key, full)
 }
@@ -328,24 +338,31 @@ func (s *Storage) stat(ctx context.Context, key, full string) (model.ObjectInfo,
 	case http.StatusOK:
 		var r resource
 		if err := json.Unmarshal(resp.body, &r); err != nil {
-			return model.ObjectInfo{}, plugin.Transient(fmt.Errorf("stat %s: unreadable answer: %w", full, err))
+			return model.ObjectInfo{}, pluginerrors.Transient(fmt.Errorf("stat %s: unreadable answer: %w", full, err))
 		}
 		if r.Type != "file" {
-			return model.ObjectInfo{}, plugin.NotFound(
+			return model.ObjectInfo{}, pluginerrors.NotFound(
 				fmt.Errorf("object %s is definitely absent: the path is a %s", full, orElse(r.Type, "resource")))
 		}
 		return model.ObjectInfo{Key: key, Size: r.Size, ModTime: parseModified(r.Modified),
 			MD5: strings.ToLower(r.MD5)}, nil
 	case http.StatusNotFound:
-		return model.ObjectInfo{}, plugin.NotFound(
+		return model.ObjectInfo{}, pluginerrors.NotFound(
 			fmt.Errorf("object %s is definitely absent: %s", full, apiMessage(resp.body)))
 	default:
 		return model.ObjectInfo{}, classifyAPI(resp, "stat "+full)
 	}
 }
 
-// List walks the folder tree under the prefix, one API page per contract page:
-// the next token carries the folder being paged and the folders still to visit.
+// List walks the folder tree under the prefix and returns every matching
+// object in one page. The walk is one treewalk.Walk at the instance's
+// call_parallelism; a failed walk returns no objects, one cause, and the
+// caller replays the whole traversal from its own token. A successful walk
+// names no continuation, so NextToken is always empty.
+//
+// A folder answer always names its children, an empty folder as an empty list:
+// a 200 without _embedded.items is an unreadable answer and fails the walk as
+// transient, never as an empty folder that hides a subtree.
 //
 // Every child path is built from the folder this call asked for plus the item's
 // name. The response's own path field is never read: an app-folder request is
@@ -359,71 +376,130 @@ func (s *Storage) List(ctx context.Context, req storage.ListRequest) (storage.Li
 	}
 	prefix, err := s.listPrefix(req.Prefix)
 	if err != nil {
-		return storage.ListPage{}, plugin.Permanent(err)
+		return storage.ListPage{}, pluginerrors.Permanent(err)
 	}
-	st := listState{Dir: s.baseDir(prefix)}
+	cursor := listCursor{Dir: s.baseDir(prefix)}
 	if req.Token != "" {
-		if err := json.Unmarshal([]byte(req.Token), &st); err != nil {
-			return storage.ListPage{}, plugin.Permanent(fmt.Errorf("bad listing token %q: %w", req.Token, err))
+		// Decode into a fresh cursor: an absent member must stay absent rather
+		// than inherit the starting folder and slip past the confinement guard.
+		var decoded listCursor
+		if err := json.Unmarshal([]byte(req.Token), &decoded, json.RejectUnknownMembers(true)); err != nil {
+			return storage.ListPage{}, pluginerrors.Permanent(fmt.Errorf("listing token: %w", err))
 		}
+		cursor = decoded
 	}
-	if !s.inRoot(st.Dir) {
-		return storage.ListPage{}, plugin.Permanent(fmt.Errorf("listing token points at %q, outside the root %q", st.Dir, s.root))
+	if err := s.confine(cursor, prefix); err != nil {
+		return storage.ListPage{}, pluginerrors.Permanent(err)
 	}
-	page := storage.ListPage{}
-	for {
-		fp, err := s.listFolder(ctx, st.Dir, st.Offset)
-		if err != nil {
-			if class, _ := plugin.ClassOf(err); class == plugin.ClassNotFound {
-				// The folder does not exist yet: nothing under this prefix.
-				zero := 0
-				fp = folderListing{itemsPresent: true, total: &zero}
-			} else {
-				return storage.ListPage{}, err
+	objects, err := treewalk.Walk(ctx, treewalk.Input[listCursor, model.ObjectInfo]{
+		Cursor:      cursor,
+		Parallelism: s.parallelism,
+		Fetch: func(ctx context.Context, cursor listCursor) (treewalk.Page[listCursor, model.ObjectInfo], error) {
+			return s.fetchPage(ctx, cursor, prefix)
+		},
+	})
+	if err != nil {
+		return storage.ListPage{}, err
+	}
+	return storage.ListPage{Objects: objects}, nil
+}
+
+// fetchPage reads exactly one API page at one cursor and returns the objects it
+// found plus the cursors that continue the walk: the same folder's next page
+// first, then its subfolders in reverse discovery order. Depth-first traversal
+// of that order is the one-folder-at-a-time order this listing always had.
+func (s *Storage) fetchPage(ctx context.Context, cursor listCursor, prefix string) (treewalk.Page[listCursor, model.ObjectInfo], error) {
+	empty := treewalk.Page[listCursor, model.ObjectInfo]{}
+	if err := s.confine(cursor, prefix); err != nil {
+		return empty, pluginerrors.Permanent(err)
+	}
+	fp, err := s.listFolder(ctx, cursor.Dir, cursor.Offset)
+	if err != nil {
+		if class, _ := pluginerrors.ClassOf(err); class == pluginerrors.ClassNotFound {
+			return empty, nil // the folder does not exist yet: nothing under it
+		}
+		return empty, err
+	}
+	if !fp.itemsPresent {
+		// A folder answer always states its items — an empty folder states an
+		// empty list. Without that field the answer proves nothing, and reading
+		// it as "no children" would silently drop the subtree from the survey.
+		return empty, pluginerrors.Transient(
+			fmt.Errorf("listing %s: the answer does not state the items", cursor.Dir))
+	}
+	page := empty
+	var folders []listCursor
+	next := cursor.Offset + len(fp.items)
+	for _, it := range fp.items {
+		child := cursor.Dir + "/" + it.Name
+		switch it.Type {
+		case "file":
+			if strings.HasPrefix(child, prefix) && s.inRoot(child) {
+				page.Items = append(page.Items, model.ObjectInfo{Key: s.keyOf(child), Size: it.Size,
+					ModTime: parseModified(it.Modified), MD5: strings.ToLower(it.MD5)})
+			}
+		case "dir":
+			if descendable(child, prefix) && s.inRoot(child) {
+				folders = append(folders, listCursor{Dir: child})
 			}
 		}
-		items := fp.items
-		next := st.Offset + len(items)
-		for _, it := range items {
-			child := st.Dir + "/" + it.Name
-			switch it.Type {
-			case "file":
-				if strings.HasPrefix(child, prefix) && s.inRoot(child) {
-					page.Objects = append(page.Objects, model.ObjectInfo{Key: s.keyOf(child), Size: it.Size,
-						ModTime: parseModified(it.Modified), MD5: strings.ToLower(it.MD5)})
-				}
-			case "dir":
-				if descendable(child, prefix) && s.inRoot(child) {
-					st.Queue = append(st.Queue, child)
-				}
-			}
+	}
+	switch {
+	case fp.total != nil && *fp.total > next:
+		if len(fp.items) == 0 {
+			return empty, pluginerrors.Transient(
+				fmt.Errorf("listing %s made no progress: offset %d of %d", cursor.Dir, cursor.Offset, *fp.total))
 		}
-		switch {
-		case fp.total != nil && *fp.total > next:
-			if len(items) == 0 {
-				return storage.ListPage{}, plugin.Transient(
-					fmt.Errorf("listing %s made no progress: offset %d of %d", st.Dir, st.Offset, *fp.total))
-			}
-			st.Offset = next
-			page.NextToken = st.token()
-			return page, nil
-		case fp.total == nil && len(items) > 0:
-			// The answer did not state how many children the folder holds: page
-			// on until an empty page instead of assuming this was the last one.
-			st.Offset = next
-			page.NextToken = st.token()
-			return page, nil
-		}
-		if len(st.Queue) == 0 {
-			return page, nil
-		}
-		st.Dir = st.Queue[len(st.Queue)-1]
-		st.Queue = st.Queue[:len(st.Queue)-1]
-		st.Offset = 0
-		if !s.inRoot(st.Dir) {
-			return storage.ListPage{}, plugin.Permanent(fmt.Errorf("listing token points at %q, outside the root %q", st.Dir, s.root))
+		page.Next = append(page.Next, listCursor{Dir: cursor.Dir, Offset: next})
+	case fp.total == nil && len(fp.items) > 0:
+		// The answer did not state how many children the folder holds: page on
+		// until an empty page instead of assuming this was the last one.
+		page.Next = append(page.Next, listCursor{Dir: cursor.Dir, Offset: next})
+	}
+	for i := len(folders) - 1; i >= 0; i-- {
+		page.Next = append(page.Next, folders[i])
+	}
+	return page, nil
+}
+
+// confine refuses a cursor that could make a request outside the listing's
+// scope: a negative offset, a folder outside the root, a folder beside the
+// prefix, or a folder path carrying an empty, "." or ".." segment. The service
+// resolves such segments to another resource, so a look-alike path passes every
+// prefix test while the request reads elsewhere; the walk library treats a
+// cursor as opaque, so this check is the only guard between a forged token — or
+// a hostile name in a listing answer — and an out-of-scope request.
+func (s *Storage) confine(cursor listCursor, prefix string) error {
+	if cursor.Offset < 0 {
+		return fmt.Errorf("listing cursor offset %d is negative", cursor.Offset)
+	}
+	if !s.inRoot(cursor.Dir) {
+		return fmt.Errorf("listing cursor folder %q is outside the root %q", cursor.Dir, s.root)
+	}
+	if !onPrefixPath(cursor.Dir, prefix) {
+		return fmt.Errorf("listing cursor folder %q is outside the prefix %q", cursor.Dir, prefix)
+	}
+	if err := confinedDir(cursor.Dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// confinedDir refuses a folder path with an empty, "." or ".." segment: those
+// spellings resolve to a different resource than the string suggests.
+func confinedDir(dir string) error {
+	for _, seg := range strings.Split(dir, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return fmt.Errorf("listing cursor folder %q has an empty, %q or %q segment", dir, ".", "..")
 		}
 	}
+	return nil
+}
+
+// onPrefixPath reports whether dir lies on the prefix's own path: a listing may
+// start above the prefix (the configured root) or inside it, never beside it.
+func onPrefixPath(dir, prefix string) bool {
+	return strings.HasPrefix(dir, prefix) || strings.HasPrefix(prefix, dir+"/")
 }
 
 // folderListing is one listing answer as the plugin read it. total is nil and
@@ -454,7 +530,7 @@ func (s *Storage) listFolder(ctx context.Context, dir string, offset int) (folde
 	case http.StatusOK:
 		var l listing
 		if err := json.Unmarshal(resp.body, &l); err != nil {
-			return folderListing{}, plugin.Transient(fmt.Errorf("list %s: unreadable answer: %w", dir, err))
+			return folderListing{}, pluginerrors.Transient(fmt.Errorf("list %s: unreadable answer: %w", dir, err))
 		}
 		out := folderListing{total: l.Embedded.Total, itemsPresent: l.Embedded.Items != nil}
 		if l.Embedded.Items != nil {
@@ -462,7 +538,7 @@ func (s *Storage) listFolder(ctx context.Context, dir string, offset int) (folde
 		}
 		return out, nil
 	case http.StatusNotFound:
-		return folderListing{}, plugin.NotFound(fmt.Errorf("folder %s is definitely absent: %s", dir, apiMessage(resp.body)))
+		return folderListing{}, pluginerrors.NotFound(fmt.Errorf("folder %s is definitely absent: %s", dir, apiMessage(resp.body)))
 	default:
 		return folderListing{}, classifyAPI(resp, "list "+dir)
 	}
@@ -474,7 +550,7 @@ func (s *Storage) Delete(ctx context.Context, key string) error {
 	}
 	full, err := s.objectPath(key)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	q := url.Values{"path": {full}}
 	if s.cfg.PermanentDelete {
@@ -547,7 +623,7 @@ func (s *Storage) depthBelowRoot(dir string) int {
 func (s *Storage) folderIsEmpty(ctx context.Context, dir string) (bool, error) {
 	l, err := s.listFolder(ctx, dir, 0)
 	if err != nil {
-		if class, _ := plugin.ClassOf(err); class == plugin.ClassNotFound {
+		if class, _ := pluginerrors.ClassOf(err); class == pluginerrors.ClassNotFound {
 			return true, nil // already gone: nothing left to remove
 		}
 		return false, err
@@ -595,7 +671,7 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 	}
 	full, err := s.objectPath(key)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	if _, err := s.stat(ctx, key, full); err != nil {
 		return err
@@ -606,7 +682,7 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, href, nil)
 	if err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	resp, err := s.http.Do(req)
 	if err != nil {
@@ -614,7 +690,7 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound {
-		return plugin.NotFound(fmt.Errorf("object %s is definitely absent", full))
+		return pluginerrors.NotFound(fmt.Errorf("object %s is definitely absent", full))
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -626,10 +702,10 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(fmt.Errorf("read %s: %w", full, err))
+		return pluginerrors.Transient(fmt.Errorf("read %s: %w", full, err))
 	}
 	if resp.ContentLength >= 0 && n != resp.ContentLength {
-		return plugin.Transient(fmt.Errorf("download of %s stopped at %d of %d bytes", full, n, resp.ContentLength))
+		return pluginerrors.Transient(fmt.Errorf("download of %s stopped at %d of %d bytes", full, n, resp.ContentLength))
 	}
 	return nil
 }
@@ -645,11 +721,11 @@ func (s *Storage) downloadHref(ctx context.Context, full string) (string, error)
 			Href string `json:"href"`
 		}
 		if err := json.Unmarshal(resp.body, &answer); err != nil || answer.Href == "" {
-			return "", plugin.Transient(fmt.Errorf("download href for %s: unreadable answer %q", full, resp.body))
+			return "", pluginerrors.Transient(fmt.Errorf("download href for %s: unreadable answer %q", full, resp.body))
 		}
 		return answer.Href, nil
 	case http.StatusNotFound:
-		return "", plugin.NotFound(fmt.Errorf("object %s is definitely absent: %s", full, apiMessage(resp.body)))
+		return "", pluginerrors.NotFound(fmt.Errorf("object %s is definitely absent: %s", full, apiMessage(resp.body)))
 	default:
 		return "", classifyAPI(resp, "download href for "+full)
 	}
@@ -690,11 +766,11 @@ func (s *Storage) apiCall(ctx context.Context, method, endpoint string, q url.Va
 func (s *Storage) token() (string, error) {
 	b, err := os.ReadFile(s.cfg.Token.File)
 	if err != nil {
-		return "", plugin.Permanent(fmt.Errorf("read token file: %w", err))
+		return "", pluginerrors.Permanent(fmt.Errorf("read token file: %w", err))
 	}
 	token := strings.TrimSpace(string(b))
 	if token == "" {
-		return "", plugin.Permanent(fmt.Errorf("token file %s is empty", s.cfg.Token.File))
+		return "", pluginerrors.Permanent(fmt.Errorf("token file %s is empty", s.cfg.Token.File))
 	}
 	return token, nil
 }
@@ -772,23 +848,23 @@ func classifyAPI(resp apiResponse, what string) error {
 	err := fmt.Errorf("%s: HTTP %d: %s", what, resp.status, apiMessage(resp.body))
 	switch {
 	case resp.status == http.StatusUnauthorized || resp.status == http.StatusForbidden:
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	case resp.status == http.StatusInsufficientStorage || resp.status == http.StatusLocked:
 		// 507 is a full Disk and 423 the monthly upload-traffic limit: quota
 		// answers a retry of this run cannot change.
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	case resp.status == http.StatusTooManyRequests || resp.status >= 500:
 		if d := retryAfterHint(resp.header); d > 0 {
-			return plugin.RetryAfter(err, d)
+			return pluginerrors.RetryAfter(err, d)
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	default:
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 }
 
 // transportError classifies a request that got no HTTP answer at all: caller
-// cancellation stays unclassified (the engine treats it as terminal), anything
+// cancellation stays unclassified (execution treats it as terminal), anything
 // else — a timeout, a reset connection, DNS — is transient. Only the wrapped
 // cause is reported: a *url.Error spells out the request URL, and for the bulk
 // transfers that URL is a pre-authorised href whose signature must never reach
@@ -801,7 +877,7 @@ func transportError(ctx context.Context, err error, what string) error {
 	if errors.As(err, &uerr) && uerr.Err != nil {
 		err = uerr.Err
 	}
-	return plugin.Transient(fmt.Errorf("%s: %w", what, err))
+	return pluginerrors.Transient(fmt.Errorf("%s: %w", what, err))
 }
 
 func retryAfterHint(h http.Header) time.Duration {
@@ -879,17 +955,11 @@ type listing struct {
 	} `json:"_embedded"`
 }
 
-// listState is the opaque page token: the folder being paged with its offset,
-// and the folders still to walk.
-type listState struct {
-	Dir    string   `json:"dir"`
-	Offset int      `json:"offset"`
-	Queue  []string `json:"queue"`
-}
-
-// token renders the paging state as the opaque token a caller hands back. Every
-// field is a JSON scalar or a list of them, so the marshal has no failure left
-// to report.
-func (st listState) token() string {
-	return string(must.Do(json.Marshal(st)))
+// listCursor is one folder-page position: the folder being read and the offset
+// where the next page of its children starts. It is both the caller's input
+// token shape and the internal walk cursor; a token names no queued folder
+// because the walk itself carries the branches.
+type listCursor struct {
+	Dir    string `json:"dir"`
+	Offset int    `json:"offset"`
 }

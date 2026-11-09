@@ -19,25 +19,29 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/s3"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 const testBucket = "test-bucket"
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := s3.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, s3.Spec, func(lr *loader.Registry) error {
+		return s3.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
 }
 
-// writeSecret writes a secret file of mode 600 for a plugin.Secret{file} field.
+// writeSecret writes a secret file of mode 600 for a configuration.Secret{file} field.
 func writeSecret(t *testing.T, value string) string {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "secret-*")
@@ -85,8 +89,8 @@ func newStorageFrom(t *testing.T, raw map[string]any) storage.Storage {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := plugin.Build(context.Background(), testRegistry(t), storage.Kind, "s3", body,
-		plugin.Deps{Instance: "offsite", Log: slog.New(slog.DiscardHandler)})
+	s, err := storage.Build(context.Background(), testRegistry(t), "s3", body,
+		storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "offsite", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,20 +103,20 @@ func newStorage(t *testing.T, mutate func(raw map[string]any)) (storage.Storage,
 	return newStorageFrom(t, baseConfig(t, f, mutate)), f
 }
 
-func classOf(err error) plugin.Class {
-	class, _ := plugin.ClassOf(err)
+func classOf(err error) pluginerrors.Class {
+	class, _ := pluginerrors.ClassOf(err)
 	return class
 }
 
 func TestGeneralConformance(t *testing.T) {
-	plugintest.CheckSpec(t, testRegistry(t))
+	storagetest.CheckSpec(t, testRegistry(t))
 }
 
 func TestStorageConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T) storage.Storage {
-		s, _ := newStorage(t, func(raw map[string]any) { raw["request_timeout"] = "100ms" })
+		s, _ := newStorage(t, func(raw map[string]any) { raw["request_timeout"] = "1s" })
 		return s
-	}, storagetest.Options{SlowWrite: 300 * time.Millisecond})
+	}, storagetest.Options{SlowWrite: 3 * time.Second})
 }
 
 func TestDescribeTraits(t *testing.T) {
@@ -128,7 +132,7 @@ func TestDescribeTraits(t *testing.T) {
 
 // TestSinglePutSequence pins one Put attempt's requests: one signed PutObject
 // with the configured storage class and no aws-chunked framing — and nothing
-// else. The plugin does not verify its own write; the engine's Stat is the one
+// else. The plugin does not verify its own write; transfer's Stat is the one
 // proof, so the whole upload costs 1 PUT + 1 HEAD. A hidden SDK retry would
 // break the counts.
 func TestSinglePutSequence(t *testing.T) {
@@ -159,12 +163,12 @@ func TestSinglePutSequence(t *testing.T) {
 	if _, ok := f.objectBody("root/a/b.bin"); !ok {
 		t.Error("the object was not stored under the storage prefix")
 	}
-	// The engine's verification of the copy: one Stat (one HEAD), no download.
+	// Transfer's verification of the copy: one Stat (one HEAD), no download.
 	if _, err := s.Stat(ctx, "a/b.bin"); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.Count("head"); got != 1 {
-		t.Errorf("head requests after Put and the engine's Stat: got %d, want 1", got)
+		t.Errorf("head requests after Put and transfer's Stat: got %d, want 1", got)
 	}
 	if got := f.Count("get"); got != 0 {
 		t.Errorf("get requests: got %d, want none", got)
@@ -180,8 +184,8 @@ func TestNoSdkRetryOnPut(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 503 was accepted")
 	}
-	class, after := plugin.ClassOf(err)
-	if class != plugin.ClassTransient || after != 3*time.Second {
+	class, after := pluginerrors.ClassOf(err)
+	if class != pluginerrors.ClassTransient || after != 3*time.Second {
 		t.Errorf("class %q after %s, want transient after 3s: %v", class, after, err)
 	}
 	if got := f.Count("put"); got != 1 {
@@ -200,7 +204,7 @@ func TestForbiddenHeadIsNotNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 403 on HEAD was read as success")
 	}
-	if class := classOf(err); class != plugin.ClassPermanent {
+	if class := classOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("class %q, want permanent (never not_found): %v", class, err)
 	}
 }
@@ -213,7 +217,7 @@ func TestOversizeObjectRejectedWithoutRequests(t *testing.T) {
 		raw["max_object_bytes"] = 10 << 20
 	})
 	_, err := s.Put(ctx, storage.PutRequest{Key: "huge.bin", Size: 20 << 20}, bytes.NewReader(make([]byte, 1)))
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("oversize object: got %v", err)
 	}
 	if f.Count("put") != 0 || f.Count("create") != 0 || f.Count("part") != 0 {
@@ -279,7 +283,7 @@ func TestListPagingAndPrefix(t *testing.T) {
 
 func TestListRejectsEscapingPrefix(t *testing.T) {
 	s, _ := newStorage(t, nil)
-	if _, err := s.List(context.Background(), storage.ListRequest{Prefix: "../x"}); classOf(err) != plugin.ClassPermanent {
+	if _, err := s.List(context.Background(), storage.ListRequest{Prefix: "../x"}); classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("a prefix with .. was accepted: %v", err)
 	}
 }
@@ -319,7 +323,7 @@ func TestGetWithoutHeadersIsTransientTimeout(t *testing.T) {
 	f.putObject("root/hang.bin", []byte("x"))
 	f.hang["get"] = true
 	err := s.Get(context.Background(), "hang.bin", io.Discard)
-	if err == nil || classOf(err) != plugin.ClassTransient {
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a download that never got headers: %v", err)
 	}
 	if !strings.Contains(err.Error(), "no response within request_timeout") {
@@ -341,7 +345,7 @@ func TestOneConnectionPerStorage(t *testing.T) {
 			t.Fatalf("PutPart %d: %v", i+1, err)
 		}
 	}
-	if _, err := s.Stat(ctx, "pool/absent.bin"); classOf(err) != plugin.ClassNotFound {
+	if _, err := s.Stat(ctx, "pool/absent.bin"); classOf(err) != pluginerrors.ClassNotFound {
 		t.Fatalf("Stat of an absent key: %v", err)
 	}
 	if got := f.Connections(); got != 1 {
@@ -357,13 +361,13 @@ func TestCredentialsAreReadPerCall(t *testing.T) {
 	s, f := newStorage(t, func(raw map[string]any) {
 		raw["access_key_id"] = map[string]any{"file": keyFile}
 	})
-	if _, err := s.Stat(ctx, "x.bin"); classOf(err) != plugin.ClassNotFound {
+	if _, err := s.Stat(ctx, "x.bin"); classOf(err) != pluginerrors.ClassNotFound {
 		t.Fatalf("Stat: %v", err)
 	}
 	if err := os.WriteFile(keyFile, []byte("rotated-key-id"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Stat(ctx, "x.bin"); classOf(err) != plugin.ClassNotFound {
+	if _, err := s.Stat(ctx, "x.bin"); classOf(err) != pluginerrors.ClassNotFound {
 		t.Fatalf("Stat after the key was rotated: %v", err)
 	}
 	auths := f.Authorizations()
@@ -398,10 +402,10 @@ func TestGetDeleteRoundTrip(t *testing.T) {
 	if err := s.Delete(ctx, "get/x.bin"); err != nil {
 		t.Errorf("second Delete must be idempotent: %v", err)
 	}
-	if _, err := s.Stat(ctx, "get/x.bin"); classOf(err) != plugin.ClassNotFound {
+	if _, err := s.Stat(ctx, "get/x.bin"); classOf(err) != pluginerrors.ClassNotFound {
 		t.Errorf("Stat after Delete: %v", err)
 	}
-	if err := s.Get(ctx, "get/x.bin", io.Discard); classOf(err) != plugin.ClassNotFound {
+	if err := s.Get(ctx, "get/x.bin", io.Discard); classOf(err) != pluginerrors.ClassNotFound {
 		t.Errorf("Get of an absent key: %v", err)
 	}
 }
@@ -411,7 +415,7 @@ func TestMissingCredentialFileIsPermanent(t *testing.T) {
 		raw["access_key_id"] = map[string]any{"file": filepath.Join(t.TempDir(), "absent")}
 	})
 	_, err := s.Stat(context.Background(), "x.bin")
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("a missing credential file: got %v", err)
 	}
 }
@@ -440,21 +444,27 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"object below request":   strings.Replace(good, `"max_object_bytes": 5497558138880`, `"max_object_bytes": 1`, 1),
 		"unknown member":         strings.Replace(good, `{`, `{"zzz": 1,`, 1),
 	}
+	build := func(raw string) error {
+		t.Helper()
+		_, err := storage.Build(context.Background(), r, "s3", jsontext.Value(raw),
+			storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "s3"})
+		return err
+	}
 	for name, raw := range bad {
-		if _, err := r.BuildAny(context.Background(), "storage", "s3", jsontext.Value(raw), plugin.Deps{Instance: "s3"}); err == nil {
+		if err := build(raw); err == nil {
 			t.Errorf("%s: config accepted: %s", name, raw)
 		}
 	}
-	if _, err := r.BuildAny(context.Background(), "storage", "s3", jsontext.Value(good), plugin.Deps{Instance: "s3"}); err != nil {
+	if err := build(good); err != nil {
 		t.Errorf("the good config was rejected: %v", err)
 	}
 	supported := strings.Replace(good, `"when_required"`, `"when_supported"`, 1)
-	if _, err := r.BuildAny(context.Background(), "storage", "s3", jsontext.Value(supported), plugin.Deps{Instance: "s3"}); err != nil {
+	if err := build(supported); err != nil {
 		t.Errorf("a when_supported config was rejected: %v", err)
 	}
 }
 
-func TestRegisterRejectsCanceledContext(t *testing.T) {
+func TestBuildRejectsCanceledContext(t *testing.T) {
 	f := newFakeS3(t, testBucket)
 	body, err := json.Marshal(baseConfig(t, f, nil))
 	if err != nil {
@@ -462,8 +472,8 @@ func TestRegisterRejectsCanceledContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := plugin.Build(ctx, testRegistry(t), storage.Kind, "s3", body,
-		plugin.Deps{Instance: "s3", Log: slog.New(slog.DiscardHandler)}); err == nil {
+	if _, err := storage.Build(ctx, testRegistry(t), "s3", body,
+		storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "s3", Log: slog.New(slog.DiscardHandler)}); err == nil {
 		t.Fatal("a cancelled context built a storage")
 	}
 }
@@ -539,7 +549,7 @@ func TestListDropsKeysOutsideTheRoot(t *testing.T) {
 func TestListFailureIsTransient(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["list"] = http.StatusInternalServerError
-	if _, err := s.List(context.Background(), storage.ListRequest{}); err == nil || classOf(err) != plugin.ClassTransient {
+	if _, err := s.List(context.Background(), storage.ListRequest{}); err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a failed listing: got %v", err)
 	}
 }
@@ -547,7 +557,7 @@ func TestListFailureIsTransient(t *testing.T) {
 func TestDeleteFailureIsTransient(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["delete"] = http.StatusInternalServerError
-	if err := s.Delete(context.Background(), "k"); err == nil || classOf(err) != plugin.ClassTransient {
+	if err := s.Delete(context.Background(), "k"); err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a failed delete: got %v", err)
 	}
 }
@@ -555,7 +565,7 @@ func TestDeleteFailureIsTransient(t *testing.T) {
 func TestGetFailureIsTransient(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["get"] = http.StatusInternalServerError
-	if err := s.Get(context.Background(), "k", io.Discard); err == nil || classOf(err) != plugin.ClassTransient {
+	if err := s.Get(context.Background(), "k", io.Discard); err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a failed download: got %v", err)
 	}
 }

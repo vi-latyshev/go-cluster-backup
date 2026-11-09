@@ -52,7 +52,7 @@ func TestSuite(t *testing.T) {
 		})
 	})
 
-	// Scenario b: a manual run does the work, records itself, and notifies.
+	// Scenario b: a manual run does the work, releases the lease, and notifies.
 	var runID string
 	t.Run("manual_run", func(t *testing.T) {
 		job := "manual-" + timestamp()
@@ -64,12 +64,23 @@ func TestSuite(t *testing.T) {
 		if runID == "" {
 			t.Fatalf("no run id in the notification: %q", line)
 		}
-		// The finished notification is sent before the last catalog save, so the
-		// entry is polled for rather than read once.
-		waitFor(t, "the catalog entry for run "+runID, time.Minute, func() (bool, string) {
-			catalog := e.kubectl(t, "get", "configmap", catalogName(suiteFullname), "-n", ns,
-				"-o", `jsonpath={.data.catalog\.json}`)
-			return strings.Contains(catalog, runID) && strings.Contains(catalog, `"outcome":"delivered"`), catalog
+		// The catalog keeps the writer lease alone: the run's record is its
+		// storage manifest, and the ConfigMap carries the lease key and no
+		// history key.
+		data := e.kubectl(t, "get", "configmap", catalogName(suiteFullname), "-n", ns,
+			"-o", "jsonpath={.data}")
+		if !strings.Contains(data, "lease.json") || strings.Contains(data, "catalog.json") {
+			t.Fatalf("the catalog ConfigMap holds %s; want the lease key alone", data)
+		}
+		// The lease is released with the run: the record stays under its key,
+		// without a holder.
+		waitFor(t, "the writer lease to be released after run "+runID, time.Minute, func() (bool, string) {
+			lease, err := e.exec("", "kubectl", "get", "configmap", catalogName(suiteFullname), "-n", ns,
+				"-o", `jsonpath={.data.lease\.json}`)
+			if err != nil {
+				return false, lease
+			}
+			return lease == "" || strings.Contains(lease, `"holder":""`), lease
 		})
 	})
 
@@ -277,10 +288,11 @@ func (e *Env) jobFailed(t *testing.T, ns, name string, timeout time.Duration) {
 	})
 }
 
-// seedLease writes the writer-lease record the tool itself writes, naming a
-// holder the catalog cannot prove dead: the pod is absent and the claim is far
-// inside run.lease_hard_bound. A manual run refuses it at once, which is the
-// one behaviour under test — no race against a run that may finish first.
+// seedLease writes the writer-lease record the tool itself writes under the
+// lease key, naming a holder the catalog cannot prove dead: the pod is absent
+// and the claim is far inside run.lease_hard_bound. A manual run refuses it at
+// once, which is the one behaviour under test — no race against a run that may
+// finish first.
 func (e *Env) seedLease(t *testing.T, ns, catalog string) {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
@@ -295,7 +307,7 @@ func (e *Env) seedLease(t *testing.T, ns, catalog string) {
 	if err != nil {
 		t.Fatalf("encode lease: %v", err)
 	}
-	patch := fmt.Sprintf(`{"data":{"catalog.json.lease":%q}}`, string(body))
+	patch := fmt.Sprintf(`{"data":{"lease.json":%q}}`, string(body))
 	e.kubectl(t, "patch", "configmap", catalog, "-n", ns, "--type=merge", "-p", patch)
 }
 
@@ -303,7 +315,7 @@ func (e *Env) seedLease(t *testing.T, ns, catalog string) {
 func (e *Env) clearLease(t *testing.T, ns, catalog string) {
 	t.Helper()
 	_, _ = e.exec("", "kubectl", "patch", "configmap", catalog, "-n", ns, "--type=json",
-		"-p", `[{"op":"remove","path":"/data/catalog.json.lease"}]`)
+		"-p", `[{"op":"remove","path":"/data/lease.json"}]`)
 }
 
 // waitForLease waits until the catalog ConfigMap carries a held writer lease.
@@ -311,7 +323,7 @@ func (e *Env) waitForLease(t *testing.T, ns, catalog string) {
 	t.Helper()
 	waitFor(t, "the writer lease to be taken", time.Minute, func() (bool, string) {
 		out, err := e.exec("", "kubectl", "get", "configmap", catalog, "-n", ns,
-			"-o", `jsonpath={.data.catalog\.json\.lease}`)
+			"-o", `jsonpath={.data.lease\.json}`)
 		if err != nil {
 			return false, out
 		}

@@ -14,8 +14,9 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // internalStub installs a sqlite3 that answers every pragma with ok and writes
@@ -48,12 +49,15 @@ exit 0
 func internalSource(t *testing.T, path, scratch string) source.Source {
 	t.Helper()
 	raw := fmt.Sprintf(`{"path": %q, "scratch_dir": %q, "busy_timeout": "10s", "integrity_check": "quick"}`, path, scratch)
-	r := plugin.NewRegistry()
-	if err := Register(r); err != nil {
+	r := instances.NewRegistry()
+	lr := loader.New()
+	if err := loader.Add(lr, Spec, func(lr *loader.Registry) error {
+		return Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := plugin.Build(context.Background(), r, source.Kind, "sqlite", jsontext.Value(raw),
-		plugin.Deps{Instance: "sqlite", Log: slog.New(slog.DiscardHandler)})
+	s, err := instances.Build(context.Background(), r, source.Kind, "sqlite", jsontext.Value(raw),
+		instances.Deps{Instance: "sqlite", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}

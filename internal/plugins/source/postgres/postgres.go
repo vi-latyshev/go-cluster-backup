@@ -14,36 +14,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/extcmd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // Config is the plugin config. Every field is required: no value in code can
 // stand in for what the file omits.
 type Config struct {
-	Address         string         `json:"address" required:"true" doc:"host:port of the PostgreSQL server"`
-	Database        string         `json:"database" required:"true" doc:"database to dump; with all_databases true, the database the enumeration connects to"`
-	Username        string         `json:"username" required:"true" doc:"role pg_dump and psql connect as"`
-	Password        plugin.Secret  `json:"password" doc:"file holding the role's password; never passed on a command line"`
-	Format          string         `json:"format" doc:"pg_dump output format: custom, tar or plain"`
-	Compression     string         `json:"compression" doc:"pg_dump --compress argument, e.g. none or zstd:3"`
-	ConnectAttempts int            `json:"connect_attempts" doc:"TCP connect attempts before a dump gives up"`
-	ConnectInterval model.Duration `json:"connect_interval" doc:"wait between connect attempts; also the per-attempt dial timeout"`
+	Address         string               `json:"address" required:"true" doc:"host:port of the PostgreSQL server"`
+	Database        string               `json:"database" required:"true" doc:"database to dump; with all_databases true, the database the enumeration connects to"`
+	Username        string               `json:"username" required:"true" doc:"role pg_dump and psql connect as"`
+	Password        configuration.Secret `json:"password" doc:"file holding the role's password; never passed on a command line"`
+	Format          string               `json:"format" doc:"pg_dump output format: custom, tar or plain"`
+	Compression     string               `json:"compression" doc:"pg_dump --compress argument, e.g. none or zstd:3"`
+	ConnectAttempts int                  `json:"connect_attempts" doc:"TCP connect attempts before a dump gives up"`
+	ConnectInterval model.Duration       `json:"connect_interval" doc:"wait between connect attempts; also the per-attempt dial timeout"`
 	// AllDatabases makes this instance enumerate the server's databases instead
-	// of dumping one: the engine builds one source per database, and each of
+	// of dumping one: the planning layer builds one source per database, and each of
 	// those artifacts carries the database it holds.
 	AllDatabases bool `json:"all_databases" required:"true" doc:"true when this instance enumerates every database of the server as its own artifact"`
 	// ExcludeDatabases is exact names, not a pattern: a database listed here is
@@ -64,64 +66,10 @@ var (
 	formatExt  = map[string]string{"custom": ".dump", "tar": ".tar", "plain": ".sql"}
 	formatFlag = map[string]string{"custom": "c", "tar": "t", "plain": "p"}
 	// pg_dump --compress: none, a bare gzip level, or METHOD[:LEVEL].
-	compressionRe = regexp.MustCompile(`^(none|[0-9]|gzip(:[0-9]{1,2})?|lz4(:[0-9]{1,2})?|zstd(:[0-9]{1,2})?)$`)
-)
-
-// Register adds the postgres source to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, source.Kind, plugin.Spec[Config, source.Source]{
-		Type:      "postgres",
-		Summary:   "one PostgreSQL database, dumped with pg_dump",
-		Stability: plugin.Stable,
-		Requires:  binaries,
-		Example:   []byte(`{"address": "postgres.example.svc.cluster.local:5432", "database": "app", "username": "app", "password": {"file": "/run/secrets/postgres/password"}, "format": "custom", "compression": "none", "connect_attempts": 6, "connect_interval": "5s", "all_databases": true, "exclude_databases": ["postgres"]}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (source.Source, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			host, port, err := net.SplitHostPort(cfg.Address)
-			if err != nil {
-				return nil, fmt.Errorf("address %q must be host:port: %w", cfg.Address, err)
-			}
-			if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-				return nil, fmt.Errorf("address %q: port %q is not a number", cfg.Address, port)
-			}
-			if cfg.Database == "" {
-				return nil, errors.New("database is empty")
-			}
-			if cfg.Username == "" {
-				return nil, errors.New("username is empty")
-			}
-			if cfg.Password.File == "" {
-				return nil, errors.New("password/file is empty")
-			}
-			if _, ok := formatFlag[cfg.Format]; !ok {
-				return nil, fmt.Errorf("format %q must be custom, tar or plain", cfg.Format)
-			}
-			if !compressionRe.MatchString(cfg.Compression) {
-				return nil, fmt.Errorf("compression %q is not a pg_dump --compress value", cfg.Compression)
-			}
-			if cfg.ConnectAttempts < 1 {
-				return nil, fmt.Errorf("connect_attempts must be at least 1, got %d", cfg.ConnectAttempts)
-			}
-			if cfg.ConnectInterval.Std() <= 0 {
-				return nil, errors.New("connect_interval must be positive")
-			}
-			// The instance dumps either one database or all of them: a list of
-			// exclusions beside a single-database instance is a config that
-			// asks for something it cannot do.
-			for i, name := range cfg.ExcludeDatabases {
-				if name == "" {
-					return nil, fmt.Errorf("exclude_databases/%d is empty", i)
-				}
-			}
-			if len(cfg.ExcludeDatabases) > 0 && !cfg.AllDatabases {
-				return nil, errors.New("exclude_databases is set but all_databases is false: the instance dumps one database, so nothing is enumerated to exclude")
-			}
-			return &Source{cfg: cfg, host: host, port: port}, nil
-		},
+	compressionRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`^(none|[0-9]|gzip(:[0-9]{1,2})?|lz4(:[0-9]{1,2})?|zstd(:[0-9]{1,2})?)$`)
 	})
-}
+)
 
 type Source struct {
 	cfg  Config
@@ -159,7 +107,7 @@ func (s *Source) Check(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
 	if err != nil {
@@ -174,7 +122,7 @@ func (s *Source) Check(ctx context.Context) error {
 		return err
 	}
 	if client != server {
-		return plugin.Permanent(fmt.Errorf("pg_dump major %d does not equal server major %d: the image's postgresql client must match the server", client, server))
+		return pluginerrors.Permanent(fmt.Errorf("pg_dump major %d does not equal server major %d: the image's postgresql client must match the server", client, server))
 	}
 	return nil
 }
@@ -193,7 +141,7 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(err)
+		return pluginerrors.Transient(err)
 	}
 	cmd := exec.CommandContext(ctx, "pg_dump", s.dumpArgs()...)
 	cmd.Env = s.pgEnv(pass)
@@ -228,13 +176,13 @@ func (s *Source) pgDumpMajor(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	m := versionRe.FindStringSubmatch(out)
+	m := versionRe().FindStringSubmatch(out)
 	if m == nil {
-		return 0, plugin.Permanent(fmt.Errorf("cannot read a version from pg_dump --version output %q", strings.TrimSpace(out)))
+		return 0, pluginerrors.Permanent(fmt.Errorf("cannot read a version from pg_dump --version output %q", strings.TrimSpace(out)))
 	}
 	major, err := strconv.Atoi(m[1])
 	if err != nil {
-		return 0, plugin.Permanent(fmt.Errorf("pg_dump version %q is not a number", m[1]))
+		return 0, pluginerrors.Permanent(fmt.Errorf("pg_dump version %q is not a number", m[1]))
 	}
 	return major, nil
 }
@@ -248,7 +196,7 @@ func (s *Source) serverMajor(ctx context.Context, pass string) (int, error) {
 	}
 	num, err := strconv.Atoi(strings.TrimSpace(out))
 	if err != nil {
-		return 0, plugin.Permanent(fmt.Errorf("server version %q is not a number: %w", strings.TrimSpace(out), err))
+		return 0, pluginerrors.Permanent(fmt.Errorf("server version %q is not a number: %w", strings.TrimSpace(out), err))
 	}
 	return num / 10000, nil
 }
@@ -268,7 +216,7 @@ func (s *Source) psqlQuery(ctx context.Context, database, pass, query string) (s
 
 // Units enumerates the server's databases as one artifact each: with
 // all_databases false the instance dumps exactly one database and answers
-// errors.ErrUnsupported — the engine's "this instance is one artifact". A
+// errors.ErrUnsupported — the planning layer's "this instance is one artifact". A
 // unit's config is this instance's own config with the database substituted and
 // the enumeration switched off — a unit that enumerated again would never end —
 // and every unit is dumped by a source of this same type.
@@ -289,7 +237,7 @@ func (s *Source) Units(ctx context.Context) ([]source.Unit, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, plugin.Transient(err)
+		return nil, pluginerrors.Transient(err)
 	}
 	out, err := s.psqlQuery(ctx, s.cfg.Database, pass, unitsQuery)
 	if err != nil {
@@ -306,7 +254,7 @@ func (s *Source) Units(ctx context.Context) ([]source.Unit, error) {
 			continue
 		}
 		// A database name is the server's, not this plugin's to judge: one the
-		// engine cannot build an artifact name from is that database's own
+		// planning layer cannot build an artifact name from is that database's own
 		// failed artifact, and every other database of the instance is dumped.
 		// A Config is plain JSON-encodable data — strings, numbers, a duration
 		// and a secret reference — so the encode cannot fail.
@@ -314,7 +262,7 @@ func (s *Source) Units(ctx context.Context) ([]source.Unit, error) {
 		units = append(units, source.Unit{Name: name, Config: raw})
 	}
 	if len(units) == 0 {
-		return nil, plugin.Permanent(fmt.Errorf("server %s holds no database to dump (%d excluded; templates and databases that refuse connections are not dumped)",
+		return nil, pluginerrors.Permanent(fmt.Errorf("server %s holds no database to dump (%d excluded; templates and databases that refuse connections are not dumped)",
 			s.cfg.Address, len(s.cfg.ExcludeDatabases)))
 	}
 	return units, nil
@@ -330,7 +278,7 @@ func unitConfig(cfg Config, database string) Config {
 	return cfg
 }
 
-var versionRe = regexp.MustCompile(`(\d+)\.`)
+var versionRe = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`(\d+)\.`) })
 
 func connectTimeoutSeconds(d time.Duration) int {
 	return max(int((d+time.Second-1)/time.Second), 1)
@@ -348,7 +296,7 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, dst io.Writer) (int64, er
 	stdout, err := stdoutPipe(cmd)
 	if err != nil {
 		// A host out of descriptors is worth another attempt, never a panic.
-		return 0, plugin.Transient(fmt.Errorf("taking the command's stdout: %w", err))
+		return 0, pluginerrors.Transient(fmt.Errorf("taking the command's stdout: %w", err))
 	}
 	stderr := extcmd.NewBoundedBuffer()
 	cmd.Stderr = stderr
@@ -356,9 +304,9 @@ func streamCommand(ctx context.Context, cmd *exec.Cmd, dst io.Writer) (int64, er
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return 0, ctxErr
 		}
-		return 0, plugin.Transient(err)
+		return 0, pluginerrors.Transient(err)
 	}
-	n, copyErr := plugin.CopyContext(ctx, dst, stdout)
+	n, copyErr := pluginio.CopyContext(ctx, dst, stdout)
 	if copyErr != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -397,14 +345,20 @@ func runCommand(ctx context.Context, cmd *exec.Cmd, src io.Reader) (int64, error
 var (
 	// A connection the server never answered is worth another attempt; a
 	// credential the server refused is not.
-	transientRe = regexp.MustCompile(`(?i)connection refused|connection timed out|could not connect|connection reset|no route to host|i/o timeout|the database system is starting up|is in recovery|terminating connection due to|server closed the connection unexpectedly`)
-	permanentRe = regexp.MustCompile(`(?i)password authentication failed|authentication failed|no pg_hba.conf entry|does not exist|permission denied|too many connections|server version mismatch`)
+	transientRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`(?i)connection refused|connection timed out|could not connect|connection reset|no route to host|i/o timeout|the database system is starting up|is in recovery|terminating connection due to|server closed the connection unexpectedly`)
+	})
+	permanentRe = sync.OnceValue(func() *regexp.Regexp {
+		return regexp.MustCompile(`(?i)password authentication failed|authentication failed|no pg_hba.conf entry|does not exist|permission denied|too many connections|server version mismatch`)
+	})
 )
 
 // classifyExit turns a failed command into a framework-marked error with this
 // plugin's patterns; text that matches neither stays unclassified, and the
-// engine's config then decides what an unclassified error means.
-var classifyExit = extcmd.Classifier(permanentRe, transientRe)
+// execution config then decides what an unclassified error means.
+func classifyExit(bin string, err error, detail string) error {
+	return extcmd.ClassifyExit(bin, err, detail, permanentRe(), transientRe())
+}
 
 type countingReader struct {
 	r io.Reader

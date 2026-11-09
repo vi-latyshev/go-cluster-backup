@@ -14,10 +14,11 @@ import (
 
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/notifier"
-	"github.com/vi-latyshev/go-cluster-backup/internal/notifier/notifiertest"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier/notifiertest"
 )
 
 // check runs one raw configuration through the registry's offline check, the
@@ -100,8 +101,8 @@ func TestBuildRefusesACancelledContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = plugin.Build(ctx, testRegistry(t), notifier.Kind, "webhook", raw,
-		plugin.Deps{Instance: "webhook", Log: slog.New(slog.DiscardHandler)})
+	_, err = instances.Build(ctx, testRegistry(t), notifier.Kind, "webhook", raw,
+		instances.Deps{Instance: "webhook", Log: slog.New(slog.DiscardHandler)})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("building with a cancelled context returned %v, want context.Canceled", err)
 	}
@@ -125,7 +126,7 @@ func TestARedirectIsNotFollowed(t *testing.T) {
 	if err == nil {
 		t.Fatal("Notify accepted a 302")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("a 302 classified %q, want permanent", class)
 	}
 	if n := followed.Load(); n != 0 {
@@ -148,7 +149,7 @@ func TestASpanThatDoesNotPairUpInTheRenderIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Notify delivered a message whose code span never opened")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("an unrenderable message classified %q, want permanent", class)
 	}
 	if !strings.Contains(err.Error(), "code span") {
@@ -168,7 +169,7 @@ func TestTextAfterACodeSpanIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Notify delivered a line carrying text after its code span")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("an unrenderable message classified %q, want permanent", class)
 	}
 	if !strings.Contains(err.Error(), "follows the code span") {
@@ -181,12 +182,14 @@ func TestTextAfterACodeSpanIsPermanent(t *testing.T) {
 // retrying would render exactly the same way.
 func TestAPayloadThatFailsToRenderIsPermanent(t *testing.T) {
 	cfg := baseConfig("http://127.0.0.1:1/never")
-	cfg["payload"] = "{{ if not .Event.Run.Previous.RunID }}{{ .Event.Run.Lease.Holder }}{{ end }}title: {{ json .Title }}"
+	// Every sample carries one of the two kinds, so the config validates; the
+	// conformance event carries none, so this body renders nowhere.
+	cfg["payload"] = `title: {{ pick .Event.Run.Kind "scheduled" "night" "manual" "manual" }}`
 	err := build(t, cfg).Notify(context.Background(), notifiertest.Event())
 	if err == nil {
 		t.Fatal("Notify delivered a body the payload could not render")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("an unrenderable body classified %q, want permanent", class)
 	}
 	if !strings.Contains(err.Error(), "rendering the payload") {
@@ -202,7 +205,7 @@ func TestARequestThatCannotBeBuiltIsPermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Notify built a request from a URL the client refuses")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("an unbuildable request classified %q, want permanent", class)
 	}
 	if !strings.Contains(err.Error(), "building the run_finished request") {
@@ -210,7 +213,7 @@ func TestARequestThatCannotBeBuiltIsPermanent(t *testing.T) {
 	}
 }
 
-// TestACancelledRequestReturnsTheContextError: the engine's own context is the
+// TestACancelledRequestReturnsTheContextError: the run's own context is the
 // answer when the caller gives up while the request is in flight, not a
 // transient transport failure it would retry.
 func TestACancelledRequestReturnsTheContextError(t *testing.T) {
@@ -248,7 +251,7 @@ func TestACancelledRequestReturnsTheContextError(t *testing.T) {
 }
 
 // TestATruncatedResponseIsTransient: a receiver that dies mid-body is an outage
-// the engine may try again, not a permanent refusal.
+// execution may try again, not a permanent refusal.
 func TestATruncatedResponseIsTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		conn, _, err := w.(http.Hijacker).Hijack()
@@ -265,7 +268,7 @@ func TestATruncatedResponseIsTransient(t *testing.T) {
 	if err == nil {
 		t.Fatal("Notify accepted a response body that ended early")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("a truncated response classified %q, want transient", class)
 	}
 	if !strings.Contains(err.Error(), "reading the run_finished response") {
@@ -275,7 +278,7 @@ func TestATruncatedResponseIsTransient(t *testing.T) {
 
 // TestATransportFailureDoesNotCarryTheEndpoint: a *url.Error spells out the
 // request URL, and a bot endpoint's path is its credential
-// (https://host/bot123:SECRET/sendMessage). The engine stores the error text in
+// (https://host/bot123:SECRET/sendMessage). The run stores the error text in
 // the run report and sends it to every other notifier, so the cause never
 // reaches it at all.
 func TestATransportFailureDoesNotCarryTheEndpoint(t *testing.T) {
@@ -290,7 +293,7 @@ func TestATransportFailureDoesNotCarryTheEndpoint(t *testing.T) {
 	if strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("the error carries the endpoint's own URL: %v", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("a refused connection classified %q, want transient", class)
 	}
 	if !strings.Contains(err.Error(), "posting run_finished") {
@@ -306,7 +309,7 @@ func TestReviewMalformedEndpointDoesNotLeakSecret(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("delivery leaks endpoint: %v", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("an unbuildable request classified %q, want permanent", class)
 	}
 }
@@ -341,7 +344,7 @@ func TestReviewResponseCannotEchoEndpoint(t *testing.T) {
 					t.Fatalf("response diagnostics leaked the endpoint: %v", err)
 				}
 			}
-			if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+			if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 				t.Errorf("HTTP 403 classified %q, want permanent", class)
 			}
 		})
@@ -381,7 +384,7 @@ func TestReviewMalformedHeadersCannotEchoEndpoint(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "TOKEN") {
 		t.Fatalf("malformed headers leaked endpoint: %v", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("a malformed response classified %q, want transient", class)
 	}
 }
@@ -403,7 +406,7 @@ func TestReviewMalformedTrailerCannotEchoEndpoint(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "TOKEN") {
 		t.Fatalf("malformed trailer leaked endpoint: %v", err)
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("a malformed trailer classified %q, want transient", class)
 	}
 }
@@ -446,7 +449,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 	cases := map[string]struct {
 		cfg  func(*testing.T) map[string]any
 		run  func(*testing.T, map[string]any) error
-		want plugin.Class
+		want pluginerrors.Class
 	}{
 		"validation refuses a scheme": {
 			cfg:  func(*testing.T) map[string]any { return baseConfig("ftp://notify.example.com" + suffix) },
@@ -456,7 +459,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 		"the request cannot be built": {
 			cfg:  func(*testing.T) map[string]any { return baseConfig("https://notify.example.com" + suffix + "\x7f") },
 			run:  notify,
-			want: plugin.ClassPermanent,
+			want: pluginerrors.ClassPermanent,
 		},
 		"the transport has no answer": {
 			cfg: func(t *testing.T) map[string]any {
@@ -467,7 +470,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 				return cfg
 			},
 			run:  notify,
-			want: plugin.ClassTransient,
+			want: pluginerrors.ClassTransient,
 		},
 		"the transport times out": {
 			cfg: func(t *testing.T) map[string]any {
@@ -483,7 +486,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 				return cfg
 			},
 			run:  notify,
-			want: plugin.ClassTransient,
+			want: pluginerrors.ClassTransient,
 		},
 		"the response body is truncated": {
 			cfg: func(t *testing.T) map[string]any {
@@ -498,7 +501,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 				})
 			},
 			run:  notify,
-			want: plugin.ClassTransient,
+			want: pluginerrors.ClassTransient,
 		},
 		"the response headers are malformed": {
 			cfg: func(t *testing.T) map[string]any {
@@ -513,7 +516,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 				})
 			},
 			run:  notify,
-			want: plugin.ClassTransient,
+			want: pluginerrors.ClassTransient,
 		},
 		"the response trailer is malformed": {
 			cfg: func(t *testing.T) map[string]any {
@@ -528,31 +531,31 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 				})
 			},
 			run:  notify,
-			want: plugin.ClassTransient,
+			want: pluginerrors.ClassTransient,
 		},
 		"the status echoes the whole URI": {
 			cfg: func(t *testing.T) map[string]any {
 				return withLimit(t, echo(func(uri string) string { return uri }), "4KiB")
 			},
 			run:  notify,
-			want: plugin.ClassPermanent,
+			want: pluginerrors.ClassPermanent,
 		},
 		"the status echoes a truncated URI": {
 			cfg: func(t *testing.T) map[string]any {
 				return withLimit(t, echo(func(uri string) string { return uri }), 10)
 			},
 			run:  notify,
-			want: plugin.ClassPermanent,
+			want: pluginerrors.ClassPermanent,
 		},
 		"the status echoes an escaped URI": {
 			cfg:  func(t *testing.T) map[string]any { return withLimit(t, echo(url.PathEscape), "4KiB") },
 			run:  notify,
-			want: plugin.ClassPermanent,
+			want: pluginerrors.ClassPermanent,
 		},
 		"a retryable status": {
 			cfg:  func(t *testing.T) map[string]any { return serve(t, status(http.StatusServiceUnavailable)) },
 			run:  notify,
-			want: plugin.ClassTransient,
+			want: pluginerrors.ClassTransient,
 		},
 	}
 	for name, tc := range cases {
@@ -566,7 +569,7 @@ func TestDeliveryDiagnosticsCarryNoCause(t *testing.T) {
 					t.Fatalf("the diagnosis leaked the endpoint: %v", err)
 				}
 			}
-			if class, _ := plugin.ClassOf(err); class != tc.want {
+			if class, _ := pluginerrors.ClassOf(err); class != tc.want {
 				t.Fatalf("class = %q, want %q (%v)", class, tc.want, err)
 			}
 		})
@@ -630,12 +633,12 @@ func TestReviewResponseReadUsesConfiguredBound(t *testing.T) {
 	}
 	if err := run(t, 10); err == nil {
 		t.Fatal("no error below the held prefix")
-	} else if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("the read passed the configured bound: %v", err)
 	}
 	if err := run(t, "2KiB"); err == nil {
 		t.Fatal("no error above the held prefix")
-	} else if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("a read waiting for the held tail classified %q, want transient (%v)", class, err)
 	}
 }

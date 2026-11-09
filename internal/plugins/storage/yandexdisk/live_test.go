@@ -35,10 +35,11 @@ import (
 
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 const defaultLiveAPI = "https://cloud-api.yandex.net/v1/disk"
@@ -96,7 +97,7 @@ type liveClient struct {
 }
 
 // do issues one raw API call and retries a transport failure a few times, the
-// way the engine would; callers pass no body, so a retry re-issues the same
+// way execution would; callers pass no body, so a retry re-issues the same
 // request unchanged.
 func (c *liveClient) do(method, endpoint string, q url.Values, body io.Reader) (int, []byte, http.Header) {
 	c.t.Helper()
@@ -223,16 +224,16 @@ func liveBuilder(t *testing.T, tokenFile, base, root string, rec *liveRecorder) 
 	t.Helper()
 	log := testLogger()
 	return func() *Storage {
-		s, err := newStorage(Config{
+		s, err := open(Config{
 			APIURL:             base,
-			Token:              plugin.Secret{File: tokenFile},
+			Token:              configuration.Secret{File: tokenFile},
 			Root:               root,
 			PermanentDelete:    true,
 			PruneKeepDepth:     1,
 			RequestTimeout:     model.Duration(30 * time.Second),
 			CommitPollInterval: model.Duration(2 * time.Second),
 			CommitPollTimeout:  model.Duration(5 * time.Minute),
-		}, log)
+		}, log, 1)
 		if err != nil {
 			t.Fatalf("constructing the live storage: %v", err)
 		}
@@ -374,7 +375,7 @@ func TestLiveYandex(t *testing.T) {
 				var state string
 				if st, serr := s.Stat(ctx, key); serr == nil {
 					state = fmt.Sprintf("visible with %d bytes", st.Size)
-				} else if class, _ := plugin.ClassOf(serr); class == plugin.ClassNotFound {
+				} else if class, _ := pluginerrors.ClassOf(serr); class == pluginerrors.ClassNotFound {
 					state = "not_found (definitely absent)"
 				} else {
 					state = fmt.Sprintf("stat failed: %v", serr)
@@ -573,8 +574,8 @@ func TestLiveYandex(t *testing.T) {
 		ctx := context.Background()
 		s := build()
 		dir := root + "/shape"
-		// The harness has no engine to retry a stalled control call, so the
-		// setup retries it the way the engine would.
+		// The harness has no retry loop of its own, so the
+		// setup retries it the way execution would.
 		if err := retryLive(t, "mkdir "+dir, func() error { return s.mkdirAll(ctx, dir) }); err != nil {
 			t.Fatal(err)
 		}
@@ -767,7 +768,7 @@ func slowestSeconds(rows []nameRow) float64 {
 	return out
 }
 
-// retryLive runs one harness setup call under the engine's policy shape: a few
+// retryLive runs one harness setup call under the execution policy shape: a few
 // attempts, because the test process has no retry loop of its own and a live
 // control call can stall on a busy link.
 func retryLive(t *testing.T, what string, fn func() error) error {
@@ -801,15 +802,15 @@ func TestLiveYandexCleanup(t *testing.T) {
 		t.Fatalf("reading the token file: %v", err)
 	}
 	base := envOrLive("YDISK_LIVE_API", defaultLiveAPI)
-	s, err := newStorage(Config{
+	s, err := open(Config{
 		APIURL:             base,
-		Token:              plugin.Secret{File: tokenFile},
+		Token:              configuration.Secret{File: tokenFile},
 		Root:               root,
 		PermanentDelete:    true,
 		RequestTimeout:     model.Duration(30 * time.Second),
 		CommitPollInterval: model.Duration(2 * time.Second),
 		CommitPollTimeout:  model.Duration(5 * time.Minute),
-	}, testLogger())
+	}, testLogger(), 1)
 	if err != nil {
 		t.Fatalf("constructing the live storage: %v", err)
 	}

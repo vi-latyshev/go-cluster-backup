@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 )
 
 // TestStreamCommandReportsAPipeItCannotTake: os.Pipe can fail on a host out of
@@ -23,7 +23,7 @@ func TestStreamCommandReportsAPipeItCannotTake(t *testing.T) {
 	if err == nil {
 		t.Fatal("a command whose stdout pipe could not be taken was started")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }

@@ -9,9 +9,8 @@ value followed by one hand-started Job:
 kubectl create job --from=cronjob/<fullname>-restore restore-$(date +%s) -n backup
 ```
 
-Everything below also works from a laptop: copy the configuration out of the
-`<fullname>-config` ConfigMap, repoint the secret file paths at local files, and
-run the same `go-cluster-backup` binary.
+On a laptop, copy config from `<fullname>-config`, use local secret paths and
+run the same binary.
 
 ## What you need
 
@@ -36,6 +35,9 @@ and then the artifact names, exactly as `--artifact` takes them. A run without a
 manifest is listed as `manifest=no`, with no outcome — it started and never
 finished, or was killed. `--run newest-ok` selects, **per artifact**, the newest
 run where that artifact is `ok`: a degraded run may still hold the copy you need.
+Missing or wrong manifest `kind` excludes a problem run from artifact restore,
+retention deletion and protection credit. Restore reads through `guard.Port`,
+which implements `storage.Reader` without write or delete methods.
 
 ## Fetch an artifact
 
@@ -252,8 +254,7 @@ When a night fails before the tool even starts (a rejected init container, an
 next run's notification reports that failure from the cluster, via
 `.Run.Previous.Failure`.
 
-The tool reports its own runs and nothing else: there is no heartbeat and no
-periodic self-check. Its reports are the `run_started` and `run_finished`
-notifications and the catalog entry of a run that got as far as reading the
-catalog; a run that never wrote an entry surfaces in the next run's
-previous-run line. Watching the Job itself is the deployment's to add.
+Reports are `run_started` and `run_finished`; no heartbeat or periodic self-check
+runs. Only the finished event carries `.Run.Previous`, from storage manifests and
+previous Job status via `reporting`. The catalog holds only the lease. Monitor
+Jobs independently.

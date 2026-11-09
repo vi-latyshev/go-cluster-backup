@@ -1,15 +1,15 @@
 // Package s3 is the storage plugin over any S3-compatible endpoint.
 //
 // One attempt per call: the SDK's own retryer is disabled (aws.NopRetryer) and
-// every error is classified, so the engine owns retries exactly as it does for
+// every error is classified, so execution owns retries exactly as it does for
 // every other storage. Put stores one object in ONE PutObject request; an object
 // larger than a part travels part by part through the storage.MultipartUploader
-// capability, which the engine drives (see multipart.go) — one part per call and
+// capability, which transfer drives (see multipart.go) — one part per call and
 // no buffer of the object held here, so a part that failed is sent again without
 // re-sending the parts the service already accepted.
 //
 // A write is one PUT and nothing else: the plugin does not verify its own
-// object, because the engine stats every copy it uploads and that Stat is the
+// object, because transfer stats every copy it uploads and that Stat is the
 // proof a copy landed. A 200 that did not commit anything (CompleteMultipartUpload
 // may answer 200 with an error in the body) is caught by that Stat, not here.
 package s3
@@ -33,9 +33,11 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 )
 
 // Addressing styles accepted by the config field.
@@ -58,43 +60,25 @@ const (
 const minPartBytes = 5 << 20
 
 type Config struct {
-	Endpoint        string         `json:"endpoint" required:"true" doc:"base URL of the S3 endpoint, e.g. https://s3.example.com"`
-	Region          string         `json:"region" required:"true" doc:"signing region of the endpoint"`
-	Bucket          string         `json:"bucket" required:"true" doc:"bucket every object lives in"`
-	Prefix          string         `json:"prefix" required:"true" doc:"key prefix of the storage root; keys are built under it"`
-	AccessKeyID     plugin.Secret  `json:"access_key_id" doc:"file holding the access key id; an opaque string, e.g. <tenant_id>:<key_id>"`
-	SecretAccessKey plugin.Secret  `json:"secret_access_key" doc:"file holding the secret access key"`
-	Addressing      string         `json:"addressing" required:"true" doc:"addressing style: path or virtual"`
-	StorageClass    string         `json:"storage_class" doc:"storage class of every object, e.g. STANDARD"`
-	RequestChecksum string         `json:"request_checksum" doc:"request checksum mode: when_required or when_supported"`
-	PartBytes       model.ByteSize `json:"part_bytes" doc:"bytes per part of a multipart upload; at least 5 MiB"`
-	MaxRequestBytes model.ByteSize `json:"max_request_bytes" doc:"largest single request the endpoint accepts"`
-	MaxObjectBytes  model.ByteSize `json:"max_object_bytes" doc:"largest object the endpoint accepts"`
-	RequestTimeout  model.Duration `json:"request_timeout" doc:"time until the response headers of one HTTP request; a download body streams under the caller's deadline"`
+	Endpoint        string               `json:"endpoint" required:"true" doc:"base URL of the S3 endpoint, e.g. https://s3.example.com"`
+	Region          string               `json:"region" required:"true" doc:"signing region of the endpoint"`
+	Bucket          string               `json:"bucket" required:"true" doc:"bucket every object lives in"`
+	Prefix          string               `json:"prefix" required:"true" doc:"key prefix of the storage root; keys are built under it"`
+	AccessKeyID     configuration.Secret `json:"access_key_id" doc:"file holding the access key id; an opaque string, e.g. <tenant_id>:<key_id>"`
+	SecretAccessKey configuration.Secret `json:"secret_access_key" doc:"file holding the secret access key"`
+	Addressing      string               `json:"addressing" required:"true" doc:"addressing style: path or virtual"`
+	StorageClass    string               `json:"storage_class" doc:"storage class of every object, e.g. STANDARD"`
+	RequestChecksum string               `json:"request_checksum" doc:"request checksum mode: when_required or when_supported"`
+	PartBytes       model.ByteSize       `json:"part_bytes" doc:"bytes per part of a multipart upload; at least 5 MiB"`
+	MaxRequestBytes model.ByteSize       `json:"max_request_bytes" doc:"largest single request the endpoint accepts"`
+	MaxObjectBytes  model.ByteSize       `json:"max_object_bytes" doc:"largest object the endpoint accepts"`
+	RequestTimeout  model.Duration       `json:"request_timeout" doc:"time until the response headers of one HTTP request; a download body streams under the caller's deadline"`
 }
 
-// Register adds the S3 storage to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, storage.Kind, plugin.Spec[Config, storage.Storage]{
-		Type:      "s3",
-		Summary:   "an S3-compatible endpoint",
-		Stability: plugin.Stable,
-		Example: []byte(`{"endpoint": "https://s3.example.com", "region": "ru-central-1", "bucket": "bucket-name",` +
-			` "prefix": "cluster-backup", "access_key_id": {"file": "/run/secrets/s3/access-key-id"},` +
-			` "secret_access_key": {"file": "/run/secrets/s3/secret-access-key"}, "addressing": "path",` +
-			` "storage_class": "STANDARD", "request_checksum": "when_required", "part_bytes": 16777216,` +
-			` "max_request_bytes": 5368709120, "max_object_bytes": 5497558138880,` +
-			` "request_timeout": "5m"}`),
-		New: func(ctx context.Context, cfg Config, deps plugin.Deps) (storage.Storage, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			return newStorage(cfg)
-		},
-	})
-}
-
-func newStorage(cfg Config) (*Storage, error) {
+func newStorage(ctx context.Context, cfg Config, _ instances.Deps, _ storage.BuildInput) (storage.Storage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	u := cfg.Endpoint
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return nil, fmt.Errorf("endpoint %q must be an absolute http(s) URL", cfg.Endpoint)
@@ -179,14 +163,14 @@ func (s *Storage) Describe(ctx context.Context) (storage.StorageTraits, error) {
 	return storage.StorageTraits{Checksums: []string{"md5"}}, nil
 }
 
-var _ plugin.Checker = (*Storage)(nil)
+var _ instances.Checker = (*Storage)(nil)
 
 // Check is the instance's preflight: one read-only listing probe at the
 // configured bucket and prefix proves the credentials are accepted and the
 // bucket is reachable. MaxKeys keeps the probe to at most one key, and an empty
 // prefix is not an error — the first run writes into it. A bucket that does not
 // exist is a permanent error that names it, as is a rejected credential. One
-// attempt: the engine retries a transient answer under the configured policy.
+// attempt: execution retries a transient answer under the configured policy.
 func (s *Storage) Check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -207,7 +191,7 @@ func (s *Storage) Check(ctx context.Context) error {
 			return ctx.Err()
 		}
 		if st := apiStatus(err); st == http.StatusUnauthorized || st == http.StatusForbidden {
-			return plugin.Permanent(fmt.Errorf("check bucket %s: the credentials were rejected: %w", s.cfg.Bucket, err))
+			return pluginerrors.Permanent(fmt.Errorf("check bucket %s: the credentials were rejected: %w", s.cfg.Bucket, err))
 		}
 		return s.classify(ctx, err, "check bucket "+s.cfg.Bucket)
 	}
@@ -245,9 +229,9 @@ func (s *Storage) reqCtx(ctx context.Context) (context.Context, context.CancelFu
 }
 
 // Put stores one object in one PutObject request. The plugin does not verify its
-// own write: the engine's Stat of the object is the one proof a copy landed, and
+// own write: transfer's Stat of the object is the one proof a copy landed, and
 // a second HEAD here only doubled the requests of every upload. An object larger
-// than one request is a permanent error here: the engine uploads such an object
+// than one request is a permanent error here: transfer uploads such an object
 // part by part through the storage.MultipartUploader capability, and Put never
 // becomes a multipart upload of its own.
 func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reader) (model.ObjectInfo, error) {
@@ -255,11 +239,11 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 		return model.ObjectInfo{}, err
 	}
 	if req.Size > s.cfg.MaxObjectBytes.Int64() {
-		return model.ObjectInfo{}, plugin.Permanent(
+		return model.ObjectInfo{}, pluginerrors.Permanent(
 			fmt.Errorf("object %s is %d bytes, above the endpoint limit of %d", req.Key, req.Size, s.cfg.MaxObjectBytes))
 	}
 	if req.Size > s.cfg.MaxRequestBytes.Int64() {
-		return model.ObjectInfo{}, plugin.Permanent(fmt.Errorf(
+		return model.ObjectInfo{}, pluginerrors.Permanent(fmt.Errorf(
 			"object %s is %d bytes, above the %d bytes one request carries: it is uploaded part by part through the multipart capability",
 			req.Key, req.Size, s.cfg.MaxRequestBytes))
 	}
@@ -309,7 +293,7 @@ func (s *Storage) Stat(ctx context.Context, key string) (model.ObjectInfo, error
 	out, err := c.HeadObject(rctx, &s3.HeadObjectInput{Bucket: aws.String(s.cfg.Bucket), Key: aws.String(full)})
 	if err != nil {
 		if isNotFound(err) {
-			return model.ObjectInfo{}, plugin.NotFound(fmt.Errorf("object %s is definitely absent", full))
+			return model.ObjectInfo{}, pluginerrors.NotFound(fmt.Errorf("object %s is definitely absent", full))
 		}
 		return model.ObjectInfo{}, s.classify(ctx, err, "head "+full)
 	}
@@ -324,7 +308,7 @@ func (s *Storage) List(ctx context.Context, req storage.ListRequest) (storage.Li
 		return storage.ListPage{}, err
 	}
 	if strings.HasPrefix(req.Prefix, "/") || strings.Contains(req.Prefix, "..") {
-		return storage.ListPage{}, plugin.Permanent(
+		return storage.ListPage{}, pluginerrors.Permanent(
 			fmt.Errorf("prefix %q must be a relative key prefix without %q", req.Prefix, ".."))
 	}
 	c, err := s.client()
@@ -396,11 +380,11 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 		defer func() { _ = out.Body.Close() }()
 	}
 	if timedOut {
-		return plugin.Transient(fmt.Errorf("get %s: no response within request_timeout %s", full, s.cfg.RequestTimeout))
+		return pluginerrors.Transient(fmt.Errorf("get %s: no response within request_timeout %s", full, s.cfg.RequestTimeout))
 	}
 	if err != nil {
 		if isNotFound(err) {
-			return plugin.NotFound(fmt.Errorf("object %s is definitely absent", full))
+			return pluginerrors.NotFound(fmt.Errorf("object %s is definitely absent", full))
 		}
 		return s.classify(ctx, err, "get "+full)
 	}
@@ -409,10 +393,10 @@ func (s *Storage) Get(ctx context.Context, key string, dst io.Writer) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return plugin.Transient(fmt.Errorf("read %s: %w", full, err))
+		return pluginerrors.Transient(fmt.Errorf("read %s: %w", full, err))
 	}
 	if out.ContentLength != nil && n != *out.ContentLength {
-		return plugin.Transient(fmt.Errorf("download of %s stopped at %d of %d bytes", full, n, *out.ContentLength))
+		return pluginerrors.Transient(fmt.Errorf("download of %s stopped at %d of %d bytes", full, n, *out.ContentLength))
 	}
 	return nil
 }
@@ -444,24 +428,24 @@ func (s *Storage) classify(ctx context.Context, err error, what string) error {
 	wrapped := fmt.Errorf("%s: %w", what, err)
 	switch apiErrorCode(err) {
 	case "NoSuchBucket":
-		return plugin.Permanent(wrapped)
+		return pluginerrors.Permanent(wrapped)
 	case "RequestTimeout":
-		return plugin.Transient(wrapped)
+		return pluginerrors.Transient(wrapped)
 	}
 	switch status := apiStatus(err); {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
-		return plugin.Permanent(wrapped)
+		return pluginerrors.Permanent(wrapped)
 	case status == http.StatusTooManyRequests || status >= 500:
 		if d := retryAfterHint(err); d > 0 {
-			return plugin.RetryAfter(wrapped, d)
+			return pluginerrors.RetryAfter(wrapped, d)
 		}
-		return plugin.Transient(wrapped)
+		return pluginerrors.Transient(wrapped)
 	case status == http.StatusNotFound:
-		return plugin.NotFound(wrapped)
+		return pluginerrors.NotFound(wrapped)
 	case status >= 400:
-		return plugin.Permanent(wrapped)
+		return pluginerrors.Permanent(wrapped)
 	default:
-		return plugin.Transient(wrapped)
+		return pluginerrors.Transient(wrapped)
 	}
 }
 
@@ -526,14 +510,14 @@ func etagMD5(etag *string) string {
 // readSecret reads one mounted secret file. The value is stored trimmed: keys
 // and tokens never carry surrounding whitespace, and a trailing newline from
 // however the file was produced would silently break every signature.
-func readSecret(sec plugin.Secret) (string, error) {
+func readSecret(sec configuration.Secret) (string, error) {
 	b, err := os.ReadFile(sec.File)
 	if err != nil {
-		return "", plugin.Permanent(fmt.Errorf("read secret file: %w", err))
+		return "", pluginerrors.Permanent(fmt.Errorf("read secret file: %w", err))
 	}
 	v := strings.TrimSpace(string(b))
 	if v == "" {
-		return "", plugin.Permanent(fmt.Errorf("secret file %s is empty", sec.File))
+		return "", pluginerrors.Permanent(fmt.Errorf("secret file %s is empty", sec.File))
 	}
 	return v, nil
 }

@@ -18,23 +18,27 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/yandexdisk"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
 )
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t testing.TB) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := yandexdisk.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, yandexdisk.Spec, func(lr *loader.Registry) error {
+		return yandexdisk.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
 }
 
-func writeSecret(t *testing.T, value string) string {
+func writeSecret(t testing.TB, value string) string {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "secret-*")
 	if err != nil {
@@ -52,7 +56,7 @@ func writeSecret(t *testing.T, value string) string {
 	return f.Name()
 }
 
-func baseConfig(t *testing.T, f *fakeDiskServer) map[string]any {
+func baseConfig(t testing.TB, f *fakeDiskServer) map[string]any {
 	t.Helper()
 	return map[string]any{
 		"api_url":              f.srv.URL + "/v1/disk",
@@ -66,26 +70,38 @@ func baseConfig(t *testing.T, f *fakeDiskServer) map[string]any {
 	}
 }
 
-func newStorageFrom(t *testing.T, raw map[string]any) storage.Storage {
+func newStorageFrom(t testing.TB, raw map[string]any) storage.Storage {
 	t.Helper()
-	return newStorageWithLog(t, raw, slog.New(slog.DiscardHandler))
+	return newStorageAt(t, raw, 1)
 }
 
-func newStorageWithLog(t *testing.T, raw map[string]any, log *slog.Logger) storage.Storage {
+func newStorageWithLog(t testing.TB, raw map[string]any, log *slog.Logger) storage.Storage {
+	t.Helper()
+	return newStorageAt(t, raw, 1, log)
+}
+
+// newStorageAt builds one storage through the storage factory with the given
+// call_parallelism: the only construction path, which also hands the plugin its
+// construction input.
+func newStorageAt(t testing.TB, raw map[string]any, parallelism int, log ...*slog.Logger) storage.Storage {
 	t.Helper()
 	body, err := json.Marshal(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := plugin.Build(context.Background(), testRegistry(t), storage.Kind, "yandex_disk", body,
-		plugin.Deps{Instance: "yandex", Log: log})
+	logger := slog.New(slog.DiscardHandler)
+	if len(log) > 0 {
+		logger = log[0]
+	}
+	s, err := storage.Build(context.Background(), testRegistry(t), "yandex_disk", body,
+		storage.BuildInput{CallParallelism: parallelism}, instances.Deps{Instance: "yandex", Log: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return s
 }
 
-func newStorage(t *testing.T, mutate func(raw map[string]any)) (storage.Storage, *fakeDiskServer) {
+func newStorage(t testing.TB, mutate func(raw map[string]any)) (storage.Storage, *fakeDiskServer) {
 	t.Helper()
 	f := newFakeDisk(t)
 	raw := baseConfig(t, f)
@@ -95,8 +111,14 @@ func newStorage(t *testing.T, mutate func(raw map[string]any)) (storage.Storage,
 	return newStorageFrom(t, raw), f
 }
 
-func classOf(err error) plugin.Class {
-	class, _ := plugin.ClassOf(err)
+func newStorageWithParallelism(t testing.TB, parallelism int) (storage.Storage, *fakeDiskServer) {
+	t.Helper()
+	f := newFakeDisk(t)
+	return newStorageAt(t, baseConfig(t, f), parallelism), f
+}
+
+func classOf(err error) pluginerrors.Class {
+	class, _ := pluginerrors.ClassOf(err)
 	return class
 }
 
@@ -112,8 +134,11 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 	t.Fatal("condition did not become true in time")
 }
 
+// TestGeneralConformance runs the general plugin contract plus the
+// storage-owned construction check: the kit builds every example through
+// storage.Build with its construction input.
 func TestGeneralConformance(t *testing.T) {
-	plugintest.CheckSpec(t, testRegistry(t))
+	storagetest.CheckSpec(t, testRegistry(t))
 }
 
 func TestStorageConformance(t *testing.T) {
@@ -180,7 +205,7 @@ func TestFolderCreationFailureIsOneAttempt(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 500 on folder creation was accepted")
 	}
-	if class := classOf(err); class != plugin.ClassTransient {
+	if class := classOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 	if got := f.Count("mkdir"); got != 1 {
@@ -193,7 +218,7 @@ func TestHrefIssueFailureIsOneAttempt(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.failAlways["uploadhref"] = http.StatusInternalServerError
 	_, err := s.Put(ctx, storage.PutRequest{Key: "runs/x.bin", Size: 1}, strings.NewReader("x"))
-	if err == nil || classOf(err) != plugin.ClassTransient {
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("href failure: got %v", err)
 	}
 	if got := f.Count("uploadhref"); got != 1 {
@@ -216,8 +241,8 @@ func TestRateLimitedHrefPassesRetryAfter(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 429 was accepted")
 	}
-	class, after := plugin.ClassOf(err)
-	if class != plugin.ClassTransient || after != 7*time.Second {
+	class, after := pluginerrors.ClassOf(err)
+	if class != pluginerrors.ClassTransient || after != 7*time.Second {
 		t.Errorf("got class %q after %s, want transient after 7s: %v", class, after, err)
 	}
 }
@@ -299,7 +324,7 @@ func TestAcceptedUploadNeverCommitted(t *testing.T) {
 	if err == nil {
 		t.Fatal("an upload that never became visible was accepted")
 	}
-	if class := classOf(err); class != plugin.ClassTransient {
+	if class := classOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 	if got := f.Count("stat"); got < 2 {
@@ -310,12 +335,48 @@ func TestAcceptedUploadNeverCommitted(t *testing.T) {
 	}
 }
 
+// TestC7_AcceptedUploadIsAnAsynchronousWrite is the C7 site proof: the Disk
+// accepts an upload with 201/202 before it commits the bytes, so Put can return
+// while the write may still settle on the provider. The storage must declare
+// the asynchronous-write capability the safety owner consults before the first
+// write — the multipart-only classifier missed exactly this shape — and the
+// test drives that accepted-then-settled path through Put: the 202 is taken at
+// send, the visibility poll inside Put gives up, and the very same upload
+// becomes readable afterwards.
+func TestC7_AcceptedUploadIsAnAsynchronousWrite(t *testing.T) {
+	ctx := context.Background()
+	s, f := newStorage(t, nil)
+	if !storage.WritesAsynchronously(s) {
+		t.Fatal("yandex_disk accepts 201/202 uploads and returns before the Disk commits them; " +
+			"the storage must implement storage.AsynchronousWriter")
+	}
+	f.uploadMode = "202"
+	body := []byte("accepted now, committed later")
+	_, err := s.Put(ctx, storage.PutRequest{Key: "async.bin", Size: int64(len(body))}, bytes.NewReader(body))
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
+		t.Fatalf("a 202 whose commit never became visible inside the poll window: got %v", err)
+	}
+	if got := f.Count("putdata"); got != 1 {
+		t.Fatalf("data PUTs: got %d, want exactly 1 (the plugin must not re-send an accepted body)", got)
+	}
+	if !f.commitPending("app:/cluster-backup/async.bin") {
+		t.Fatal("the fake lost the accepted upload; nothing settles after Put")
+	}
+	info, err := s.Stat(ctx, "async.bin")
+	if err != nil {
+		t.Fatalf("an upload the Disk settled after Put returned is not readable: %v", err)
+	}
+	if info.Size != int64(len(body)) {
+		t.Errorf("settled size %d, want %d", info.Size, len(body))
+	}
+}
+
 func TestInsufficientStorageIsPermanent(t *testing.T) {
 	ctx := context.Background()
 	s, f := newStorage(t, nil)
 	f.uploadMode = "507"
 	_, err := s.Put(ctx, storage.PutRequest{Key: "full.bin", Size: 4}, strings.NewReader("full"))
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("507: got %v", err)
 	}
 	if got := f.Count("putdata"); got != 1 {
@@ -328,7 +389,7 @@ func TestUnauthorizedIsPermanent(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.uploadMode = "401"
 	_, err := s.Put(ctx, storage.PutRequest{Key: "x.bin", Size: 1}, strings.NewReader("x"))
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("401: got %v", err)
 	}
 }
@@ -366,43 +427,179 @@ func TestCancelMidUploadReturnsPromptly(t *testing.T) {
 	}
 }
 
-func TestListPagingAndWalk(t *testing.T) {
+// TestListReturnsTheWholeTree: one List call is one full walk. Every object
+// under the prefix appears exactly once, the call names no continuation, and
+// the walk makes one service request per folder page.
+func TestListReturnsTheWholeTree(t *testing.T) {
 	ctx := context.Background()
 	s, f := newStorage(t, nil)
 	for _, key := range []string{"list/a/0", "list/a/1", "list/a/2", "list/b/x"} {
 		f.putObject("app:/cluster-backup/"+key, []byte(key))
 	}
 	f.pageLimit = 2
-	seen := map[string]int{}
-	token := ""
-	pages := 0
-	for {
-		page, err := s.List(ctx, storage.ListRequest{Prefix: "list/", Token: token})
-		if err != nil {
-			t.Fatal(err)
-		}
-		pages++
-		for _, o := range page.Objects {
-			seen[o.Key]++
-		}
-		if page.NextToken == "" {
-			break
-		}
-		if pages > 10 {
-			t.Fatal("listing did not terminate")
-		}
-		token = page.NextToken
+	before := f.Count("list")
+	page, err := s.List(ctx, storage.ListRequest{Prefix: "list/"})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if pages != 2 {
-		t.Errorf("contract pages: got %d, want 2 (one folder page each)", pages)
+	if page.NextToken != "" {
+		t.Errorf("a completed walk named a continuation token %q", page.NextToken)
+	}
+	seen := map[string]int{}
+	for _, o := range page.Objects {
+		seen[o.Key]++
+	}
+	if len(seen) != 4 {
+		t.Errorf("listing returned %v", seen)
 	}
 	for _, key := range []string{"list/a/0", "list/a/1", "list/a/2", "list/b/x"} {
 		if seen[key] != 1 {
 			t.Errorf("key %s seen %d times, want 1", key, seen[key])
 		}
 	}
-	if len(seen) != 4 {
-		t.Errorf("listing returned %v", seen)
+	// list/ itself, the two pages of a/, and b/: one request per service page.
+	if got := f.Count("list") - before; got != 4 {
+		t.Errorf("listing made %d service requests, want 4 (one per service page)", got)
+	}
+}
+
+// listTreeShape is one positive corpus: objects to seed and the keys a listing
+// of prefix must return exactly once.
+type listTreeShape struct {
+	name    string
+	objects []string
+	prefix  string
+	page    func(f *fakeDiskServer)
+}
+
+func listTreeShapes() []listTreeShape {
+	return []listTreeShape{
+		{name: "empty root", prefix: ""},
+		{name: "flat", prefix: "", objects: []string{"a", "b", "c"}},
+		{name: "nested", prefix: "", objects: []string{"a/b/c/d.bin", "a/b/e.bin", "a/f.bin"}},
+		{name: "many siblings", prefix: "",
+			objects: []string{"d1/x", "d2/x", "d3/x", "d4/x", "d5/x"}},
+		{name: "paginated folder", prefix: "p/",
+			objects: []string{"p/0", "p/1", "p/2", "p/3", "p/4"},
+			page:    func(f *fakeDiskServer) { f.pageLimit = 2 }},
+		{name: "unknown total", prefix: "p/",
+			objects: []string{"p/0", "p/1", "p/2"},
+			page:    func(f *fakeDiskServer) { f.listNoTotal = true; f.pageLimit = 1 }},
+		{name: "prefix below a folder", prefix: "a/b/",
+			objects: []string{"a/b/c", "a/b/d", "a/e", "x/y"}},
+	}
+}
+
+// TestListReturnsEveryObjectExactlyOnce holds the walk to every positive tree
+// and page shape: the same keys once each, a finite walk, and no continuation.
+func TestListReturnsEveryObjectExactlyOnce(t *testing.T) {
+	for _, tc := range listTreeShapes() {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := newStorage(t, nil)
+			for _, key := range tc.objects {
+				f.putObject("app:/cluster-backup/"+key, []byte(key))
+			}
+			if tc.page != nil {
+				tc.page(f)
+			}
+			page, err := s.List(context.Background(), storage.ListRequest{Prefix: tc.prefix})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if page.NextToken != "" {
+				t.Errorf("next token %q after a completed walk", page.NextToken)
+			}
+			seen := map[string]int{}
+			for _, o := range page.Objects {
+				seen[o.Key]++
+			}
+			for _, key := range tc.objects {
+				if !strings.HasPrefix(key, tc.prefix) {
+					if seen[key] != 0 {
+						t.Errorf("object %s is outside the prefix %q", key, tc.prefix)
+					}
+					continue
+				}
+				if seen[key] != 1 {
+					t.Errorf("key %s seen %d times, want 1", key, seen[key])
+				}
+			}
+			if want := countUnderPrefix(tc.objects, tc.prefix); len(seen) != want {
+				t.Errorf("listing returned %d keys, want %d: %v", len(seen), want, seen)
+			}
+		})
+	}
+}
+
+func countUnderPrefix(objects []string, prefix string) int {
+	n := 0
+	for _, key := range objects {
+		if strings.HasPrefix(key, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestListRunsBranchesInParallel proves call_parallelism reaches the walk: two
+// subfolders are held open at once, so the fake serves two listing requests
+// simultaneously. Nothing sleeps and no gate is released before both entered,
+// so the same corpus at parallelism 1 could never pass this test.
+func TestListRunsBranchesInParallel(t *testing.T) {
+	s, f := newStorageWithParallelism(t, 2)
+	for _, key := range []string{"d1/x", "d2/y"} {
+		f.putObject("app:/cluster-backup/"+key, []byte(key))
+	}
+	g1 := f.holdList("app:/cluster-backup/d1")
+	g2 := f.holdList("app:/cluster-backup/d2")
+	done := make(chan struct{})
+	var page storage.ListPage
+	var err error
+	go func() {
+		defer close(done)
+		page, err = s.List(context.Background(), storage.ListRequest{})
+	}()
+	for _, gate := range []*fakeListGate{g1, g2} {
+		select {
+		case <-gate.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("one branch never reached the service: the walk did not run both at once")
+		}
+	}
+	if got := f.PeakConcurrentList(); got < 2 {
+		t.Errorf("peak concurrent listing requests %d, want at least 2", got)
+	}
+	close(g1.release)
+	close(g2.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the listing did not finish after both branches were released")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, o := range page.Objects {
+		seen[o.Key] = true
+	}
+	if len(seen) != 2 || !seen["d1/x"] || !seen["d2/y"] {
+		t.Errorf("parallel listing returned %+v", page.Objects)
+	}
+}
+
+// TestListStaysSequentialAtParallelismOne is the other end of the same knob:
+// one worker means the fake never serves two listing requests at once.
+func TestListStaysSequentialAtParallelismOne(t *testing.T) {
+	s, f := newStorage(t, nil)
+	for _, key := range []string{"d1/x", "d2/y", "d3/z"} {
+		f.putObject("app:/cluster-backup/"+key, []byte(key))
+	}
+	if _, err := s.List(context.Background(), storage.ListRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.PeakConcurrentList(); got != 1 {
+		t.Errorf("peak concurrent listing requests %d, want exactly 1", got)
 	}
 }
 
@@ -421,26 +618,21 @@ func TestListWithoutTotalPagesUntilTheEmptyPage(t *testing.T) {
 	}
 	f.listNoTotal = true
 	f.pageLimit = 1
+	before := f.Count("list")
+	page, err := s.List(ctx, storage.ListRequest{Prefix: "page/"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	seen := map[string]bool{}
-	token := ""
-	for pages := 0; ; pages++ {
-		if pages > 10 {
-			t.Fatal("listing did not terminate")
-		}
-		page, err := s.List(ctx, storage.ListRequest{Prefix: "page/", Token: token})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, o := range page.Objects {
-			seen[o.Key] = true
-		}
-		if page.NextToken == "" {
-			break
-		}
-		token = page.NextToken
+	for _, o := range page.Objects {
+		seen[o.Key] = true
 	}
 	if len(seen) != 3 {
 		t.Errorf("listing returned %v, want all three objects", seen)
+	}
+	// Three pages with one object each plus the empty page that ends the walk.
+	if got := f.Count("list") - before; got != 4 {
+		t.Errorf("listing made %d service requests, want 4 (three objects and the empty ending page)", got)
 	}
 }
 
@@ -468,7 +660,7 @@ func TestStatFolderIsDefinitelyAbsent(t *testing.T) {
 	s, f := newStorage(t, nil)
 	f.putObject("app:/cluster-backup/folder/file.bin", []byte("x"))
 	_, err := s.Stat(context.Background(), "folder")
-	if class := classOf(err); class != plugin.ClassNotFound {
+	if class := classOf(err); class != pluginerrors.ClassNotFound {
 		t.Fatalf("class %q, want not_found: %v", class, err)
 	}
 }
@@ -511,9 +703,86 @@ func (failWriter) Write([]byte) (int, error) { return 0, errors.New("no space le
 func TestListTokenCannotEscapeRoot(t *testing.T) {
 	s, _ := newStorage(t, nil)
 	_, err := s.List(context.Background(), storage.ListRequest{Prefix: "runs/",
-		Token: `{"dir":"app:/Backups","offset":0,"queue":[]}`})
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+		Token: `{"dir":"app:/Backups","offset":0}`})
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("a token pointing outside the root: got %v", err)
+	}
+	if !strings.Contains(err.Error(), "outside the root") {
+		t.Errorf("the refusal does not name the cause: %v", err)
+	}
+}
+
+// TestListUnreadableFolderAnswerFailsTheWalk pins the service semantics this
+// build requires: a folder listing answer always carries _embedded.items (an
+// empty folder carries an empty list), so a 200 without it proves nothing.
+// Reading it as "no children" would silently drop the subtree from the survey —
+// a failed walk must return one transient cause and no objects instead.
+func TestListUnreadableFolderAnswerFailsTheWalk(t *testing.T) {
+	cases := map[string]func(f *fakeDiskServer){
+		"items and total absent":      func(f *fakeDiskServer) { f.listNoItems = true; f.listNoTotal = true },
+		"items absent, total present": func(f *fakeDiskServer) { f.listNoItems = true },
+	}
+	for name, shape := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, f := newStorage(t, nil)
+			f.putObject("app:/cluster-backup/runs/x", []byte("x"))
+			shape(f)
+			page, err := s.List(context.Background(), storage.ListRequest{Prefix: "runs/"})
+			if err == nil {
+				t.Fatalf("a listing answer without items was accepted as an empty folder: %+v", page)
+			}
+			if class := classOf(err); class != pluginerrors.ClassTransient {
+				t.Errorf("class %q, want transient: %v", class, err)
+			}
+			if len(page.Objects) != 0 {
+				t.Errorf("a failed walk returned objects: %+v", page.Objects)
+			}
+		})
+	}
+}
+
+// TestListCursorDotSegmentsAreRefused: a token is untrusted input. The API
+// resolves "." and ".." segments of a path parameter to a different resource,
+// so a cursor that merely looks confined ("app:/cluster-backup/../Backups")
+// would make the plugin read outside the configured root. The guard refuses the
+// segment before any request leaves, exactly as it refuses an outside root.
+func TestListCursorDotSegmentsAreRefused(t *testing.T) {
+	ctx := context.Background()
+	tokens := map[string]string{
+		"parent segment":  `{"dir":"app:/cluster-backup/../Backups","offset":0}`,
+		"current segment": `{"dir":"app:/cluster-backup/./runs","offset":0}`,
+		"inner parent":    `{"dir":"app:/cluster-backup/runs/..","offset":0}`,
+		"empty segment":   `{"dir":"app:/cluster-backup//runs","offset":0}`,
+	}
+	for name, token := range tokens {
+		t.Run(name, func(t *testing.T) {
+			s, f := newStorage(t, nil)
+			_, err := s.List(ctx, storage.ListRequest{Token: token})
+			if err == nil || classOf(err) != pluginerrors.ClassPermanent {
+				t.Fatalf("a cursor with a dot-segment look-alike: got %v", err)
+			}
+			if got := f.Count("list"); got != 0 {
+				t.Errorf("the walk made %d listing requests for a refused cursor, want 0", got)
+			}
+		})
+	}
+}
+
+// TestListRefusesDotSegmentFolderFromTheAnswer covers the other direction: a
+// folder name reaches the walk through a listing answer, not only through the
+// caller's token. The walk must refuse the cursor before it requests the path
+// the service would resolve outside the root.
+func TestListRefusesDotSegmentFolderFromTheAnswer(t *testing.T) {
+	s, f := newStorage(t, nil)
+	f.putObject("app:/cluster-backup/../Backups/x", []byte("old archive"))
+	_, err := s.List(context.Background(), storage.ListRequest{})
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
+		t.Fatalf("a listed folder named %q: got %v", "..", err)
+	}
+	for _, p := range f.ListedPaths() {
+		if strings.Contains(p, "..") {
+			t.Errorf("the walk listed %q: a dot-segment path resolves outside the root", p)
+		}
 	}
 }
 
@@ -580,15 +849,15 @@ func TestGetRoundTrip(t *testing.T) {
 		t.Errorf("got %q", got.String())
 	}
 	_, err := s.Stat(ctx, "get/absent.bin")
-	if class := classOf(err); err == nil || class != plugin.ClassNotFound {
+	if class := classOf(err); err == nil || class != pluginerrors.ClassNotFound {
 		t.Errorf("Stat of an absent key: class %q err %v", class, err)
 	}
-	if err := s.Get(ctx, "get/absent.bin", io.Discard); classOf(err) != plugin.ClassNotFound {
+	if err := s.Get(ctx, "get/absent.bin", io.Discard); classOf(err) != pluginerrors.ClassNotFound {
 		t.Errorf("Get of an absent key: %v", err)
 	}
 	f.failNext["download"] = http.StatusNotFound
 	err = s.Get(ctx, "get/x.bin", io.Discard)
-	if class := classOf(err); class != plugin.ClassNotFound {
+	if class := classOf(err); class != pluginerrors.ClassNotFound {
 		t.Errorf("Get whose download href is gone: class %q err %v", class, err)
 	}
 }
@@ -897,7 +1166,7 @@ func TestFolderCleanupFailureKeepsTheDeleteSuccessful(t *testing.T) {
 	if err := s.Delete(ctx, "del/a/x.bin"); err != nil {
 		t.Fatalf("a folder cleanup failure failed the delete: %v", err)
 	}
-	if _, err := s.Stat(ctx, "del/a/x.bin"); classOf(err) != plugin.ClassNotFound {
+	if _, err := s.Stat(ctx, "del/a/x.bin"); classOf(err) != pluginerrors.ClassNotFound {
 		t.Errorf("the file was not deleted: %v", err)
 	}
 	if !f.folders["app:/cluster-backup/del/a"] {
@@ -913,7 +1182,7 @@ func TestFolderCleanupFailureKeepsTheDeleteSuccessful(t *testing.T) {
 
 // TestHrefNeverReachesErrors: a transport failure must not put the
 // pre-authorised upload or download href — its query is the access grant — into
-// an error the engine logs and stores in the run report.
+// an error the run logs and stores in the run report.
 func TestHrefNeverReachesErrors(t *testing.T) {
 	ctx := context.Background()
 	closed := closedPortAddress(t)
@@ -925,7 +1194,7 @@ func TestHrefNeverReachesErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("a PUT to an unreachable href was accepted")
 	}
-	if class := classOf(err); class != plugin.ClassTransient {
+	if class := classOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
 	if strings.Contains(err.Error(), "secret-upload-token") || strings.Contains(err.Error(), upload) {
@@ -980,7 +1249,7 @@ func TestMissingTokenFileIsPermanent(t *testing.T) {
 		raw["token"] = map[string]any{"file": filepath.Join(t.TempDir(), "absent")}
 	})
 	_, err := s.Stat(context.Background(), "x.bin")
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("a missing token file: got %v", err)
 	}
 }
@@ -1001,14 +1270,18 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		"negative keep depth":                 strings.Replace(good, `"prune_keep_depth": 1`, `"prune_keep_depth": -1`, 1),
 		"unknown member":                      strings.Replace(good, `{`, `{"zzz": 1,`, 1),
 	}
+	build := func(raw string) error {
+		t.Helper()
+		_, err := storage.Build(context.Background(), r, "yandex_disk", jsontext.Value(raw),
+			storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "yandex"})
+		return err
+	}
 	for name, raw := range bad {
-		if _, err := r.BuildAny(context.Background(), "storage", "yandex_disk", jsontext.Value(raw),
-			plugin.Deps{Instance: "yandex"}); err == nil {
+		if err := build(raw); err == nil {
 			t.Errorf("%s: config accepted: %s", name, raw)
 		}
 	}
-	if _, err := r.BuildAny(context.Background(), "storage", "yandex_disk", jsontext.Value(good),
-		plugin.Deps{Instance: "yandex"}); err != nil {
+	if err := build(good); err != nil {
 		t.Errorf("the good config was rejected: %v", err)
 	}
 }
@@ -1016,16 +1289,15 @@ func TestNewRejectsBadConfig(t *testing.T) {
 func TestExampleDecodesToAWorkingStorage(t *testing.T) {
 	// The example is documentation; its construction must not need the token
 	// file to exist (credentials are read per request, not at build time).
-	r := testRegistry(t)
-	s, err := r.BuildAny(context.Background(), "storage", "yandex_disk",
+	s, err := storage.Build(context.Background(), testRegistry(t), "yandex_disk",
 		jsontext.Value(`{"api_url": "https://cloud-api.yandex.net/v1/disk", "token": {"file": "/run/secrets/yandex/token"},`+
 			` "root": "app:/cluster-backup", "permanent_delete": true, "prune_keep_depth": 1,`+
 			` "request_timeout": "30s", "commit_poll_interval": "5s", "commit_poll_timeout": "2m"}`),
-		plugin.Deps{Instance: "yandex"})
+		storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "yandex"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s.(storage.Storage); !ok {
-		t.Fatalf("built %T", s)
+	if s == nil {
+		t.Fatal("the example built no storage")
 	}
 }

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage"
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 const testPartBytes = 5 << 20
@@ -69,7 +69,7 @@ func TestMultipartConformance(t *testing.T) {
 }
 
 // TestMultipartSmallObjectIsThePluginsUnsupported: an object that fits one part
-// is answered with errors.ErrUnsupported and no request at all — the engine then
+// is answered with errors.ErrUnsupported and no request at all — transfer then
 // stores it with a single Put.
 func TestMultipartSmallObjectIsThePluginsUnsupported(t *testing.T) {
 	s, f := multipartStorage(t)
@@ -83,7 +83,7 @@ func TestMultipartSmallObjectIsThePluginsUnsupported(t *testing.T) {
 	}
 }
 
-// TestMultipartOneRequestPerCall: the engine drives the upload, so every call is
+// TestMultipartOneRequestPerCall: transfer drives the upload, so every call is
 // exactly one request — and a failing part is NOT retried inside the plugin, the
 // way the SDK's disabled retryer promises.
 func TestMultipartOneRequestPerCall(t *testing.T) {
@@ -97,11 +97,11 @@ func TestMultipartOneRequestPerCall(t *testing.T) {
 	}
 
 	// A part that fails: one request, a transient error, no abort from the plugin
-	// (cleaning up is the engine's decision, made once).
+	// (cleaning up is transfer's decision, made once).
 	f.failNext["part"] = 500
 	if _, err := mu.PutPart(ctx, session, partBytes(1, body[:testPartBytes])); err == nil {
 		t.Fatal("an injected 500 on a part was accepted")
-	} else if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class %q, want transient: %v", class, err)
 	}
 	if got := f.Count("part"); got != 1 {
@@ -111,7 +111,7 @@ func TestMultipartOneRequestPerCall(t *testing.T) {
 		t.Fatalf("the plugin aborted on its own: %d abort requests", got)
 	}
 
-	// The engine's retry sends the same number again: the part lands, and the
+	// Execution's retry sends the same number again: the part lands, and the
 	// remaining part with it, in two more requests.
 	first, err := mu.PutPart(ctx, session, partBytes(1, body[:testPartBytes]))
 	if err != nil {
@@ -145,7 +145,7 @@ func TestMultipartBeginFailureIsOneRequest(t *testing.T) {
 	mu := capabilityOf(t, s)
 	f.failAlways["create"] = 500
 	_, err := mu.BeginMultipart(context.Background(), storage.PutRequest{Key: "big.bin", Size: 2 * testPartBytes})
-	if err == nil || classOf(err) != plugin.ClassTransient {
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("create failure: got %v", err)
 	}
 	if got := f.Count("create"); got != 1 {
@@ -154,7 +154,7 @@ func TestMultipartBeginFailureIsOneRequest(t *testing.T) {
 }
 
 // TestMultipartCompleteWithoutCommitIsAnError: the service answers 200 and
-// commits nothing, so nothing but an error may come back — the engine verifies
+// commits nothing, so nothing but an error may come back — transfer verifies
 // the object afterwards, and a 200 that committed nothing must never read as a
 // stored object.
 func TestMultipartCompleteWithoutCommitIsAnError(t *testing.T) {
@@ -176,10 +176,10 @@ func TestMultipartCompleteWithoutCommitIsAnError(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 200 without a completion ETag was accepted as a commit")
 	}
-	if class := classOf(err); class != plugin.ClassTransient {
+	if class := classOf(err); class != pluginerrors.ClassTransient {
 		t.Errorf("class %q, want transient: %v", class, err)
 	}
-	if _, err := s.Stat(ctx, "dropped.bin"); classOf(err) != plugin.ClassNotFound {
+	if _, err := s.Stat(ctx, "dropped.bin"); classOf(err) != pluginerrors.ClassNotFound {
 		t.Errorf("the dropped upload became visible: %v", err)
 	}
 	if err := mu.AbortMultipart(ctx, session); err != nil {
@@ -190,33 +190,39 @@ func TestMultipartCompleteWithoutCommitIsAnError(t *testing.T) {
 	}
 }
 
-// TestMultipartAbortRunsOnItsOwnContext: the engine aborts when the upload's own
-// context is already dead, so the call must go out anyway — one attempt, and an
-// upload already gone is nothing left to clean rather than an error.
-func TestMultipartAbortRunsOnItsOwnContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+// TestMultipartAbortUsesTheCallersContext: the abort no longer detaches from its
+// caller, so a cancelled caller context stops it before the request — the
+// cleanup owner's deadline is the one bound the call gets. Mutant:
+// context.WithoutCancel inside AbortMultipart lets the call outlive the caller.
+func TestMultipartAbortUsesTheCallersContext(t *testing.T) {
 	s, f := multipartStorage(t)
 	mu := capabilityOf(t, s)
 	body := newPattern(t, int(testPartBytes)+7)
 	session := beginUpload(t, mu, "aborted.bin", int64(len(body)))
-	if _, err := mu.PutPart(ctx, session, partBytes(1, body[:testPartBytes])); err != nil {
+	if _, err := mu.PutPart(context.Background(), session, partBytes(1, body[:testPartBytes])); err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := mu.AbortMultipart(ctx, session); err != nil {
-		t.Fatalf("abort with a cancelled context: %v", err)
+	err := mu.AbortMultipart(ctx, session)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("an abort with a cancelled caller context: %v", err)
 	}
-	if got := f.Count("abort"); got != 1 {
-		t.Fatalf("abort requests: got %d, want 1", got)
+	if got := f.Count("abort"); got != 0 {
+		t.Errorf("abort requests: got %d, want none after the caller context ended", got)
+	}
+	// A live context still aborts, and an upload already gone is not an error.
+	if err := mu.AbortMultipart(context.Background(), session); err != nil {
+		t.Fatalf("abort with a live context: %v", err)
 	}
 	if got := f.OpenUploads(); len(got) != 0 {
 		t.Fatalf("uploads left open: %v", got)
 	}
-	if err := mu.AbortMultipart(ctx, session); err != nil {
+	if err := mu.AbortMultipart(context.Background(), session); err != nil {
 		t.Fatalf("second abort of an upload already gone: %v", err)
 	}
 	if got := f.Count("abort"); got != 2 {
-		t.Errorf("abort requests after the second abort: got %d, want 2 (one attempt each)", got)
+		t.Errorf("abort requests after two live aborts: got %d, want 2 (one attempt each)", got)
 	}
 }
 
@@ -247,7 +253,7 @@ func TestCancelMidPartReturnsPromptly(t *testing.T) {
 	}
 }
 
-// TestMultipartPartsComeFromTheFile: the engine hands over a section of its spool
+// TestMultipartPartsComeFromTheFile: transfer hands over a section of its spool
 // file — a seekable reader over a bounded window — and that is all the plugin
 // needs: no buffer of the part is allocated here.
 func TestMultipartPartsComeFromTheFile(t *testing.T) {
@@ -295,16 +301,16 @@ func TestMultipartRefusesABadPartWithoutARequest(t *testing.T) {
 	s, f := multipartStorage(t)
 	mu := capabilityOf(t, s)
 	session := beginUpload(t, mu, "bad.bin", 2*testPartBytes)
-	if _, err := mu.PutPart(ctx, session, partBytes(0, []byte("x"))); classOf(err) != plugin.ClassPermanent {
+	if _, err := mu.PutPart(ctx, session, partBytes(0, []byte("x"))); classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("part number 0: %v", err)
 	}
-	if _, err := mu.PutPart(ctx, session, storage.Part{Number: 1, Size: 0, Body: strings.NewReader("")}); classOf(err) != plugin.ClassPermanent {
+	if _, err := mu.PutPart(ctx, session, storage.Part{Number: 1, Size: 0, Body: strings.NewReader("")}); classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("an empty part: %v", err)
 	}
-	if _, err := mu.PutPart(ctx, session, partBytes(1, make([]byte, testPartBytes+1))); classOf(err) != plugin.ClassPermanent {
+	if _, err := mu.PutPart(ctx, session, partBytes(1, make([]byte, testPartBytes+1))); classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("a part above part_bytes: %v", err)
 	}
-	if err := mu.CompleteMultipart(ctx, session, nil); classOf(err) != plugin.ClassPermanent {
+	if err := mu.CompleteMultipart(ctx, session, nil); classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("a completion with no parts: %v", err)
 	}
 	if got := f.Count("part"); got != 0 {
@@ -314,12 +320,12 @@ func TestMultipartRefusesABadPartWithoutARequest(t *testing.T) {
 
 // TestPutRefusesAnObjectAboveOneRequest: the whole-object path never becomes a
 // multipart upload of its own — an object above the endpoint's single-request
-// limit is the engine's multipart capability to upload.
+// limit is transfer's multipart capability to upload.
 func TestPutRefusesAnObjectAboveOneRequest(t *testing.T) {
 	ctx := context.Background()
 	s, f := multipartStorage(t)
 	_, err := s.Put(ctx, storage.PutRequest{Key: "huge.bin", Size: 5<<30 + 1}, bytes.NewReader(nil))
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("an object above one request: %v", err)
 	}
 	if !strings.Contains(err.Error(), "multipart") {
@@ -341,7 +347,7 @@ func TestBeginRefusesMorePartsThanTheServiceAccepts(t *testing.T) {
 	mu := capabilityOf(t, s)
 	over := int64(10000)*testPartBytes + 1
 	_, err := mu.BeginMultipart(ctx, storage.PutRequest{Key: "too-many-parts.bin", Size: over})
-	if classOf(err) != plugin.ClassPermanent {
+	if classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("an object needing more than 10000 parts: %v", err)
 	}
 	if !strings.Contains(err.Error(), "10000 parts") {
@@ -362,13 +368,11 @@ func TestBeginRefusesMorePartsThanTheServiceAccepts(t *testing.T) {
 	}
 }
 
-// TestAbortIsBoundedByItsOwnShortBudget: the abort runs after the upload's own
-// context died, on a context of its own — and that budget is request_timeout
-// divided down, because an abort fires exactly when the run's ending needs its
-// seconds. Mutant: giving the abort the whole request_timeout lets a stalling
-// endpoint hold the run for it.
-func TestAbortIsBoundedByItsOwnShortBudget(t *testing.T) {
-	ctx := context.Background()
+// TestAbortIsBoundedByTheCallerDeadline: a stalling endpoint cannot hold the
+// abort past the caller's cleanup deadline — the call returns the context's own
+// error after one attempt. Mutant: a detached budget lets the abort outlive the
+// caller that handed it the one deadline the run's ending has.
+func TestAbortIsBoundedByTheCallerDeadline(t *testing.T) {
 	s, f := newStorage(t, func(raw map[string]any) {
 		raw["part_bytes"] = testPartBytes
 		raw["request_timeout"] = "10s"
@@ -376,24 +380,26 @@ func TestAbortIsBoundedByItsOwnShortBudget(t *testing.T) {
 	mu := capabilityOf(t, s)
 	body := newPattern(t, int(testPartBytes)+7)
 	session := beginUpload(t, mu, "stalling-abort.bin", int64(len(body)))
-	if _, err := mu.PutPart(ctx, session, partBytes(1, body[:testPartBytes])); err != nil {
+	if _, err := mu.PutPart(context.Background(), session, partBytes(1, body[:testPartBytes])); err != nil {
 		t.Fatal(err)
 	}
 	f.hang["abort"] = true
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	start := time.Now()
 	done := make(chan error, 1)
 	go func() { done <- mu.AbortMultipart(ctx, session) }()
 	// The one attempt must have reached the endpoint before the bound is
-	// judged: on a loaded machine the request can arrive after the abort's own
-	// budget expired, and the count is what proves the attempt was made.
+	// judged: on a loaded machine the request can arrive after the caller's
+	// deadline expired, and the count is what proves the attempt was made.
 	waitFor(t, func() bool { return f.Count("abort") >= 1 }, 30*time.Second)
 	err := <-done
 	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("an abort against a stalling endpoint returned success")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("an abort whose caller deadline expired: %v", err)
 	}
-	if elapsed > 4*time.Second {
-		t.Fatalf("the abort took %s; with a 10s request timeout it must come back far sooner", elapsed)
+	if elapsed > 5*time.Second {
+		t.Fatalf("the abort took %s; the caller's 2s deadline must bound it", elapsed)
 	}
 	if got := f.Count("abort"); got != 1 {
 		t.Errorf("abort requests: got %d, want exactly 1", got)
@@ -477,7 +483,7 @@ func TestStaleMultipartPages(t *testing.T) {
 // TestStaleMultipartSkipsUndatedUploads: an upload the service does not date is
 // never called stale — a missing Initiated decodes as the zero time, which is
 // "before every cutoff" and would take an upload a run may be writing right now.
-// Mutant: without the skip the undated upload is listed and, by the engine,
+// Mutant: without the skip the undated upload is listed and, by transfer,
 // aborted.
 func TestStaleMultipartSkipsUndatedUploads(t *testing.T) {
 	ctx := context.Background()
@@ -579,7 +585,7 @@ func TestBeginRefusesAnObjectAboveTheEndpointLimit(t *testing.T) {
 	s, f := multipartStorage(t)
 	mu := capabilityOf(t, s)
 	_, err := mu.BeginMultipart(context.Background(), storage.PutRequest{Key: "huge.bin", Size: (5 << 40) + 1})
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("an object above the endpoint limit: %v", err)
 	}
 	if got := f.Count("create"); got != 0 {
@@ -592,7 +598,7 @@ func TestBeginWithoutAnUploadIDIsTransient(t *testing.T) {
 	mu := capabilityOf(t, s)
 	f.createNoID = true
 	_, err := mu.BeginMultipart(context.Background(), storage.PutRequest{Key: "big.bin", Size: 2 * testPartBytes})
-	if err == nil || classOf(err) != plugin.ClassTransient {
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a create answer without an upload id: %v", err)
 	}
 	if got := f.Count("create"); got != 1 {
@@ -607,7 +613,7 @@ func TestPutPartWithoutAnETagIsTransient(t *testing.T) {
 	f.partNoETag = true
 	session := beginUpload(t, mu, "noetag-part.bin", 2*testPartBytes)
 	_, err := mu.PutPart(ctx, session, partBytes(1, newPattern(t, int(testPartBytes))))
-	if err == nil || classOf(err) != plugin.ClassTransient {
+	if err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a part answered without an ETag: %v", err)
 	}
 }
@@ -616,7 +622,7 @@ func TestAbortWithoutASessionIDIsPermanent(t *testing.T) {
 	s, f := multipartStorage(t)
 	mu := capabilityOf(t, s)
 	err := mu.AbortMultipart(context.Background(), storage.MultipartSession{Key: "k"})
-	if err == nil || classOf(err) != plugin.ClassPermanent {
+	if err == nil || classOf(err) != pluginerrors.ClassPermanent {
 		t.Fatalf("an abort without an upload id: %v", err)
 	}
 	if got := f.Count("abort"); got != 0 {
@@ -654,7 +660,7 @@ func TestStaleMultipartFailureIsTransient(t *testing.T) {
 	s, f := multipartStorage(t)
 	mu := capabilityOf(t, s)
 	f.failAlways["listuploads"] = 500
-	if _, err := mu.StaleMultipart(context.Background(), time.Now()); err == nil || classOf(err) != plugin.ClassTransient {
+	if _, err := mu.StaleMultipart(context.Background(), time.Now()); err == nil || classOf(err) != pluginerrors.ClassTransient {
 		t.Fatalf("a failed upload listing: %v", err)
 	}
 }

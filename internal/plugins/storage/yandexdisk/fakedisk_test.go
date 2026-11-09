@@ -33,42 +33,49 @@ import (
 // a test can hold the plugin to "cannot tell" where the service would delete a
 // non-empty folder recursively.
 type fakeDisk struct {
-	mu              sync.Mutex
-	folders         map[string]bool
-	files           map[string]*fakeFile
-	pending         map[string]*fakeFile // accepted uploads waiting to become visible
-	polls           map[string]int       // visibility polls per path
-	hrefs           map[string]*fakeHref
-	hrefTokens      []string // href tokens PUT to, in order
-	downloads       map[string]string
-	nextID          int
-	counts          map[string]int
-	failAlways      map[string]int
-	failNext        map[string]int
-	retryAfter      map[string]int  // seconds of Retry-After per operation
-	pageLimit       int             // children per listing response; 0 = all
-	uploadMode      string          // "", "202", "never", or an HTTP status
-	commitAfter     int             // for "202": visible after this many stat polls
-	hangPutData     bool            // block the data PUT until the request context ends
-	hangStat        bool            // block a metadata answer until the request context ends
-	statBody        string          // when set, the raw 200 body of every metadata answer
-	hrefOverride    string          // when set, the href every upload/download answer carries
-	uploadHrefBad   bool            // the upload href answer carries no href
-	downloadHrefBad bool            // the download href answer carries no href
-	listEmptyPage   bool            // a listing answer states a total with no items
-	listBody        string          // when set, the raw 200 body of every listing answer
-	dropTransport   map[string]bool // close the connection without an answer, per operation
-	shortAnswer     map[string]bool // answer with a body shorter than its declared length
-	dropFolderDel   bool            // close the connection on a folder delete
-	downloadStall   bool            // the download href sends half the body, then waits
-	failDirDelete   int             // status injected into a folder delete; 0 = none
-	listPaths       []string        // folder path of every listing request, in order
-	listNoTotal     bool            // a listing answer without _embedded.total
-	listNoItems     bool            // a listing answer without _embedded.items
-	listContradicts bool            // a listing answer stating total 0 while items are non-empty
-	badMD5          bool            // report an md5 that is not the body's, to pin the leniency
-	sawChunkedBody  bool            // any request arrived with Transfer-Encoding: chunked or Content-Encoding: aws-chunked
-	srv             *httptest.Server
+	mu               sync.Mutex
+	folders          map[string]bool
+	files            map[string]*fakeFile
+	pending          map[string]*fakeFile // accepted uploads waiting to become visible
+	polls            map[string]int       // visibility polls per path
+	hrefs            map[string]*fakeHref
+	hrefTokens       []string // href tokens PUT to, in order
+	downloads        map[string]string
+	nextID           int
+	counts           map[string]int
+	failAlways       map[string]int
+	failNext         map[string]int
+	retryAfter       map[string]int             // seconds of Retry-After per operation
+	pageLimit        int                        // children per listing response; 0 = all
+	uploadMode       string                     // "", "202", "never", or an HTTP status
+	commitAfter      int                        // for "202": visible after this many stat polls
+	hangPutData      bool                       // block the data PUT until the request context ends
+	hangStat         bool                       // block a metadata answer until the request context ends
+	statBody         string                     // when set, the raw 200 body of every metadata answer
+	hrefOverride     string                     // when set, the href every upload/download answer carries
+	uploadHrefBad    bool                       // the upload href answer carries no href
+	downloadHrefBad  bool                       // the download href answer carries no href
+	listEmptyPage    bool                       // a listing answer states a total with no items
+	listBody         string                     // when set, the raw 200 body of every listing answer
+	dropTransport    map[string]bool            // close the connection without an answer, per operation
+	shortAnswer      map[string]bool            // answer with a body shorter than its declared length
+	dropFolderDel    bool                       // close the connection on a folder delete
+	downloadStall    bool                       // the download href sends half the body, then waits
+	failDirDelete    int                        // status injected into a folder delete; 0 = none
+	listPaths        []string                   // folder path of every listing request, in order
+	listInFlight     int                        // listing requests being served right now
+	listPeak         int                        // the most listing requests served at once
+	listGates        map[string]*fakeListGate   // a gate a test holds open per folder
+	listLatency      func(string) time.Duration // simulated per-folder latency, benchmark only
+	failCursor       map[string]int             // one-shot status for the next listing of a folder
+	retryAfterCursor map[string]int             // Retry-After seconds for that injected status
+	dropCursor       map[string]bool            // close the connection on the next listing of a folder
+	listNoTotal      bool                       // a listing answer without _embedded.total
+	listNoItems      bool                       // a listing answer without _embedded.items
+	listContradicts  bool                       // a listing answer stating total 0 while items are non-empty
+	badMD5           bool                       // report an md5 that is not the body's, to pin the leniency
+	sawChunkedBody   bool                       // any request arrived with Transfer-Encoding: chunked or Content-Encoding: aws-chunked
+	srv              *httptest.Server
 }
 
 type fakeFile struct {
@@ -87,21 +94,25 @@ type fakeDiskServer struct {
 	*fakeDisk
 }
 
-func newFakeDisk(t *testing.T) *fakeDiskServer {
+func newFakeDisk(t testing.TB) *fakeDiskServer {
 	t.Helper()
 	f := &fakeDisk{
-		folders:       map[string]bool{"app:": true},
-		files:         map[string]*fakeFile{},
-		pending:       map[string]*fakeFile{},
-		polls:         map[string]int{},
-		hrefs:         map[string]*fakeHref{},
-		downloads:     map[string]string{},
-		counts:        map[string]int{},
-		failAlways:    map[string]int{},
-		failNext:      map[string]int{},
-		retryAfter:    map[string]int{},
-		dropTransport: map[string]bool{},
-		shortAnswer:   map[string]bool{},
+		folders:          map[string]bool{"app:": true},
+		files:            map[string]*fakeFile{},
+		pending:          map[string]*fakeFile{},
+		polls:            map[string]int{},
+		hrefs:            map[string]*fakeHref{},
+		downloads:        map[string]string{},
+		counts:           map[string]int{},
+		failAlways:       map[string]int{},
+		failNext:         map[string]int{},
+		retryAfter:       map[string]int{},
+		dropTransport:    map[string]bool{},
+		shortAnswer:      map[string]bool{},
+		listGates:        map[string]*fakeListGate{},
+		failCursor:       map[string]int{},
+		retryAfterCursor: map[string]int{},
+		dropCursor:       map[string]bool{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/disk/resources", f.resources)
@@ -136,6 +147,91 @@ func (f *fakeDisk) Count(kind string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.counts[kind]
+}
+
+// fakeListGate holds one folder's listing answer open. The handler signals
+// entered once, then waits for release or for the client to go — never holding
+// the fake's mutex, so a sibling request can be served meanwhile.
+type fakeListGate struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *fakeListGate) signalEntered() { g.once.Do(func() { close(g.entered) }) }
+
+// holdList arms a gate on one folder's listing answer.
+func (f *fakeDisk) holdList(path string) *fakeListGate {
+	g := &fakeListGate{entered: make(chan struct{}), release: make(chan struct{})}
+	f.mu.Lock()
+	f.listGates[path] = g
+	f.mu.Unlock()
+	return g
+}
+
+// failListOnce injects one status into the next listing of one folder, with an
+// optional Retry-After, so a test gates a fault by cursor instead of by
+// operation.
+func (f *fakeDisk) failListOnce(path string, status, retryAfter int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failCursor[path] = status
+	if retryAfter > 0 {
+		f.retryAfterCursor[path] = retryAfter
+	}
+}
+
+// dropList closes the connection on every listing of one folder — persistent,
+// because net/http retries an idempotent request once when the link dies before
+// any answer arrives.
+func (f *fakeDisk) dropList(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropCursor[path] = true
+}
+
+// PeakConcurrentList reports the most listing requests the fake served at one
+// time — the proof a walk really ran its branches in parallel.
+func (f *fakeDisk) PeakConcurrentList() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listPeak
+}
+
+// enterList records one listing request and counts it as in flight. The gate,
+// latency and cursor fault that follow all wait without the mutex held.
+func (f *fakeDisk) enterList(path string) *fakeListGate {
+	f.mu.Lock()
+	f.listPaths = append(f.listPaths, path)
+	f.listInFlight++
+	if f.listInFlight > f.listPeak {
+		f.listPeak = f.listInFlight
+	}
+	gate := f.listGates[path]
+	latency := f.listLatency
+	f.mu.Unlock()
+	if latency != nil {
+		if d := latency(path); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	return gate
+}
+
+func (f *fakeDisk) leaveList() {
+	f.mu.Lock()
+	f.listInFlight--
+	f.mu.Unlock()
+}
+
+// cursorFault consumes one injected fault of one folder's listing.
+func (f *fakeDisk) cursorFault(path string) (status, retryAfter int, drop bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	status = f.failCursor[path]
+	delete(f.failCursor, path)
+	retryAfter = f.retryAfterCursor[path]
+	return status, retryAfter, f.dropCursor[path]
 }
 
 // fail returns an injected status for one operation, consuming a one-shot
@@ -198,6 +294,20 @@ func writeShort(w http.ResponseWriter) {
 	defer func() { _ = conn.Close() }()
 	_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"partial\":")
 	_ = buf.Flush()
+}
+
+// commitPending settles one accepted-but-invisible upload now: what the service
+// does when a 202 upload finishes committing after the caller stopped polling.
+func (f *fakeDisk) commitPending(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	file, ok := f.pending[path]
+	if !ok {
+		return false
+	}
+	f.files[path] = file
+	delete(f.pending, path)
+	return true
 }
 
 // putObject seeds a committed file with its folders, bypassing fault injection.
@@ -276,6 +386,30 @@ func (f *fakeDisk) resources(w http.ResponseWriter, r *http.Request) {
 			f.writeStatus(w, kind, st)
 			return
 		}
+		if listing {
+			gate := f.enterList(p)
+			defer f.leaveList()
+			if gate != nil {
+				gate.signalEntered()
+				select {
+				case <-gate.release:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			status, retryAfter, drop := f.cursorFault(p)
+			if drop {
+				dropConn(w)
+				return
+			}
+			if status != 0 {
+				if retryAfter > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+				}
+				writeJSON(w, status, errJSON("DiskError", fmt.Sprintf("injected %d for list %s", status, p)))
+				return
+			}
+		}
 		if kind == "stat" {
 			f.mu.Lock()
 			hang := f.hangStat
@@ -287,9 +421,6 @@ func (f *fakeDisk) resources(w http.ResponseWriter, r *http.Request) {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if listing {
-			f.listPaths = append(f.listPaths, p)
-		}
 		if !listing && f.statBody != "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)

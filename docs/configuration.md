@@ -1,11 +1,10 @@
 # Configuration
 
-`go-cluster-backup` reads one YAML document. `run`, `stage` and the `restore`
-subcommands read the same file. Every command builds every declared instance at
-startup, so a broken section stops it even when that command does not use it;
-only the **checks** are scoped: `run` checks everything except `stage.sources`,
-`stage` its own sources and the processors their pipelines name, and `restore`
-resolves its storages and apply options on use. The chart mounts the file at
+`go-cluster-backup` reads one YAML document with no `version` key. `run`, `stage`
+and `restore` share it. Every present section must validate, even when the
+command does not use it. Runtime **checks** are scoped: `run` checks everything
+except `stage.sources`, `stage` its sources and their processors, and `restore`
+resolves storages and apply options on use. The chart mounts the file at
 `/etc/go-cluster-backup/config.yaml`.
 
 Reference configurations:
@@ -35,17 +34,69 @@ JSON-pointer path.
 
 ### Defaults
 
-The fields no deployment may choose (a credential, a storage's root, a retention
-tier or byte budget, a message text) are the deployment's to state, and every
-other field has one value in the service's own document,
-`internal/defaults/defaults.yaml`, embedded into the binary. The engine merges
-it under the configuration file before a byte reaches a plugin: objects merge
-key by key, a value the file carries replaces the default whole, `name[]` fills
-the elements of the list `name` the file declares, `null` is refused, and a
-default never creates an optional section, an instance or a list element. A
-plugin still receives complete bytes and treats every field as required.
-`config defaults` prints the document; `config effective --config FILE` prints
-the merged file with every defaulted value marked.
+Deployment-specific fields — credentials, storage roots, retention tiers/byte
+budgets and message text — must be supplied by the deployment. Other fields
+come from `internal/plugins/configuration/defaults/defaults.yaml`, embedded in
+the binary. Objects merge recursively; present scalars and lists replace earlier
+values. `name[]` fills fields in declared list elements. Null is refused, and
+defaults never create optional sections, instances or list elements. Plugins
+receive complete config bytes and supply no defaults themselves.
+
+`config defaults` prints the embedded document. `config effective --config FILE`
+marks only actually defaulted values: YAML uses `# default`; JSON includes their
+provenance pointers. Pointers escape IDs per RFC 6901: `source/postgres` becomes
+`source~1postgres`, for example `/plugins/config/source~1postgres/format`.
+
+### Plugins
+
+Defaults and deployment config use the same root:
+`plugins: {bundles, disabled, config}`. The `config` map holds partial settings
+under factory IDs (`kind/type`) or application-provider IDs such as `reporting`.
+Backup sections remain in this document. For example, this deployment fragment
+sets type-wide compression settings and then overrides one instance:
+
+```yaml
+plugins:
+  bundles: []
+  disabled: []
+  config:
+    processor/zstd:
+      concurrency: 2
+    reporting:
+      request_timeout: 10s
+processors:
+  compress:
+    type: zstd
+    config:
+      concurrency: 3
+```
+
+Precedence is embedded defaults, deployment per-type settings, then
+`instance.config`; the instance above receives `concurrency: 3`. Nested discovery
+sources and retention use the same resolver. Required fields may be supplied
+per-type or per-instance by the deployment, never embedded defaults. Settings do
+not create instances or discovery results. Partial blocks are checked against
+compiled schemas even when the plugin is disabled; full required-field and
+combination checks follow assembly. Secret references are allowed, not printed
+secret contents.
+
+All compiled plugins start available. Bundles apply in list order, then
+`plugins.disabled`; deployment lists replace default lists. `bundles: []` clears
+bundles. Re-enable a plugin by removing its disable and any disabling bundle.
+Floor includes `cli`, `workflow-backup` and the dependency closure of each;
+these cannot be disabled. The flat Floor host lives in `internal/plugins/cli`
+and registers only through the generated root. Library plugins are always active. Unknown IDs/bundles/members,
+duplicate keys, nulls and invalid types are errors. Referencing a disabled role,
+instance type or nested discovery source refuses operation before I/O.
+
+The generic container is `internal/loader`; registration is generated from plugin
+metadata. `assembly` is the construction boundary for Config and supplies typed
+options to `workflow/backup`, `workflow/stage`, `workflow/restore` and their
+collaborators. `plugins check` validates the compiled composition offline. `validate`
+and `config effective` aggregate configuration, availability and dependency
+diagnostics. Effective config prints a mergeable candidate on stdout, diagnostics
+on stderr and exits non-zero on errors; unreadable or unmergeable input has no
+candidate. A diagnostic candidate never permits operational execution.
 
 ### Size units
 
@@ -142,10 +193,10 @@ stream, a sealed snapshot. One artifact is one object;
 
 One artifact of an instance whose domain holds several (a database server's
 databases). Such a source answers `source.Enumerator` with each unit's name and
-the config that dumps exactly it; the engine builds one source per unit of the
+the config that dumps exactly it; `planning` builds one source per unit of the
 same type and names the artifact `<envelope>/<unit>` and the instance
-`<instance>/<unit>`. A name the engine cannot build a name from (empty, a `/`, a
-control character) is that unit's own failed artifact, and its siblings still
+`<instance>/<unit>`. An invalid name (empty, containing `/` or a control
+character) is that unit's own failed artifact, and its siblings still
 run; a unit whose source cannot be built or checked fails alone too. A source
 without the capability, or one answering `errors.ErrUnsupported`, is one
 artifact. An enumeration that fails, or answers nothing, is ONE failed artifact
@@ -179,21 +230,27 @@ manifest at `manifest.json` beside them. The literal head of
 renaming either orphans every run already written. A manual run's id is the
 scheduled one plus `layout.manual_id_suffix` (default `-manual`), so a survey
 tells a run's kind from its key alone, and a manifest whose `kind` disagrees
-with it is a problem run the engine never deletes.
+with it is a problem run the protection ledger never deletes.
 
 ### Manifest
 
-The run report as the last object of the run, carrying `schema`. A restore
-decodes with the chain the manifest records, never with a pipeline looked up in
-the current config. **The manifest's JSON keys and its schema version are a
-stored format: they never change.**
+The run report as the last object of the run, carrying `schema` and a required
+`kind`. A missing or invalid kind, or one that disagrees with the run ID, makes
+a problem run: never deleted, credited as verified protection or selected for
+artifact restore. Its listed bytes still count towards occupancy. Only the
+current strict format is accepted. Restore decodes the recorded processor chain,
+never a pipeline looked up in the current config, through read-only
+`storage.Reader` ports. `guard.Port` supplies that read-only view. Writes use
+Handle/Uploader/Inventory under a live `guard.Authority`; zero, expired or
+revoked handles refuse. Only the protection ledger holds `guard.Remover`.
+Raw instances stay behind `internal/plugins/storage/internal`.
 
 ### Run outcome
 
 A run that returns a report ends with exactly one outcome, and it decides the
 exit code. The verdict reads the writer lease, every storage's verification,
 every artifact's result and the started notification, and nothing else;
-`Engine.reportOutcome` evaluates them in this order, and the first rule that
+the backup workflow evaluates them in this order, and the first rule that
 holds wins:
 
 1. `failed` — the writer lease decided the run: a manual run refused while a live
@@ -213,17 +270,17 @@ The run's own last event can still lower that verdict: with
 `run.notifier_failure_is_fatal`, the outcome becomes `failed` only when **no**
 notifier delivered the finished event — one notifier failing while another
 delivered the same event leaves the verdict as it stood, so a delivered finished
-message always names the final outcome (`Engine.Run`, after `reportOutcome`). A
+message always names the final outcome. A
 notifier that skips an event — an unsubscribed one returns `notifier.ErrSkipped`
 — counts as neither delivered nor failed, so a started-only or muted webhook
 cannot mask another notifier's failed finished delivery. The started notification
 is not symmetric — its failure is one more failure, so with the flag it degrades
 a run that would otherwise be delivered, and without the flag either event's
 failure changes nothing. The verdict reads no other input: a failed retention
-pass, catalog write, lease release or source close is recorded in the report or
+pass, lease release or source close is recorded in the report or
 the log and leaves the outcome alone.
 
-A storage is verified (`Engine.assembleResults`) when the run tried it, it holds
+The backup workflow marks a storage verified when the run tried it, it holds
 at least one object of this run, and nothing failed on it: no upload, no
 verification, no cap refusal and no manifest write or verification. The manifest
 is part of the verdict — the run's manifest must be saved and verified on that
@@ -245,9 +302,8 @@ worse, never better — the exit code follows it, and can rise from `delivered`'
 0 to `run.failed_exit_code`. The manifest is also written before the finished
 event, so with `run.notifier_failure_is_fatal` and a finished event no notifier
 received, the stored manifest can name `delivered` or `degraded` while the
-catalog entry and the exit code say `failed`. A run refused the writer lease
-writes no manifest. The report the command prints, and the catalog entry where
-one is configured, carry the final verdict.
+exit code says `failed`. A run refused the writer lease writes no manifest.
+The report the command prints carries the final verdict.
 
 `--dry-run` decides from the plans alone: `delivered` (exit 0) when every planned
 artifact resolved — its check, traits, recorded chain and the secret invariant —
@@ -266,7 +322,7 @@ do not — never a silent success.
 ### Message
 
 The `webhook` notifier's texts are config, not the plugin's. `events` maps an
-event name to a plain-text template; the engine's events are `run_started` and
+event name to a plain-text template; the backup events are `run_started` and
 `run_finished`, and an event with no entry is not subscribed — the notifier
 answers `notifier.ErrSkipped`, which counts as neither a delivery nor a failure.
 A template renders
@@ -280,7 +336,7 @@ a replacement rune and line breaks inside a value become spaces, because a
 broken name must not cost the night's one message. Sizes have two helpers:
 `bytes` renders binary units (KiB, MiB, GiB) for an artifact's stored size,
 `sibytes` renders SI units (base 1000, one decimal — kB, MB, GB) for a cap
-stated in `GB`; a cap stated in `GiB` is rendered by `bytes`. The engine's own
+stated in `GB`; a cap stated in `GiB` is rendered by `bytes`. Protection's
 `cap_exceeded` text carries the exact byte count in binary units, never a
 rounded SI reading.
 `payload` is one body template for **every** event, executed with `.Title`,
@@ -288,29 +344,30 @@ rounded SI reading.
 its keys are the receiver's own. `body_format: yaml` drops the empty rendered
 lines, reads the rest as a YAML document and sends its JSON encoding; `text`
 sends the render as it is. `validate` renders every event and the payload
-against a matrix of built-in sample runs — started with and without an
-unfinished previous run; finished delivered, degraded and failed, with and
-without exclusions, artifacts and storages, both run kinds, a manual run refused
-by a cap and one refused the writer lease — so a template that only fits one
-night is refused offline. `.Run.Previous` carries the previous run's record,
-including a failure from before the tool started (`.Run.Previous.Failure`); a
-storage's `CapExceeded`, `CapLimitBytes` and `CapUsedBytes` and a lease refusal
-(`.Run.Lease`) reach a template too.
+against a matrix of built-in sample runs — started without previous-run data;
+finished delivered, degraded and failed, with and without previous-run data,
+exclusions, artifacts and storages, both run kinds, a manual run refused by a cap
+and one refused the writer lease — so a template that only fits one night is
+refused offline. `.Run.Previous` is populated only for `run_finished`; it is
+empty for `run_started`. The `reporting` plugin derives it from storage manifests
+and the previous Job's status, including pre-start failures
+(`.Run.Previous.Failure`). A storage's `CapExceeded`, `CapLimitBytes` and
+`CapUsedBytes` and a lease refusal (`.Run.Lease`) reach a template too.
 
 ### Run knobs and budgeting
 
 | Key | What it bounds |
 |---|---|
 | `run.deadline` | the whole run: the context every artifact and storage call runs under |
-| `run.finish_allowance` | the ending beyond that deadline; the manifests take its first half and are written together, so a storage that stalls on its own manifest costs only its own record, while the finished notification and the catalog entry keep the second half |
+| `run.finish_allowance` | the ending beyond that deadline; the manifests take its first half and are written together, so a storage that stalls on its own manifest costs only its own record, while the finished notification keeps the second half |
 | `run.max_artifact_bytes` | one artifact: a source that would produce more is stopped and that artifact fails, so one oversized volume cannot fill the spool |
 | `run.spool_reserve_bytes` | free space kept free in the spool; below it an artifact fails rather than filling the filesystem |
 | `restore.spool_reserve_bytes` | free space kept beyond the object being written to the restore spool, checked before the first byte and during every write |
 | `storages.<name>.time_budget` | the wall time while at least one call to that storage is in flight in one run — uploads, listings, deletes, the survey; overlapping calls book their union once, never a source's dump or a processor's compression |
-| `storages.<name>.call_parallelism` | the most calls the engine holds in flight to this storage; the default is stated by `config defaults`. It covers the manifest reads of one survey and the parts of one multipart upload. The ceiling is per process and per instance: a `restore list` or a `validate --preflight` hook beside a run, and two instances on one service, each hold their own |
+| `storages.<name>.call_parallelism` | the per-instance call ceiling, passed to factories as `storage.BuildInput{CallParallelism}`; the default is stated by `config defaults`. It bounds survey manifest reads, multipart parts and Yandex folder-listing fan-out. The ceiling is per process and per instance: a `restore list` or a `validate --preflight` hook beside a run, and two instances on one service, each hold their own |
 | `run.storage_parallelism` | how many storages upload at once, `4` by default. Overlapping holds one `run.storage_parallelism` slot from the storage's first call to its last; a storage that gets no slot, or has no multipart capability, uploads after produce on the finished file. With overlap, `run.deadline` must sit above max(production, upload) plus the finishing tail, not above their sum |
 | `run.lease_wait`, `run.lease_poll` | how long a scheduled run waits for a live writer lease, and how often it asks again; a manual run never waits |
-| `run.retry`, `run.unclassified_error` | the engine's retry policy for every plugin call, including the class an error a plugin did not classify gets |
+| `run.retry`, `run.unclassified_error` | the `execution` retry policy for every plugin call, including the class an error a plugin did not classify gets |
 | `run.notifier_failure_is_fatal` | with the flag, a finished event no notifier delivered makes the outcome `failed`; a failed started notification only degrades it, a notifier that skips an event counts as neither delivered nor failed, and with the flag off neither event's failure changes the outcome |
 | `run.progress_interval` | how often a running dump reports its bytes so far; 0 reports none |
 
@@ -318,11 +375,12 @@ An object goes to a storage in one request when it fits one, or part by part
 through a storage that uploads in parts: up to
 `storages.<name>.call_parallelism` parts are in flight at once, so a failed part
 is re-sent and the parts already accepted are not, and an upload that keeps
-failing is aborted rather than left billed — on a context of its own, bounded by
-a tenth of the storage's `request_timeout`, because an abort fires exactly when
-the run's ending needs its seconds. Only after the producer exited successfully
-and every part was accepted is Complete sent, with the parts by number whatever
-order they finished in. At the first failed part the engine stops issuing new
+failing is aborted rather than left billed. S3 abort uses the caller's context,
+without detaching it or adding a separate abort timeout. SIGTERM cleanup uses the
+shared detached context described in [Shutdown](#shutdown). Only after the
+producer exited successfully and every part was accepted is Complete sent,
+with the parts by number whatever
+order they finished in. At the first failed part `transfer` stops issuing new
 ones; a neighbour already in flight is cancelled, but its bytes may reach the
 service after the abort — that residue stays billed, is invisible to both the
 listing and the multipart inventory, and is at most `call_parallelism − 1` parts
@@ -335,9 +393,12 @@ part. A run starts by sweeping what a killed predecessor left behind: every
 incomplete multipart upload under the storage's own prefix, begun before `now −
 (run.deadline + run.finish_allowance)` — older than the longest a live run can
 last, so an upload an overlapping run is still writing is never taken — is
-aborted once per storage per run, and a sweep that fails leaves the storage's
-occupancy unknown instead of guessing it. A SIGKILL during produce can leave an
-incomplete multipart upload, and this sweep is what removes it.
+aborted once per storage per run by `transfer.Transfer.Sweep`. Sweep also reads the full
+multipart inventory, including young and undated uploads. Any upload in that
+inventory, or a failed inventory read, makes occupancy unknown: a stale-only view
+cannot prove the storage empty. Stale selection decides only which uploads to
+abort. `AbortOwn` instead tracks exact IDs opened by this invocation; it does not
+enumerate a successor's uploads. A SIGKILL can leave uploads for a later sweep.
 
 An artifact is not held back until its dump ends: a storage with the multipart
 capability begins sending parts as the spool grows past one part and sends
@@ -360,12 +421,63 @@ storage's listing plus its manifest reads, and holds at most
 `storages × call_parallelism` reads in flight; the upload phase holds at most
 min(storages, `run.storage_parallelism`) × `call_parallelism` parts in flight.
 
+Yandex listing uses `internal/plugins/treewalk` to walk folders in parallel,
+bounded by the same `call_parallelism`, without a nested shared semaphore or
+another concurrency knob. A failed List attempt exposes no partial page; its
+retry replays the full traversal from the input token, without checkpoints.
+
+### Shutdown
+
+`assembly` owns invocation instances in `lifecycle.Scope`. On SIGTERM, the backup
+workflow starts `Shutdown` while the operation unwinds, in this order:
+
+1. `CancelRequests`: close admission, retries and Complete; cancel producers and
+   request contexts.
+2. `Join`: wait for every request goroutine, including surveys, followers,
+   uploaders and manifests. Incomplete join leaves the claim held and skips
+   Release, Abort and Close.
+3. `Release`: CAS-release the lease with durable uncertainty, only after full join.
+4. `Abort`: call `AbortOwn` for each storage, using only this invocation's exact IDs.
+5. `Close`: close clients in reverse construction order.
+
+The whole sequence shares one detached `CleanupContext`, created with
+`context.WithoutCancel` and bounded by `RequiredGrace`; all storages spend that
+same deadline, not a fresh timeout per abort. `plugins.config.lifecycle` supplies
+`join`, `abort_total`, `close` and `margin`; release uses `run.finish_allowance`.
+With no preStop hook, RequiredGrace rounds their sum up to seconds: shipped
+values are 1m + 2m + 2m + 30s + 30s = 360s.
+The chart defaults `terminationGracePeriodSeconds` to 360 and passes the same
+literal to `validate --termination-grace-seconds`. The gate rejects a smaller
+value than effective config requires; raise chart grace when raising budgets.
+For a manual validate, zero or an omitted flag skips this check; negative values
+are usage errors. A grace period cannot force an uncooperative goroutine to stop.
+
+### Catalog
+
+The `kubernetes_configmap` catalog holds only the writer lease in a ConfigMap
+created by the deployment, never run history. Its settings are:
+
+- `namespace` and `name`: required ConfigMap namespace and name.
+- `api_host_env` and `api_port_env`: environment variables naming the API host
+  and port.
+- `token_file` and `ca_file`: ServiceAccount token and API CA bundle paths.
+- `request_timeout`: timeout of one API request.
+- `lease_key`: ConfigMap data key for the lease; defaults to `lease.json`.
+
+Previous-run information belongs to `reporting` (see [Message](#message)).
+
+For rollout from a catalog that stored history, stop scheduled and manual writers
+and wait until none is running. Delete the old catalog ConfigMap once, then let
+the upgrade recreate it empty, or recreate it through its external manifest when
+`catalog.create: false`. Never delete a live writer's lease. The replacement
+holds only the lease; do not declare its `data` in deployment manifests.
+
 ### One writer
 
 Runs that share storage roots are serialised by a cross-process writer lease the
-catalog owns: an optional capability, absent as `errors.ErrUnsupported`. The
-engine takes it before the first storage write — the stale sweep included — and
-releases it at the end. A deployment's `concurrencyPolicy` governs only one
+catalog owns: an optional capability, absent as `errors.ErrUnsupported`.
+`protection` acquires it before the first storage mutation — the stale sweep
+included — and the backup workflow releases it at the end. A deployment's `concurrencyPolicy` governs only one
 CronJob's own Jobs, so it does not stop a scheduled run and a hand-started one
 from overlapping; the lease does. The lease is taken by `run`, after `stage`:
 a `stage.dir` shared between pods — a hostPath or a PVC — lets another pod's
@@ -390,29 +502,27 @@ partial identity, an absent capability, `errors.ErrUnsupported` and a failed
 check all count as alive. A manual run refuses a live claim at once; a scheduled
 run waits `run.lease_wait` and then gives up. Both end through the common finish:
 the outcome is `failed`, the reason is in the report (`.Run.Lease` names the
-holder on a refusal), the finished notification is sent and the catalog entry is
-written. A catalog that cannot hold a lease at all leaves a manual run unable to
-start (exit 1) and a scheduled run lease-free. `Release` drops only the claim
-its own acquisition token names.
+holder on a refusal), and the finished notification is sent. A catalog that
+cannot hold a lease at all leaves a manual run unable to start (exit 1) and a
+scheduled run lease-free. `Release` drops only the claim its own acquisition
+token names.
 
-A takeover proves the holder's process ended, not that every request it had
-already handed to a provider finished: Yandex Disk answers an upload with HTTP
-202 before its asynchronous commit, and a delete the holder had already decided
-may still be applied. The answer is bounded and deliberate. After a takeover
-under the kubelet's phase the lease records a quarantine until the dead holder's
-hard bound passes; `Release` keeps it, every later acquisition inherits the
-latest one, and while it holds the successor treats occupancy as unknown — a
-manual run is refused on every storage, a scheduled run is soft-capped anyway.
-Retention never deletes another run's incomplete objects younger than the same
-`deadline + finish_allowance` bound. The worst a late provider-side commit can
-do is overshoot the scheduled cap transiently, or apply that holder's own
-already-decided deletes.
+A takeover proves the holder's process ended, not that provider-side requests
+settled: Yandex Disk may answer HTTP 202 before its asynchronous commit. Durable
+uncertainty survives `Release` and is inherited by later acquisitions. The current
+holder clears inherited uncertainty after two equal consecutive full-survey
+digests across every storage. A failed or partial survey invalidates the prior
+observation; elapsed time never clears uncertainty. A stale token cannot clear
+another holder's state, and failed durable updates leave occupancy unknown.
+While occupancy is unknown, manual admission stays closed and unsafe reclamation
+is forbidden; scheduled runs retain soft-cap/reporting behaviour. Retention also
+protects another run's incomplete objects until `deadline + finish_allowance`.
 
 ### Retention
 
 Retention is per storage, decided from the manifests that storage itself holds,
 and **partitioned by run kind**: `storages.<name>.retention` is a map,
-`{scheduled: {…}, manual: {…}}`; the engine hands each policy a homogeneous run
+`{scheduled: {…}, manual: {…}}`; `protection` hands each policy a homogeneous run
 list, so a manual run never takes a scheduled slot and a policy never sees the
 other kind. A storage with no `manual` partition refuses manual runs.
 
@@ -445,8 +555,13 @@ artifact, or one that became an exclusion — keeps its last run for as long as
 the name is absent. The Yandex Disk storage removes the folders its deletes
 empty, up to but never including the configured root.
 
-The **byte cap** is the storage's `max_total_bytes`, owned by the engine, not the
-policy, and covering every kind at once. Before every object write on a storage
+Before policy or cap decisions, the protection ledger credits the current run
+from its verified artifact copies and saved-manifest results, so a fresh verified
+copy can release an older pin. `MarkUncertain` protects the uncertain run's
+prefix, makes occupancy unknown and closes cap eviction.
+
+The **byte cap** is the storage's `max_total_bytes`, owned by the protection
+ledger, not a retention policy, and covering every kind at once. Before every object write on a storage
 — artifacts and the manifest — a manual run checks it against that storage's
 real occupancy (its listing plus what the run has written or is writing); a
 refusal stops uploads to **that** storage with the machine-readable
@@ -463,7 +578,7 @@ more than the cap allows, is reported without failing the run.
 Every step — the run starting and the storages it will write to, the previous
 run, what the discovery found and how many objects it covered or ignored, each
 artifact's source, each processor step with its bytes in and out, the spool,
-every storage's upload, verification and retention, the catalog write, each
+every storage's upload, verification and retention, the writer lease, each
 notification and the closing summary — is one line written when it happens, so
 `kubectl logs -f` shows a run live. A line opens with a `[HH:MM:SS]` clock (UTC)
 and, for anything a plugin did, the instance that did it:
@@ -472,14 +587,13 @@ and, for anything a plugin did, the instance that did it:
 durations rounded (`2m40s`), and a failure is one `✗` line naming the artifact
 and the reason.
 
-The engine and every plugin report through the one `*slog.Logger` the engine
-hands each instance; nothing writes a log line with a `Printf`, and a plugin
+Every plugin reports through the scoped `*slog.Logger` assembly supplies;
+nothing writes a log line with a `Printf`, and a plugin
 never writes to stdout. `--log-level debug` is where the machine detail lives:
 the sha256 and the full object key are appended to the line, and each excluded
-object is a debug-only line of its own. The exact values are always in the
-manifest and the catalog, whatever the level. `stage` and the `restore`
-subcommands report the same way; `restore list` stays a listing, one row per run
-and storage, with no clock.
+object is a debug-only line of its own. The manifest retains exact values
+regardless of log level. `stage` and the `restore` subcommands report the same
+way; `restore list` stays a listing, one row per run and storage, with no clock.
 
 ## Commands
 
@@ -493,9 +607,10 @@ code their config names.
 go-cluster-backup run     --config FILE --kind scheduled|manual [--dry-run]
 go-cluster-backup stage   --config FILE
 go-cluster-backup validate --config FILE [--preflight] [--instance KIND/NAME]...
+                                 [--termination-grace-seconds SECONDS]
 go-cluster-backup config  defaults
 go-cluster-backup config  effective --config FILE [--output yaml|json]
-go-cluster-backup plugins [describe KIND/TYPE]
+go-cluster-backup plugins [check | describe KIND/TYPE]
 go-cluster-backup schema
 go-cluster-backup doctor
 go-cluster-backup restore list   --config FILE [--storage NAME]... [--run ID] [--output text|json]
@@ -553,10 +668,12 @@ go-cluster-backup restore verify --config FILE (--run ID | --run newest-ok) [--a
   discovery brings the sources it finds with it, the summary counts only what was
   checked, and a line names every configured instance the selection left out.
   Offline validation always reads the whole file.
-- **config defaults / effective** — the embedded document as it is; the merged
-  file with every defaulted value marked.
-- **plugins** — kind/type, stability, required binaries and summary;
-  `plugins describe KIND/TYPE` adds every field and the plugin's example.
+- **config defaults / effective** — the embedded document; the effective
+  candidate with default provenance and aggregated diagnostics (see [Plugins](#plugins)).
+- **plugins** — compiled IDs, stability, required binaries and summary;
+  `plugins describe KIND/TYPE` adds fields and an example. `plugins check` validates
+  loader kinds, Floor, effective dependencies, cycles and availability offline,
+  without constructing instances or doing I/O.
 - **schema** — the JSON Schema of a configuration file.
 - **doctor** — every external binary any registered plugin declares is on `PATH`.
 - **restore** — see [restore.md](restore.md).
@@ -566,7 +683,7 @@ go-cluster-backup restore verify --config FILE (--run ID | --run newest-ok) [--a
 Templates read Go field names of the report types and a fixed function set. That
 surface is a SemVer API for this project: a deployment's configuration spells
 those names, so a rename is a breaking change. It is pinned by tests
-(`internal/plugin/template_surface_test.go`, `internal/engine/layout_surface_test.go`).
+(`internal/plugins/configuration/template_surface_test.go`, `internal/plugins/layout/layout_surface_test.go`).
 
 - **Fields:** `RunReport`, `ArtifactResult`, `Artifact`, `StorageResult`,
   `DumpStats`, `Exclusion`, `PreviousRun`, `PreviousFailure`, `ContainerFailure`,
@@ -579,6 +696,11 @@ those names, so a rename is a breaking change. It is pinned by tests
 
 ## Adding a plugin
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md). A plugin is one package under
-`internal/plugins/<kind>/<name>` plus one registration line in
-`internal/cli/register.go`.
+See [CONTRIBUTING.md](../CONTRIBUTING.md). Declare literal `var Spec` in
+`plugin.go`; libraries have no `Apply`. Factory contributors use
+`instances.FactorySpec` or `storage.FactorySpec`. `make generate` emits
+`internal/plugins/all/{zz_generated.go,floor.json}` and
+`internal/plugins/all/components/zz_generated.go`. Hostless `components.Compose`
+registers non-host plugins; `all.Register` adds components and hosts over fresh
+factories. `all.Compose` builds that full graph with caller-owned factories.
+`make rules`, included in `make lint`, checks freshness and structural rules.

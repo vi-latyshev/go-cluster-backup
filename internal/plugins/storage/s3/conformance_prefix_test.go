@@ -10,7 +10,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/storage/storagetest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 func TestResolveCleanupPrefixRefusesEverythingButAConformancePrefix(t *testing.T) {

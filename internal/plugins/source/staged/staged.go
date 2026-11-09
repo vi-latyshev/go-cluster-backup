@@ -1,6 +1,6 @@
 // Package staged reads an artifact another process already encoded and left in
 // a directory — the run-side half of the stage command, whose init container
-// produces it. The engine's Stage writes <stage.dir>/<name><ext> and, beside
+// produces it. The stage workflow writes <stage.dir>/<name><ext> and, beside
 // it, the chain record of what it ran (source.StagedChainFile); this source
 // reads the single file that is this artifact — the entry named <name> or
 // <name>.<ext>, never a neighbour whose name merely starts with it — reports
@@ -20,45 +20,17 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // Config is the plugin config. Every field is required.
 type Config struct {
 	Dir  string `json:"dir" required:"true" doc:"directory the stage command leaves its sealed artifact in"`
 	Name string `json:"name" required:"true" doc:"artifact name the staged file starts with"`
-}
-
-// Register adds the staged source to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, source.Kind, plugin.Spec[Config, source.Source]{
-		Type:      "staged",
-		Summary:   "a sealed artifact an earlier stage left in a directory",
-		Stability: plugin.Stable,
-		Example:   []byte(`{"dir": "/backup/staged", "name": "example-state"}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (source.Source, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if cfg.Dir == "" {
-				return nil, errors.New("dir is empty")
-			}
-			if !filepath.IsAbs(cfg.Dir) {
-				return nil, fmt.Errorf("dir %q must be absolute", cfg.Dir)
-			}
-			if cfg.Name == "" {
-				return nil, errors.New("name is empty")
-			}
-			if strings.ContainsAny(cfg.Name, "/\x00") {
-				return nil, fmt.Errorf("name %q must be a plain file name prefix", cfg.Name)
-			}
-			return &Source{cfg: cfg}, nil
-		},
-	})
 }
 
 type Source struct {
@@ -101,10 +73,10 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("staged artifact: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("staged artifact: %w", err))
 	}
 	defer func() { _ = f.Close() }()
-	_, err = plugin.CopyContext(ctx, dst, f)
+	_, err = pluginio.CopyContext(ctx, dst, f)
 	return err
 }
 
@@ -132,11 +104,11 @@ func (s *Source) record() (source.StagedRecord, error) {
 	rec, err := source.ReadStagedRecord(s.cfg.Dir, s.cfg.Name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return source.StagedRecord{}, plugin.Permanent(fmt.Errorf(
+			return source.StagedRecord{}, pluginerrors.Permanent(fmt.Errorf(
 				"staged artifact %s has no chain record at %s: the stage did not leave one, and nothing tells a restore how these bytes are encoded",
 				s.cfg.Name, source.StagedChainFile(s.cfg.Dir, s.cfg.Name)))
 		}
-		return source.StagedRecord{}, plugin.Permanent(fmt.Errorf("staged chain record: %w", err))
+		return source.StagedRecord{}, pluginerrors.Permanent(fmt.Errorf("staged chain record: %w", err))
 	}
 	return rec, nil
 }
@@ -151,19 +123,19 @@ func (s *Source) artifact() (string, source.StagedRecord, error) {
 	}
 	name, err := source.StagedArtifactName(s.cfg.Name, rec)
 	if err != nil {
-		return "", source.StagedRecord{}, plugin.Permanent(err)
+		return "", source.StagedRecord{}, pluginerrors.Permanent(err)
 	}
 	path := filepath.Join(s.cfg.Dir, name)
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", source.StagedRecord{}, plugin.Permanent(fmt.Errorf(
+			return "", source.StagedRecord{}, pluginerrors.Permanent(fmt.Errorf(
 				"no staged artifact named %s in %s; the stage step did not leave one", name, s.cfg.Dir))
 		}
-		return "", source.StagedRecord{}, plugin.Permanent(err)
+		return "", source.StagedRecord{}, pluginerrors.Permanent(err)
 	}
 	if info.Size() == 0 {
-		return "", source.StagedRecord{}, plugin.Permanent(fmt.Errorf("staged artifact %s is empty", path))
+		return "", source.StagedRecord{}, pluginerrors.Permanent(fmt.Errorf("staged artifact %s is empty", path))
 	}
 	return path, rec, nil
 }

@@ -15,8 +15,9 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 const (
@@ -66,12 +67,15 @@ exit 0
 
 	raw := fmt.Sprintf(`{"datastore": %q, "token": {"file": %q}, "scratch_dir": %q, "busy_timeout": "10s", "integrity_check": "quick", "timeout": "1m"}`,
 		datastore, token, scratch)
-	r := plugin.NewRegistry()
-	if err := Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, Spec, func(lr *loader.Registry) error {
+		return Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := plugin.Build(context.Background(), r, source.Kind, "k3s_state", jsontext.Value(raw),
-		plugin.Deps{Instance: "k3s_state", Log: slog.New(slog.DiscardHandler)})
+	s, err := instances.Build(context.Background(), r, source.Kind, "k3s_state", jsontext.Value(raw),
+		instances.Deps{Instance: "k3s_state", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +96,7 @@ func TestCheckReportsAFileItCannotClose(t *testing.T) {
 		_ = f.Close()
 		return errors.New("injected close failure")
 	})
-	if err := s.(plugin.Checker).Check(context.Background()); err == nil {
+	if err := s.(instances.Checker).Check(context.Background()); err == nil {
 		t.Fatal("a datastore or token that could not be closed passed the preflight")
 	}
 }

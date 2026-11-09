@@ -142,6 +142,7 @@ on the restore pod).
 {{- $podSecurityContext := default $root.Values.podSecurityContext .podSecurityContext -}}
 restartPolicy: Never
 serviceAccountName: {{ include "go-cluster-backup.serviceAccountName" $root }}
+terminationGracePeriodSeconds: {{ $root.Values.terminationGracePeriodSeconds }}
 {{- with $root.Values.priorityClassName }}
 priorityClassName: {{ . }}
 {{- end }}

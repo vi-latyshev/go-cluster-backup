@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 )
 
 // TestFrameWindow pins the header parser an operator's window refusal is read
@@ -41,7 +41,7 @@ func TestLibraryRejectionsArePermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Encode accepted a window the library refuses")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("an encoder the library refuses is %q, want permanent", class)
 	}
 
@@ -50,7 +50,7 @@ func TestLibraryRejectionsArePermanent(t *testing.T) {
 	if err == nil {
 		t.Fatal("Decode accepted a ceiling the library refuses")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("a decoder the library refuses is %q, want permanent", class)
 	}
 }

@@ -17,8 +17,8 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // fakeEntry stands in for a directory entry whose file vanished between the
@@ -669,7 +669,7 @@ func TestCheckLiveLinksReportsALinkItCannotRead(t *testing.T) {
 	if err == nil {
 		t.Fatal("checkLiveLinks accepted a link it could not read")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -693,7 +693,7 @@ func TestCheckLiveLinksReportsADirectoryItCannotWalk(t *testing.T) {
 	if err == nil {
 		t.Fatal("checkLiveLinks walked through an unreadable directory")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -714,7 +714,7 @@ func TestApplyReportsARootItCannotOpen(t *testing.T) {
 	if err == nil {
 		t.Fatal("Apply accepted a root it could not open")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -729,7 +729,7 @@ func TestParentRefusalReportsALookupItCannotFinish(t *testing.T) {
 	if err == nil {
 		t.Fatal("parentRefusal accepted a parent it could not read")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
@@ -745,7 +745,7 @@ func TestExtractRefusesAHardLinkItCannotInspect(t *testing.T) {
 	if err == nil {
 		t.Fatal("extract linked a target it could not inspect")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 }
@@ -783,7 +783,7 @@ func TestProbeRefusesAnEmptyArtifact(t *testing.T) {
 	if err == nil {
 		t.Fatal("Probe accepted a zero-byte artifact")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("class = %q, want permanent (%v)", class, err)
 	}
 	if _, err := s.Probe(t.Context(), bytes.NewReader(make([]byte, 1024))); err != nil {

@@ -13,21 +13,26 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances/plugintest"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor/processortest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor/zstd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/processor"
-	"github.com/vi-latyshev/go-cluster-backup/internal/processor/processortest"
 )
 
 // levels are the four the library's EncoderLevel defines; every one is
 // selectable from this config.
 var levels = []string{"fastest", "default", "better", "best"}
 
-func testRegistry(t *testing.T) *plugin.Registry {
+func testRegistry(t *testing.T) *instances.Registry {
 	t.Helper()
-	r := plugin.NewRegistry()
-	if err := zstd.Register(r); err != nil {
+	lr := loader.New()
+	r := instances.NewRegistry()
+	if err := loader.Add(lr, zstd.Spec, func(lr *loader.Registry) error {
+		return zstd.Apply(lr, r)
+	}); err != nil {
 		t.Fatal(err)
 	}
 	return r
@@ -39,8 +44,8 @@ func build(t *testing.T, level string, window, decodeWindow, concurrency int) pr
 	if err != nil {
 		t.Fatal(err)
 	}
-	p, err := plugin.Build(context.Background(), testRegistry(t), processor.Kind, "zstd", raw,
-		plugin.Deps{Instance: "zstd", Log: slog.New(slog.DiscardHandler)})
+	p, err := instances.Build(context.Background(), testRegistry(t), processor.Kind, "zstd", raw,
+		instances.Deps{Instance: "zstd", Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +143,7 @@ func TestDecodeWindowIsIndependentOfEncodeWindow(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 64 MiB ceiling decoded a 128 MiB frame")
 	}
-	if class, _ := plugin.ClassOf(err); class != plugin.ClassPermanent {
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("window refusal is %q, want permanent", class)
 	}
 	if !strings.Contains(err.Error(), "decode_window_bytes=67108864") {
@@ -222,8 +227,8 @@ func TestBuildReturnsOnCancelledContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = plugin.Build(ctx, testRegistry(t), processor.Kind, "zstd", raw,
-		plugin.Deps{Instance: "zstd", Log: slog.New(slog.DiscardHandler)})
+	_, err = instances.Build(ctx, testRegistry(t), processor.Kind, "zstd", raw,
+		instances.Deps{Instance: "zstd", Log: slog.New(slog.DiscardHandler)})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Build with a cancelled context returned %v, want context.Canceled", err)
 	}

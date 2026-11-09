@@ -10,10 +10,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/extcmd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // ApplyOptions is restore.apply.postgres: the knobs that shape one restore.
@@ -59,7 +60,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		// fetch-only, and says so by call rather than by failing deep inside.
 		return source.ApplyReport{}, fmt.Errorf("a %s-format dump is restored with psql, which this plugin does not drive: %w", s.cfg.Format, errors.ErrUnsupported)
 	}
-	opts, err := plugin.DecodeOptions[ApplyOptions](req.Options, "restore.apply.postgres")
+	opts, err := configuration.DecodeOptions[ApplyOptions](req.Options, "restore.apply.postgres")
 	if err != nil {
 		return source.ApplyReport{}, err
 	}
@@ -67,7 +68,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		// pg_restore refuses --single-transaction together with --jobs, and an
 		// in-place restore is one transaction by contract: the combination is
 		// refused here, before a byte is read or a connection is made.
-		return source.ApplyReport{}, plugin.Permanent(fmt.Errorf("in_place with jobs %d is refused: pg_restore's --single-transaction and --jobs are mutually exclusive; set jobs to 1 or restore side_by_side", opts.Jobs))
+		return source.ApplyReport{}, pluginerrors.Permanent(fmt.Errorf("in_place with jobs %d is refused: pg_restore's --single-transaction and --jobs are mutually exclusive; set jobs to 1 or restore side_by_side", opts.Jobs))
 	}
 	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
 	if err != nil {
@@ -77,14 +78,14 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		if ctx.Err() != nil {
 			return source.ApplyReport{}, ctx.Err()
 		}
-		return source.ApplyReport{}, plugin.Transient(err)
+		return source.ApplyReport{}, pluginerrors.Transient(err)
 	}
 
 	target := s.cfg.Database
 	if req.Mode == source.ApplySideBySide {
 		target, err = sideBySideName(s.cfg.Database, req.Label)
 		if err != nil {
-			return source.ApplyReport{}, plugin.Permanent(err)
+			return source.ApplyReport{}, pluginerrors.Permanent(err)
 		}
 		if err := s.createDatabase(ctx, pass, target); err != nil {
 			return source.ApplyReport{}, err
@@ -177,7 +178,7 @@ func (s *Source) restore(ctx context.Context, pass, target string, mode source.A
 }
 
 // restoreParallel serves pg_restore --jobs, which refuses anything but a
-// regular file and opens the path itself. The engine hands an apply a
+// regular file and opens the path itself. The restore workflow hands an apply a
 // file-backed artifact (the decoded spool), so that file is passed through
 // directly: spooling it a second time would cost another multi-gigabyte copy
 // in the process temp dir, the 64 Mi emptyDir of the cluster. An artifact that
@@ -185,14 +186,14 @@ func (s *Source) restore(ctx context.Context, pass, target string, mode source.A
 func (s *Source) restoreParallel(ctx context.Context, cmd *exec.Cmd, jobs int, src io.Reader) (int64, error) {
 	f, ok := src.(*os.File)
 	if !ok {
-		return 0, plugin.Permanent(fmt.Errorf("jobs %d needs a file-backed artifact: pg_restore reads a path for a parallel restore and this one arrived as a stream (set jobs to 1 to restore from a stream)", jobs))
+		return 0, pluginerrors.Permanent(fmt.Errorf("jobs %d needs a file-backed artifact: pg_restore reads a path for a parallel restore and this one arrived as a stream (set jobs to 1 to restore from a stream)", jobs))
 	}
 	st, err := f.Stat()
 	if err != nil {
-		return 0, plugin.Transient(err)
+		return 0, pluginerrors.Transient(err)
 	}
 	if !st.Mode().IsRegular() {
-		return 0, plugin.Permanent(fmt.Errorf("jobs %d needs a regular file: %s is %s", jobs, f.Name(), st.Mode()))
+		return 0, pluginerrors.Permanent(fmt.Errorf("jobs %d needs a regular file: %s is %s", jobs, f.Name(), st.Mode()))
 	}
 	cmd.Args = append(cmd.Args, "-j", strconv.Itoa(jobs), f.Name())
 	if _, err := runCommand(ctx, cmd, nil); err != nil {

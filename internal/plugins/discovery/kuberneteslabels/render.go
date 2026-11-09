@@ -16,13 +16,13 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi"
-	"github.com/vi-latyshev/go-cluster-backup/internal/must"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
 )
 
 // state is the render context shared by every template of one config instance.
-// plugin.Decode parses a Template field at decode time with the functions
+// configuration.Decode parses a Template field at decode time with the functions
 // TemplateFuncs returns, and the decoded config is copied afterwards — so the
 // functions reach the object they resolve against through this shared pointer,
 // which TemplateFuncs allocates and New fills in.
@@ -219,15 +219,15 @@ func (s *state) fnVolumePath() (string, error) {
 	path, known := paths[o.volumeName]
 	switch {
 	case !known:
-		return "", plugin.Permanent(fmt.Errorf("%s: the cluster has no persistentvolume named %q", o.id(), o.volumeName))
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: the cluster has no persistentvolume named %q", o.id(), o.volumeName))
 	case path.claimNamespace == "" && path.claimName == "":
-		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to no claim, so it is not this claim's volume", o.id(), o.volumeName))
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to no claim, so it is not this claim's volume", o.id(), o.volumeName))
 	case path.claimNamespace != o.namespace || path.claimName != o.name:
-		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s, not to this claim", o.id(), o.volumeName, path.claimNamespace, path.claimName))
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s, not to this claim", o.id(), o.volumeName, path.claimNamespace, path.claimName))
 	case path.claimUID == "" || path.claimUID != o.uid:
-		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s with uid %q, not to this claim (uid %q): the name was reused by another claim", o.id(), o.volumeName, path.claimNamespace, path.claimName, path.claimUID, o.uid))
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s with uid %q, not to this claim (uid %q): the name was reused by another claim", o.id(), o.volumeName, path.claimNamespace, path.claimName, path.claimUID, o.uid))
 	case path.path == "":
-		return "", plugin.Permanent(fmt.Errorf("%s: persistentvolume %q holds no spec.local.path and no spec.hostPath.path, so it is not a volume on a node", o.id(), o.volumeName))
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q holds no spec.local.path and no spec.hostPath.path, so it is not a volume on a node", o.id(), o.volumeName))
 	}
 	return path.path, nil
 }
@@ -235,7 +235,7 @@ func (s *state) fnVolumePath() (string, error) {
 // volumePaths lists the cluster's PersistentVolumes once per collect, mapping
 // each name to the node path its data lives on — "" when it has none — and the
 // claim it is bound to. A failed listing is cached with its class: the objects
-// of this collect share the failure instead of each making the call the engine
+// of this collect share the failure instead of each making the call execution
 // counts as one attempt.
 func (s *state) volumePaths() (map[string]volume, error) {
 	if s.volumeListed {
@@ -394,7 +394,7 @@ func (s *state) clientFor() error {
 	client, err := kubeapi.New(s.opts)
 	if err != nil {
 		// Missing environment, an unreadable CA: config, not a transient fault.
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	s.client = client
 	return nil
@@ -421,7 +421,7 @@ func (s *state) writeSecretFile(v envValue) (string, error) {
 	path := filepath.Join(s.secretsDir, namespace, rel)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", plugin.Permanent(fmt.Errorf("prepare %s: %w", dir, err))
+		return "", pluginerrors.Permanent(fmt.Errorf("prepare %s: %w", dir, err))
 	}
 	// A directory created inside a setgid parent (the tmpfs mounted with fsGroup)
 	// inherits the setgid bit on Linux, so the mode is set explicitly: exactly
@@ -436,7 +436,7 @@ func (s *state) writeSecretFile(v envValue) (string, error) {
 		err = os.Chmod(path, 0o600)
 	}
 	if err != nil {
-		return "", plugin.Permanent(fmt.Errorf("prepare %s: %w", path, err))
+		return "", pluginerrors.Permanent(fmt.Errorf("prepare %s: %w", path, err))
 	}
 	return path, nil
 }

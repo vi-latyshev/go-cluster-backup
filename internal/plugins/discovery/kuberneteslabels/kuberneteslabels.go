@@ -40,10 +40,12 @@ import (
 
 	"encoding/json/jsontext"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/discovery"
-	"github.com/vi-latyshev/go-cluster-backup/internal/kubeapi"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
 // resourcePhases is every status.phase the two resources a rule may list can
@@ -65,7 +67,7 @@ type Config struct {
 	RequestTimeout model.Duration `json:"request_timeout" doc:"timeout of one API request"`
 	// The key is secrets_path, not secrets_dir: the framework refuses a field
 	// whose name mentions a secret unless it ends in _file or _path, a
-	// location rather than a value (plugin/plugintest.secretNamed).
+	// location rather than a value (instances/plugintest.secretNamed).
 	SecretsDir   string `json:"secrets_path" required:"true" doc:"absolute path of a directory (a tmpfs) the envFile function writes resolved secrets into, mode 0600"`
 	ListPageSize int    `json:"list_page_size" doc:"objects one API list page may carry; the client follows the continue token to every following page"`
 	// Exclude is the marker a workload's own manifest carries to keep its data
@@ -179,10 +181,10 @@ type rule struct {
 }
 
 type ArtifactConfig struct {
-	Group       plugin.Template   `json:"group" required:"true" doc:"artifact group template"`
-	Name        plugin.Template   `json:"name" required:"true" doc:"artifact name template; unique within a run"`
-	Importance  model.Importance  `json:"importance" doc:"required or best_effort"`
-	Sensitivity model.Sensitivity `json:"sensitivity" required:"true" doc:"plain or secret; secret requires a pipeline that seals"`
+	Group       configuration.Template `json:"group" required:"true" doc:"artifact group template"`
+	Name        configuration.Template `json:"name" required:"true" doc:"artifact name template; unique within a run"`
+	Importance  model.Importance       `json:"importance" doc:"required or best_effort"`
+	Sensitivity model.Sensitivity      `json:"sensitivity" required:"true" doc:"plain or secret; secret requires a pipeline that seals"`
 }
 
 // SourceConfig carries the source config as raw JSON: its strings are the
@@ -193,21 +195,10 @@ type SourceConfig struct {
 	Config jsontext.Value `json:"config" doc:"complete source config; every string value in it is a template rendered per matched object"`
 }
 
-// Register adds the kubernetes_labels discovery to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, discovery.Kind, plugin.Spec[Config, discovery.Discoverer]{
-		Type:      "kubernetes_labels",
-		Summary:   "labelled pods and persistent volume claims listed from the Kubernetes API",
-		Stability: plugin.Stable,
-		Example:   []byte(example),
-		New:       New,
-	})
-}
-
 // New builds the discoverer. It touches neither the environment nor the API:
 // those are read at preflight, so an instance can be constructed (and its
 // config validated) without a cluster.
-func New(ctx context.Context, cfg Config, deps plugin.Deps) (discovery.Discoverer, error) {
+func New(ctx context.Context, cfg Config, deps instances.Deps) (discovery.Discoverer, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -256,21 +247,30 @@ func (d *Discoverer) Discover(ctx context.Context) ([]discovery.Found, error) {
 	return d.collect(ctx)
 }
 
-// RuleSources exposes every rule's source — its type, the nested config exactly
-// as written and the routing — so offline validation can check what the strict
-// decoder sees only as opaque bytes. Templates stay unrendered: this touches no
-// cluster and evaluates nothing. The rule with undeclared true renders no source,
-// so its entry carries an empty type: what still belongs to a validation is its
-// routing.
-func (d *Discoverer) RuleSources(ctx context.Context) ([]discovery.RuleSource, error) {
-	if err := ctx.Err(); err != nil {
+// RuleSources is the pure compiled hook this plugin type registers beside its
+// factory: it reads every rule's source out of one raw config value — its type,
+// the nested config exactly as written and the routing — so defaults merge and
+// offline validation can see what the strict decoder holds only as opaque
+// bytes. It constructs nothing, performs no I/O and renders no template: the
+// strings of a nested config stay as written. The rule with undeclared true
+// renders no source, so its entry carries an empty type; what still belongs to
+// a validation is its routing.
+func RuleSources(raw jsontext.Value) ([]configuration.RuleSource, error) {
+	var cfg Config
+	if err := configuration.Decode(raw, &cfg); err != nil {
 		return nil, err
 	}
-	st := d.state
-	out := make([]discovery.RuleSource, 0, len(st.rules))
-	for i := range st.rules {
-		r := st.rules[i].rule
-		rs := discovery.RuleSource{
+	return cfg.ruleSources(), nil
+}
+
+// ruleSources maps the rules Validate prepared to the schema view, in the
+// config's own order: pods first, then claims, then the accounting entry.
+func (c *Config) ruleSources() []configuration.RuleSource {
+	rules := c.stateOrNew().rules
+	out := make([]configuration.RuleSource, 0, len(rules))
+	for i := range rules {
+		r := rules[i].rule
+		rs := configuration.RuleSource{
 			Path:        r.Path,
 			Type:        r.Source.Type,
 			Config:      r.Source.Config,
@@ -283,7 +283,7 @@ func (d *Discoverer) RuleSources(ctx context.Context) ([]discovery.RuleSource, e
 		}
 		out = append(out, rs)
 	}
-	return out, nil
+	return out
 }
 
 // collect finds every source in the order the contract promises — rules in
@@ -325,7 +325,7 @@ func (d *Discoverer) collect(ctx context.Context) ([]discovery.Found, error) {
 			// message. Objects that matched but carry a Problem count here:
 			// the count is about what the cluster labels, and a broken member
 			// still proves the label exists.
-			return nil, plugin.Permanent(fmt.Errorf("rule %q: %s with selector %q matched %d objects, want at least %d",
+			return nil, pluginerrors.Permanent(fmt.Errorf("rule %q: %s with selector %q matched %d objects, want at least %d",
 				rules[i].rule.Name, rules[i].rule.Resource, rules[i].rule.Selector, len(objects), rules[i].rule.MinMatches))
 		}
 		listings[i] = objects
@@ -401,8 +401,8 @@ func (d *Discoverer) collect(ctx context.Context) ([]discovery.Found, error) {
 // the claim (the pod itself carries the marker) or covered it (its own dump
 // carries the data). A mark with no kind is the pod failing to decide: its read
 // stumbled retryably, so the claim is reported as a retryable problem naming the
-// pod, and the earlier pass that did decide it stands (engine/discover.go merges
-// a retryable stumble back to the healthy verdict an earlier pass reached).
+// pod, and the earlier pass that did decide it stands (the retry pass merges a
+// retryable stumble back to the healthy verdict an earlier pass reached).
 //
 // group is the artifact group the exclusion is recorded under, and only a
 // covering pod has one: it is the group of that pod's own artifact, which is
@@ -536,7 +536,7 @@ func claimFound(pr *preparedRule, o object, st *state, acct *accounting) (discov
 			// The pod that mounts it stumbled retryably: the claim is not
 			// decided in this pass, and the merge restores the verdict an
 			// earlier pass reached.
-			return pr.problemFound(st, o, plugin.Transient(errors.New(mark.reason))), true
+			return pr.problemFound(st, o, pluginerrors.Transient(errors.New(mark.reason))), true
 		}
 		group := mark.group
 		if mark.kind == model.ExclusionIgnored {
@@ -711,7 +711,7 @@ func sortObjects(objects []object) []object {
 // failed cannot lose the rest. The one difference is the class: an error the
 // API client explicitly classed transient (it marks 5xx, timeouts and
 // connection failures that way) also sets Found.ProblemRetryable, which asks
-// the engine — the layer that owns the retry policy — for another Discover
+// execution — the layer that owns the retry policy — for another Discover
 // while its budget lasts; when the budget is spent this Found stands with its
 // Problem like any other.
 func (r *preparedRule) render(st *state, o object) discovery.Found {
@@ -722,7 +722,7 @@ func (r *preparedRule) render(st *state, o object) discovery.Found {
 	var problems []string
 	add := func(err error) {
 		problems = append(problems, fmt.Sprintf("%s: %v", o.id(), err))
-		if class, _ := plugin.ClassOf(err); class == plugin.ClassTransient {
+		if class, _ := pluginerrors.ClassOf(err); class == pluginerrors.ClassTransient {
 			f.ProblemRetryable = true
 		}
 	}
@@ -790,11 +790,11 @@ func (r *preparedRule) envelope(st *state, o object) (discovery.Found, []error) 
 
 // problemFound is one object's fault as one failed artifact: the envelope, the
 // message, and the retry class the error carries — a transient API failure asks
-// the engine for another Discover, a permanent one stands.
+// execution for another Discover, a permanent one stands.
 func (r *preparedRule) problemFound(st *state, o object, err error) discovery.Found {
 	f, _ := r.envelope(st, o)
 	f.Problem = err.Error()
-	if class, _ := plugin.ClassOf(err); class == plugin.ClassTransient {
+	if class, _ := pluginerrors.ClassOf(err); class == pluginerrors.ClassTransient {
 		f.ProblemRetryable = true
 	}
 	return f
@@ -837,7 +837,7 @@ func (d *Discoverer) podFound(pr *preparedRule, o object) discovery.Found {
 	return pr.render(d.state, o)
 }
 
-// Validate runs inside plugin.Decode: structure and enums offline, and every
+// Validate runs inside configuration.Decode: structure and enums offline, and every
 // template of every rule parsed — the artifact fields by the framework, the
 // strings of each source config here.
 func (c *Config) Validate() error {
@@ -849,9 +849,9 @@ func (c *Config) Validate() error {
 	if c.APIPortEnv == "" {
 		errs = append(errs, errors.New("/api_port_env is empty"))
 	}
-	errs = append(errs, plugin.AbsolutePath(c.TokenFile, "/token_file")...)
-	errs = append(errs, plugin.AbsolutePath(c.CAFile, "/ca_file")...)
-	errs = append(errs, plugin.AbsolutePath(c.SecretsDir, "/secrets_path")...)
+	errs = append(errs, configuration.AbsolutePath(c.TokenFile, "/token_file")...)
+	errs = append(errs, configuration.AbsolutePath(c.CAFile, "/ca_file")...)
+	errs = append(errs, configuration.AbsolutePath(c.SecretsDir, "/secrets_path")...)
 	if c.RequestTimeout.Std() <= 0 {
 		errs = append(errs, fmt.Errorf("/request_timeout must be positive, got %s", c.RequestTimeout))
 	}

@@ -25,11 +25,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vi-latyshev/go-cluster-backup/internal/extcmd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/model"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugin"
-	"github.com/vi-latyshev/go-cluster-backup/internal/source"
-	"github.com/vi-latyshev/go-cluster-backup/internal/sqlitecopy"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/sqlitecopy"
 )
 
 // IntegrityCheck names the `PRAGMA integrity_check` depth the copy is held to.
@@ -49,10 +52,10 @@ type Config struct {
 	// database just to read it.
 	Datastore string `json:"datastore" required:"true" doc:"path of the k3s sqlite datastore, e.g. /k3s-db/state.db"`
 	// Token is the k3s server token as a mounted secret file: the framework's
-	// rule types a secret-named field as plugin.Secret, and this one is
+	// rule types a secret-named field as configuration.Secret, and this one is
 	// exactly that — a reference to a file, never a literal value. The token
 	// is copied into the tar stream straight from the mount, never to a file.
-	Token plugin.Secret `json:"token" doc:"the k3s server token, as a mounted secret file reference"`
+	Token configuration.Secret `json:"token" doc:"the k3s server token, as a mounted secret file reference"`
 	// ScratchDir is the directory this source works in — a tmpfs emptyDir in
 	// the cluster. Only the working directory created inside it holds
 	// plaintext; the scratch directory's own mode is not judged, because
@@ -68,7 +71,7 @@ type Config struct {
 }
 
 // Config implements plugin.Validator through Validate.
-var _ plugin.Validator = Config{}
+var _ configuration.Validator = Config{}
 
 func (c Config) Validate() error {
 	if c.Datastore == "" {
@@ -103,29 +106,6 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// Register adds the k3s_state source to a registry.
-func Register(r *plugin.Registry) error {
-	return plugin.Register(r, source.Kind, plugin.Spec[Config, source.Source]{
-		Type:      "k3s_state",
-		Summary:   "k3s sqlite datastore + server token as one tar stream, with a configurable integrity check",
-		Stability: plugin.Stable,
-		Requires:  []string{"sqlite3"},
-		Example: []byte(`{"datastore": "/k3s-db/state.db", "token": {"file": "/k3s-token"}, ` +
-			`"scratch_dir": "/plain", "busy_timeout": "10s", "integrity_check": "quick", "timeout": "5m"}`),
-		New: func(ctx context.Context, cfg Config, _ plugin.Deps) (source.Source, error) {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			// cfg is already validated: Decode runs Config.Validate when its own
-			// walk is clean, and this constructor is only reached through it.
-			// No filesystem access here: the conformance kit constructs every
-			// plugin from its example, and the mounts exist only in the init
-			// container. Check verifies them at preflight; Dump fails loudly.
-			return &Source{cfg: cfg, sqlite3: "sqlite3"}, nil
-		},
-	})
-}
-
 // The filesystem primitives this package drives. Each is a variable so a test
 // can make it fail: no filesystem fails them on demand, and a branch no test
 // reaches is a branch nobody has run.
@@ -141,7 +121,7 @@ type Source struct {
 	sqlite3 string
 }
 
-var _ plugin.Checker = (*Source)(nil)
+var _ instances.Checker = (*Source)(nil)
 
 // Check is the preflight, and it asserts only what it can know from here: the
 // scratch directory exists and this process can write in it, the datastore and
@@ -154,7 +134,7 @@ func (s *Source) Check(ctx context.Context) error {
 		return err
 	}
 	if err := extcmd.CheckScratchDir(s.cfg.ScratchDir); err != nil {
-		return plugin.Permanent(err)
+		return pluginerrors.Permanent(err)
 	}
 	for _, field := range []struct {
 		name string
@@ -162,10 +142,10 @@ func (s *Source) Check(ctx context.Context) error {
 	}{{"datastore", s.cfg.Datastore}, {"token", s.cfg.Token.File}} {
 		f, err := os.Open(field.path)
 		if err != nil {
-			return plugin.Permanent(fmt.Errorf("%s: %w", field.name, err))
+			return pluginerrors.Permanent(fmt.Errorf("%s: %w", field.name, err))
 		}
 		if err := closeFile(f); err != nil {
-			return plugin.Permanent(fmt.Errorf("%s: %w", field.name, err))
+			return pluginerrors.Permanent(fmt.Errorf("%s: %w", field.name, err))
 		}
 	}
 	if _, err := extcmd.FindBinary(s.sqlite3); err != nil {
@@ -248,7 +228,7 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) (err error) {
 // file, with no -wal or -shm beside it.
 func (s *Source) copyDatastore(ctx context.Context, work, copyPath string) error {
 	if _, err := os.Stat(s.cfg.Datastore); err != nil {
-		return plugin.Permanent(fmt.Errorf("datastore: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("datastore: %w", err))
 	}
 	_, err := s.runSQLite(ctx, work, sqlitecopy.BackupArgs(s.cfg.Datastore, copyPath, s.cfg.BusyTimeout.Std())...)
 	if err != nil {
@@ -272,7 +252,7 @@ func (s *Source) checkIntegrity(ctx context.Context, work, copyPath string) erro
 		return fmt.Errorf("integrity check on the copy: %w", err)
 	}
 	if strings.TrimSpace(out) != "ok" {
-		return plugin.Permanent(fmt.Errorf("the datastore copy failed %s: %s", s.cfg.IntegrityCheck, strings.TrimSpace(out)))
+		return pluginerrors.Permanent(fmt.Errorf("the datastore copy failed %s: %s", s.cfg.IntegrityCheck, strings.TrimSpace(out)))
 	}
 	return nil
 }
@@ -283,7 +263,7 @@ func (s *Source) checkIntegrity(ctx context.Context, work, copyPath string) erro
 func (s *Source) pack(ctx context.Context, dst io.Writer, copyPath string) error {
 	token, err := os.ReadFile(s.cfg.Token.File)
 	if err != nil {
-		return plugin.Permanent(fmt.Errorf("token: %w", err))
+		return pluginerrors.Permanent(fmt.Errorf("token: %w", err))
 	}
 	info, err := os.Stat(copyPath)
 	if err != nil {
@@ -322,7 +302,7 @@ func (s *Source) pack(ctx context.Context, dst io.Writer, copyPath string) error
 		if err != nil {
 			return fmt.Errorf("open of the datastore copy: %w", err)
 		}
-		_, copyErr := plugin.CopyContext(ctx, tw, f)
+		_, copyErr := pluginio.CopyContext(ctx, tw, f)
 		closeErr := closeFile(f)
 		if copyErr != nil {
 			return fmt.Errorf("tar body %s: %w", entry.name, copyErr)

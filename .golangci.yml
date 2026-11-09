@@ -13,7 +13,19 @@ linters:
     # directive that ever slipped past the grep would still have to be specific
     # and carry an explanation.
     - nolintlint
+    # The loader is the empty container: registration, kinds, services, roles,
+    # selection and lifecycle over the standard library only. It must not reach
+    # into a plugin, which would make the kernel know a feature.
+    - depguard
   settings:
+    depguard:
+      rules:
+        loader-stdlib-only:
+          files:
+            - "**/internal/loader/**"
+            - "!$test"
+          allow:
+            - $gostd
     nolintlint:
       allow-unused: false
       require-specific: true

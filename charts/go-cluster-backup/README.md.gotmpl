@@ -18,7 +18,7 @@
 | CronJob | `<fullname>-manual` | never scheduled; start one Job from it by hand |
 | CronJob | `<fullname>-restore` | never scheduled; its args come from `restore.args` |
 | ConfigMap | `<fullname>-config` | the configuration, mounted at `/etc/go-cluster-backup/config.yaml` |
-| ConfigMap | `catalog.name` (default `<fullname>-catalog`) | the run index the tool writes; no `data`, annotated `helm.sh/resource-policy: keep` |
+| ConfigMap | `catalog.name` (default `<fullname>-catalog`) | the writer lease the tool writes; no `data`, annotated `helm.sh/resource-policy: keep` |
 | ServiceAccount | `<fullname>` | |
 | ClusterRole + binding | `<fullname>` | `list` on pods, PVCs and PVs |
 | Role + binding | `<fullname>` | `get`/`list` on pods and Jobs, `list` on Events, in the release namespace (lease liveness and the previous-run report) |
@@ -52,9 +52,12 @@ names, because the catalog ConfigMap is created in the release namespace.
 
 A pre-install/pre-upgrade hook Job runs `go-cluster-backup validate` against the
 new configuration before anything else is applied. It is offline — a secret
-reference is resolved, never read — so it needs no secret mount. When it fails,
-the install or upgrade aborts, and with Flux's `upgrade.remediation.strategy:
-rollback` the previous release stays in place.
+reference is resolved, never read — so it needs no secret mount. The chart sets
+`terminationGracePeriodSeconds: 360` by default and passes the same literal as
+`validate --termination-grace-seconds` to check the effective cleanup budget.
+Raise chart grace when raising lifecycle budgets; the gate rejects a value below
+the computed bound. When validation fails, install or upgrade aborts; with Flux's
+`upgrade.remediation.strategy: rollback` the previous release stays in place.
 
 ### Upgrading: the image and the configuration move together
 
