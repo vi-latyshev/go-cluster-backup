@@ -207,21 +207,17 @@ func renderComponents(module string, plugins []*plugin) ([]byte, error) {
 	instancesImport := module + "/internal/plugins/instances"
 	// The registry package is a library plugin like any other; this file already
 	// imports it, so its own name is the one exception to the reserved set.
-	names := make(map[string]string, len(components))
+	named := make([]*plugin, 0, len(components))
 	for _, p := range components {
 		if !importableFrom(module+"/"+componentsPath, p.path) {
 			return nil, fmt.Errorf("plugin %s is inside a Go internal boundary", p.path)
 		}
-		if p.path == instancesImport {
-			continue
+		if p.path != instancesImport {
+			named = append(named, p)
 		}
-		if p.name == "loader" || p.name == "instances" {
-			return nil, fmt.Errorf("plugin %s uses the reserved package name %q", p.path, p.name)
-		}
-		if other, duplicate := names[p.name]; duplicate {
-			return nil, fmt.Errorf("plugins %s and %s share the package name %q", other, p.path, p.name)
-		}
-		names[p.name] = p.path
+	}
+	if err := checkNames(named, map[string]bool{"loader": true, "instances": true}); err != nil {
+		return nil, err
 	}
 
 	var b bytes.Buffer
@@ -231,16 +227,11 @@ func renderComponents(module string, plugins []*plugin) ([]byte, error) {
 	b.WriteString("// no host, so a host's own white-box tests build this half and add the host\n")
 	b.WriteString("// themselves.\n")
 	b.WriteString("package components\n\n")
-	imports := []string{module + "/internal/loader", instancesImport}
-	seen := map[string]bool{module + "/internal/loader": true, instancesImport: true}
+	paths := []string{module + "/internal/loader", instancesImport}
 	for _, p := range components {
-		if seen[p.path] {
-			continue
-		}
-		seen[p.path] = true
-		imports = append(imports, p.path)
+		paths = append(paths, p.path)
 	}
-	writeImports(&b, imports)
+	writeImports(&b, paths)
 	b.WriteString("// Compose installs every compiled non-host plugin: the generated import graph,\n")
 	b.WriteString("// then one loader.Add per plugin. A factory backend also contributes to\n")
 	b.WriteString("// factories.\n")

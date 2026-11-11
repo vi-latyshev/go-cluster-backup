@@ -4,8 +4,10 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,16 +21,8 @@ const fixtureModule = "example.test/app"
 // generated composition root that ties them together.
 func healthyTree() map[string]string {
 	return map[string]string{
-		"go.mod": "module " + fixtureModule + "\n\ngo 1.27.3\n",
-		"internal/loader/loader.go": `package loader
-
-import "errors"
-
-// ErrSomething is a loader-owned error.
-var ErrSomething = errors.New("loader: something")
-
-const separator = "/"
-`,
+		"go.mod":                    "module " + fixtureModule + "\n\ngo 1.27.4\n",
+		"internal/loader/loader.go": loaderStub,
 		"internal/plugins/thing/thing.go": `package thing
 
 import "example.test/app/internal/plugins/instances"
@@ -162,7 +156,74 @@ func writeTree(t *testing.T, files map[string]string) string {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
+	if _, ok := files["go.mod"]; ok {
+		addStubModules(t, root, files)
+	}
 	return root
+}
+
+// stubSources are the canonical boundary packages a synthetic fixture imports
+// but rarely carries, keyed by module-relative dir. The type model resolves
+// each one like any module: addStubModules writes it as a separate module
+// required and replaced by directory.
+var stubSources = map[string]string{
+	"internal/loader":                loaderStub,
+	"internal/plugins/instances":     instancesStub,
+	"internal/plugins/protection":    protectionStub,
+	"internal/plugins/storage/guard": guardStub,
+	"internal/plugins/storage":       storageStub,
+	"internal/plugins/library":       libraryStub,
+}
+
+// addStubModules supplies each canonical boundary package a fixture imports but
+// does not carry as its own package, as a separate module required and replaced
+// by directory. No production code resolves a boundary package any other way.
+func addStubModules(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	stubs := t.TempDir()
+	var mod strings.Builder
+	for _, dir := range slices.Sorted(maps.Keys(stubSources)) {
+		importPath := fixtureModule + "/" + dir
+		provided, imported := false, false
+		for name, content := range files {
+			if strings.HasPrefix(name, dir+"/") && !strings.Contains(strings.TrimPrefix(name, dir+"/"), "/") {
+				provided = true
+			}
+			if strings.Contains(content, `"`+importPath+`"`) {
+				imported = true
+			}
+		}
+		if provided || !imported {
+			continue
+		}
+		source := stubSources[dir]
+		target := filepath.Join(stubs, filepath.FromSlash(dir))
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			t.Fatalf("create stub module %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(target, "go.mod"), []byte("module "+importPath+"\n\ngo 1.27.4\n"), 0o644); err != nil {
+			t.Fatalf("write stub module %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(target, "stub.go"), []byte(source), 0o644); err != nil {
+			t.Fatalf("write stub source %s: %v", dir, err)
+		}
+		mod.WriteString("require " + importPath + " v0.0.0\nreplace " + importPath + " => " + target + "\n")
+	}
+	if mod.Len() == 0 {
+		return
+	}
+	file, err := os.OpenFile(filepath.Join(root, "go.mod"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("append stub modules: %v", err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Fatalf("close go.mod: %v", err)
+		}
+	}()
+	if _, err := file.WriteString("\n" + mod.String()); err != nil {
+		t.Fatalf("append stub modules: %v", err)
+	}
 }
 
 // moduleTree is writeTree with the module file every fixture needs.
@@ -173,7 +234,7 @@ func moduleTree(t *testing.T, files map[string]string) string {
 		all[name] = content
 	}
 	if _, ok := all["go.mod"]; !ok {
-		all["go.mod"] = "module " + fixtureModule + "\n\ngo 1.27.3\n"
+		all["go.mod"] = "module " + fixtureModule + "\n\ngo 1.27.4\n"
 	}
 	return writeTree(t, all)
 }
@@ -258,3 +319,158 @@ func parseFile(t *testing.T, source string) *ast.File {
 	}
 	return file
 }
+
+// fixtureChecker type-checks one fixture tree for the first checked platform.
+// The errors are collected, not asserted: rule-level tests call the rule
+// functions directly on fixtures that are deliberately incorrect in type.
+func fixtureChecker(t *testing.T, tree *pluginmeta.Tree) *typeChecker {
+	t.Helper()
+	paths := make([]string, 0, len(tree.Packages))
+	for _, p := range tree.Packages {
+		paths = append(paths, p.Path)
+	}
+	listed, err := listPackages(tree.Root, platforms[0], paths)
+	if err != nil {
+		t.Fatalf("list packages: %v", err)
+	}
+	var errs []string
+	return newTypeChecker(tree, platforms[0], listed, &errs)
+}
+
+// Boundary stub sources: the packages a synthetic fixture imports but rarely
+// carries. They model exactly the declarations the fixtures use and import
+// nothing, so a fixture module stays self-contained. addStubModules installs
+// each one as a replaced module, so the production resolver never sees a stub.
+const (
+	loaderStub = `package loader
+
+import "errors"
+
+// ErrSomething is a loader-owned error.
+var ErrSomething = errors.New("loader: something")
+
+const separator = "/"
+
+type Imports map[string][]string
+
+type Spec struct {
+	ID, Summary string
+	Floor       bool
+	Requires    []string
+	After       []string
+}
+
+type Registry struct{}
+
+type Session struct{}
+
+type RoleSpec struct {
+	Name       string
+	Default    bool
+	Diagnostic bool
+	Run        func(Session) int
+	Disabled   func(Session) int
+}
+
+func Add(*Registry, Spec, func(*Registry) error) error { return nil }
+
+func SetImports(*Registry, Imports) error { return nil }
+
+func Role(*Registry, RoleSpec) error { return nil }
+
+type KindOptions[T any] struct {
+	Unique, Schema bool
+	Validate       func([]T) error
+}
+
+type Kind[T any] struct{}
+
+func NewKind[T any](string, KindOptions[T]) Kind[T] { var k Kind[T]; return k }
+
+type Service[T any] struct{}
+
+func NewService[T any](string) Service[T] { var s Service[T]; return s }
+`
+
+	instancesStub = `package instances
+
+type Registry struct{}
+
+func NewRegistry() *Registry { return &Registry{} }
+
+func ID(kind, typ string) string { return kind + "/" + typ }
+
+type Kind[T any] struct{}
+
+func (Kind[T]) Name() string { return "" }
+
+func NewKind[T any](string) Kind[T] { var k Kind[T]; return k }
+
+func RegisterProvider[T any](*Registry, string) error { return nil }
+`
+
+	protectionStub = `package protection
+
+type Ledger struct{}
+
+type LedgerOptions struct{}
+
+func NewLedger(LedgerOptions) *Ledger { return nil }
+
+func (*Ledger) Authorize(any) any { return nil }
+
+type Accounting interface {
+	Admit(string, string, int64, bool) bool
+	Shrink(string, string, int64)
+	Commit(string, string, int64)
+	Unreserve(string, string)
+}
+`
+
+	guardStub = `package guard
+
+type Authority struct{}
+
+type Port struct{}
+
+type Handle struct{}
+
+func (Port) Open(*Authority) (Handle, error) { return Handle{}, nil }
+
+type Remover struct{}
+
+func (Remover) Delete(any, string) error { return nil }
+
+type Destination struct{}
+
+func (Destination) Remover() Remover { return Remover{} }
+
+func Build(...any) (Destination, error) { var d Destination; return d, nil }
+
+func NewAuthority(any) *Authority { return nil }
+
+func Read(...any) Port { return Port{} }
+`
+
+	storageStub = `package storage
+
+type BuildInput struct{ CallParallelism int }
+
+type Storage interface{}
+
+func Build(...any) (Storage, error) { return nil, nil }
+
+func Register(...any) error { return nil }
+
+func AddFactory(...any) error { return nil }
+`
+
+	libraryStub = `package library
+
+const RoleExtra = "extra"
+
+var Spec struct{}
+
+func Authorize() {}
+`
+)

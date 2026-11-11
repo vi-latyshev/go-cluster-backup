@@ -1,6 +1,7 @@
 package human
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -125,9 +126,8 @@ func TestRenderTable(t *testing.T) {
 			"✗ describing the storage: boom"},
 		{"storage.check.failed", New("storage.check.failed", Text("reason", "boom")),
 			"✗ the preflight check failed: boom"},
-		{"catalog.saved", New("catalog.saved", Text("run", "r1")), "saved run r1"},
 		{"catalog.failed", New("catalog.failed", Text("run", "r1"), Text("reason", "boom")),
-			"✗ saving run r1: boom"},
+			"✗ the catalog preflight check failed: boom"},
 		{"notify.sent", New("notify.sent", Text("event", "finished")), "✓ sent finished"},
 		{"notify.failed", New("notify.failed", Text("event", "finished"), Text("reason", "boom")),
 			"✗ finished: boom"},
@@ -149,11 +149,24 @@ func TestRenderTable(t *testing.T) {
 	}
 }
 
+// TestRenderCatalogFailureNeverPromisesASave: the catalog holds only the writer
+// lease and run history is gone, so a catalog failure names the preflight, never
+// a save the service no longer performs.
+func TestRenderCatalogFailureNeverPromisesASave(t *testing.T) {
+	line := Render("", New("catalog.failed", Text("run", "r1"), Text("reason", "boom")), false)
+	if !strings.Contains(line, "catalog preflight check failed") {
+		t.Fatalf("Render = %q, want the catalog preflight failure", line)
+	}
+	if strings.Contains(line, "saving run") || strings.Contains(line, "saved run") {
+		t.Fatalf("Render = %q still promises a catalog save", line)
+	}
+}
+
 // TestRenderPrefixesAnInstance: the same event under an instance's own logger
 // reads as that instance's line.
 func TestRenderPrefixesAnInstance(t *testing.T) {
-	ev := New("catalog.saved", Text("run", "r1"))
-	if got, want := Render("catalog kubernetes_configmap/main", ev, false), "catalog kubernetes_configmap/main: saved run r1"; got != want {
+	ev := New("catalog.failed", Text("run", "r1"), Text("reason", "boom"))
+	if got, want := Render("catalog kubernetes_configmap/main", ev, false), "catalog kubernetes_configmap/main: ✗ the catalog preflight check failed: boom"; got != want {
 		t.Errorf("Render = %q, want %q", got, want)
 	}
 }
@@ -161,12 +174,12 @@ func TestRenderPrefixesAnInstance(t *testing.T) {
 // TestRenderAppendsMachineDetailAtDebug: an object key and a digest stay out of
 // the default line and appear behind --log-level debug, appended in braces.
 func TestRenderAppendsMachineDetailAtDebug(t *testing.T) {
-	ev := New("catalog.saved", Text("run", "r1"), ObjectKey("key", "runs/r1/manifest.json"), Digest("sha256", "abc"))
-	if got, want := Render("", ev, false), "saved run r1"; got != want {
+	ev := New("notify.sent", Text("event", "finished"), ObjectKey("key", "runs/r1/manifest.json"), Digest("sha256", "abc"))
+	if got, want := Render("", ev, false), "✓ sent finished"; got != want {
 		t.Errorf("info line = %q, want %q", got, want)
 	}
 	got := Render("", ev, true)
-	want := "saved run r1  {key=runs/r1/manifest.json, sha256=abc}"
+	want := "✓ sent finished  {key=runs/r1/manifest.json, sha256=abc}"
 	if got != want {
 		t.Errorf("debug line = %q, want %q", got, want)
 	}

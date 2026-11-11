@@ -19,7 +19,7 @@ import (
 // its golden composition root from it, tools/rules checks its rules against it.
 const corpus = "testdata/corpus"
 
-const moduleGoMod = "module example.test/app\n\ngo 1.27.3\n"
+const moduleGoMod = "module example.test/app\n\ngo 1.27.4\n"
 
 // writeTree materialises one module fixture in a temp directory.
 func writeTree(t *testing.T, files map[string]string) string {
@@ -248,7 +248,7 @@ func TestModulePath(t *testing.T) {
 	}
 	_, err = ModulePath(writeTree(t, nil))
 	wantSubstring(t, err.Error(), "read go.mod")
-	_, err = ModulePath(writeTree(t, map[string]string{"go.mod": "go 1.27.3\n"}))
+	_, err = ModulePath(writeTree(t, map[string]string{"go.mod": "go 1.27.4\n"}))
 	wantSubstring(t, err.Error(), "no module directive")
 	_, err = ModulePath(writeTree(t, map[string]string{"go.mod": "module \"\"\n"}))
 	wantSubstring(t, err.Error(), "no module directive")

@@ -30,6 +30,27 @@ func TestRunExitCodes(t *testing.T) {
 			t.Fatalf("stderr = %q", stderr.String())
 		}
 	})
+	t.Run("type model incomplete", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-root", writeTree(t, checkedTree(map[string]string{
+			"internal/plugins/library/undefined.go": "package library\n\nvar broken = undefinedName\n",
+		}))}, &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "the type model is incomplete") ||
+			!strings.Contains(stderr.String(), "undefined: undefinedName") {
+			t.Fatalf("code %d, stderr %q", code, stderr.String())
+		}
+		if strings.Contains(stdout.String(), "all checks passed") {
+			t.Fatalf("stdout = %q", stdout.String())
+		}
+	})
+	t.Run("no go on PATH", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"-root", writeTree(t, healthyTree())}, &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), "go list (linux/amd64)") {
+			t.Fatalf("code %d, stderr %q", code, stderr.String())
+		}
+	})
 	t.Run("scan failure", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		code := run([]string{"-root", t.TempDir()}, &stdout, &stderr)

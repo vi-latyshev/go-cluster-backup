@@ -38,6 +38,11 @@ type repo struct {
 	// authority caches the one go/types pass both mutation rules share.
 	authority          []string
 	checkedAuthorities bool
+
+	// modelErrors are the gaps in the type model: an unresolved import, a type
+	// error, a failed go list or a production file no checked platform builds.
+	// check refuses a tree with any of them.
+	modelErrors []string
 }
 
 // scan reads the module's metadata through the one shared reader. Test files
@@ -393,19 +398,35 @@ func (r *repo) line(node ast.Node) int {
 
 // inspectDecls walks the declarations of one file, skipping imports and struct
 // tags: an import string is a package path, and a tag is data, so neither can be
-// a feature name the rules judge.
+// a feature name the rules judge. The walk never rewrites the AST: the go/types
+// pass reads the same nodes, and a stripped tag would turn two distinct struct
+// types into identical ones and reject a valid assignment of a tagged literal.
 func inspectDecls(f *pluginmeta.File, visit func(ast.Node) bool) {
+	tags := tagNodes(f.AST)
 	for _, decl := range f.AST.Decls {
 		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
 			continue
 		}
 		ast.Inspect(decl, func(node ast.Node) bool {
-			if field, ok := node.(*ast.Field); ok {
-				field.Tag = nil
+			if tags[node] {
+				return false
 			}
 			return visit(node)
 		})
 	}
+}
+
+// tagNodes is the set of struct-tag nodes in one file, so the declaration walk
+// skips them without mutating the shared AST.
+func tagNodes(file *ast.File) map[ast.Node]bool {
+	tags := map[ast.Node]bool{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		if field, ok := node.(*ast.Field); ok && field.Tag != nil {
+			tags[field.Tag] = true
+		}
+		return true
+	})
+	return tags
 }
 
 // unwrapGenerics peels the type-argument brackets off an instantiated function

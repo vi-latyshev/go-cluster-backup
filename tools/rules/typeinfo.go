@@ -1,11 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -19,27 +28,101 @@ type packageTypes struct {
 	info *types.Info
 }
 
-// typeChecker type-checks the scanned tree with a fake importer: an in-module
-// import resolves from the scanned sources, a GOROOT import from the standard
-// library source, and the fixture boundary packages that synthetic modules omit
-// from canonical stub source. Packages that fail to resolve keep whatever the
-// checker learned; the rule never falls back to a hand-written type model.
-type typeChecker struct {
-	tree   *pluginmeta.Tree
-	fset   *token.FileSet
-	stubs  map[string]*types.Package
-	byPath map[string]*packageTypes
-	active map[string]bool
+// platform is one GOOS/GOARCH build the type pass models. The list is the two
+// shipped architectures and the development host; a file that no listed
+// platform builds is a model gap, not a silently skipped file.
+type platform struct{ goos, goarch string }
+
+func (p platform) String() string { return p.goos + "/" + p.goarch }
+
+// platforms are the builds the type pass models.
+var platforms = []platform{
+	{"linux", "amd64"},
+	{"linux", "arm64"},
+	{"darwin", "arm64"},
 }
 
-// newTypeChecker builds a checker over one scanned tree.
-func newTypeChecker(tree *pluginmeta.Tree) *typeChecker {
+// platformList renders the checked platforms for a diagnostic.
+func platformList() string {
+	names := make([]string, 0, len(platforms))
+	for _, pl := range platforms {
+		names = append(names, pl.String())
+	}
+	return strings.Join(names, ", ")
+}
+
+// listedPackage is the part of one `go list -json` entry the type pass reads.
+type listedPackage struct {
+	ImportPath, Dir string
+	GoFiles         []string
+	ImportMap       map[string]string
+	Standard        bool
+	Error           *struct{ Err string }
+}
+
+// goList runs the go command. It is the tool's only exec: the standard library
+// and every module dependency resolve through the go on PATH, never through
+// this binary's own GOROOT, which -trimpath leaves empty. A test overrides it
+// to prove the decode failure.
+var goList = func(dir string, env []string, args ...string) ([]byte, error) {
+	command := exec.Command("go", args...)
+	command.Dir = dir
+	command.Env = append(os.Environ(), env...)
+	return command.Output()
+}
+
+// listPackages lists the dependency closure of paths for one platform. Every
+// import the tree makes resolves from this one listing: the standard library,
+// third-party modules from the module cache, replace-directory modules and
+// in-module packages outside the scanned tree.
+func listPackages(root string, pl platform, paths []string) (map[string]*listedPackage, error) {
+	args := append([]string{
+		"list", "-e", "-deps", "-json=ImportPath,Dir,GoFiles,ImportMap,Standard,Error", "--",
+	}, paths...)
+	out, err := goList(root, []string{"GOOS=" + pl.goos, "GOARCH=" + pl.goarch, "CGO_ENABLED=0"}, args...)
+	if err != nil {
+		return nil, fmt.Errorf("go list (%s): %w", pl, err)
+	}
+	listed := map[string]*listedPackage{}
+	for decoder := json.NewDecoder(bytes.NewReader(out)); ; {
+		var entry listedPackage
+		err := decoder.Decode(&entry)
+		if errors.Is(err, io.EOF) {
+			return listed, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("go list (%s): %w", pl, err)
+		}
+		listed[entry.ImportPath] = &entry
+	}
+}
+
+// typeChecker type-checks the scanned tree for one platform. Every import takes
+// exactly one path: a tree package from the tree's parsed sources, anything
+// else from the go list closure. There is no stub or fake fallback: an import
+// the closure cannot supply is reported to errs, and check refuses the run.
+type typeChecker struct {
+	tree     *pluginmeta.Tree
+	fset     *token.FileSet
+	pl       platform
+	listed   map[string]*listedPackage
+	byPath   map[string]*packageTypes
+	external map[string]*types.Package
+	active   map[string]bool
+	errs     *[]string
+}
+
+// newTypeChecker builds a checker over one listed platform closure.
+func newTypeChecker(tree *pluginmeta.Tree, pl platform, listed map[string]*listedPackage, errs *[]string) *typeChecker {
 	return &typeChecker{
-		tree:   tree,
-		fset:   tree.FileSet,
-		stubs:  map[string]*types.Package{},
-		byPath: map[string]*packageTypes{},
-		active: map[string]bool{},
+		tree:     tree,
+		fset:     tree.FileSet,
+		pl:       pl,
+		listed:   listed,
+		byPath:   map[string]*packageTypes{},
+		external: map[string]*types.Package{},
+		active:   map[string]bool{},
+		errs:     errs,
 	}
 }
 
@@ -50,7 +133,40 @@ var checkPackage = func(config *types.Config, path string, fset *token.FileSet, 
 	return config.Check(path, fset, files, info)
 }
 
+// config builds the checker's type configuration. Every type error is
+// collected: the rule functions still judge the partial model they can see
+// (unit tests call them on deliberately incorrect fixtures), while check()
+// refuses a tree whose model has any error.
+func (c *typeChecker) config() *types.Config {
+	return &types.Config{
+		Importer: c,
+		Sizes:    types.SizesFor("gc", c.pl.goarch),
+		Error: func(err error) {
+			*c.errs = append(*c.errs, c.pl.String()+": "+err.Error())
+		},
+	}
+}
+
+// selected returns the files of p this platform builds, as go list named them.
+func (c *typeChecker) selected(p *pluginmeta.Package) []*pluginmeta.File {
+	listed := c.listed[p.Path]
+	if listed == nil {
+		return nil
+	}
+	var out []*pluginmeta.File
+	for _, f := range p.Files {
+		if slices.Contains(listed.GoFiles, path.Base(f.Rel)) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // typesFor returns the checked view of one package, checking it on first use.
+// A go list load error on a package that has files to check is a model gap:
+// the partial view is still built for the rule functions, but check refuses
+// the run. A package no listed platform builds is not a gap here — its files
+// are judged by the completeness check instead.
 func (c *typeChecker) typesFor(p *pluginmeta.Package) *packageTypes {
 	if checked, ok := c.byPath[p.Path]; ok {
 		return checked
@@ -64,12 +180,15 @@ func (c *typeChecker) typesFor(p *pluginmeta.Package) *packageTypes {
 	placeholder := &packageTypes{pkg: types.NewPackage(p.Path, p.Name), info: info}
 	c.byPath[p.Path] = placeholder
 	c.active[p.Path] = true
-	files := make([]*ast.File, 0, len(p.Files))
-	for _, f := range p.Files {
+	selected := c.selected(p)
+	if listed := c.listed[p.Path]; listed != nil && listed.Error != nil && len(selected) > 0 {
+		*c.errs = append(*c.errs, fmt.Sprintf("%s: %s: %s", c.pl, p.Path, listed.Error.Err))
+	}
+	files := make([]*ast.File, 0, len(selected))
+	for _, f := range selected {
 		files = append(files, f.AST)
 	}
-	config := types.Config{Importer: c, Error: func(error) {}}
-	checked, _ := checkPackage(&config, p.Path, c.fset, files, info)
+	checked, _ := checkPackage(c.config(), p.Path, c.fset, files, info)
 	delete(c.active, p.Path)
 	if checked == nil {
 		return placeholder
@@ -78,207 +197,107 @@ func (c *typeChecker) typesFor(p *pluginmeta.Package) *packageTypes {
 	return placeholder
 }
 
-// Import satisfies types.Importer for the checker's own configuration.
-func (c *typeChecker) Import(path string) (*types.Package, error) {
-	if p, ok := c.tree.ByPath[path]; ok {
+// Import satisfies types.Importer for the checker's own configuration. A tree
+// package that is still being checked is an import cycle: Go has no cyclic
+// imports, so the model is incomplete and the error reaches the error sink.
+func (c *typeChecker) Import(importPath string) (*types.Package, error) {
+	if p, ok := c.tree.ByPath[importPath]; ok {
+		if c.active[p.Path] {
+			return nil, fmt.Errorf("%s: import cycle", importPath)
+		}
 		return c.typesFor(p).pkg, nil
 	}
-	if source, ok := stubSource(path); ok {
-		return c.stub(path, source)
-	}
-	return importStdlib(path)
+	return c.importListed(importPath)
 }
 
-// stub type-checks one canonical boundary package that a synthetic fixture does
-// not carry itself.
-func (c *typeChecker) stub(path, source string) (*types.Package, error) {
-	if checked, ok := c.stubs[path]; ok {
-		return checked, nil
-	}
-	file, err := parser.ParseFile(c.fset, "stub:"+path, source, parser.SkipObjectResolution)
-	if err != nil {
-		return nil, err
-	}
-	config := types.Config{Importer: c, Error: func(error) {}}
-	checked, _ := checkPackage(&config, path, c.fset, []*ast.File{file}, nil)
-	if checked == nil {
-		checked = types.NewPackage(path, "")
-	}
-	c.stubs[path] = checked
-	return checked, nil
+// stdlib caches the standard packages per platform so every fixture shares one
+// type universe per platform instead of re-checking the library per module.
+// The mutex guards the map only: checking a package recurses through Import,
+// so holding it across a check would deadlock.
+var stdlib = &stdlibCache{
+	pkgs: map[platform]map[string]*types.Package{},
+	fset: token.NewFileSet(),
 }
 
-// stdlib is the process-wide source importer for GOROOT packages. Compiling the
-// standard library from source once per test binary keeps every fixture module
-// loadable without a shared build cache.
-var stdlib = struct {
+// stdlibCache is the process-wide standard library cache.
+type stdlibCache struct {
 	mu   sync.Mutex
-	imp  types.Importer
-	seen map[string]*types.Package
-}{
-	imp:  importer.ForCompiler(token.NewFileSet(), "source", nil),
-	seen: map[string]*types.Package{},
+	pkgs map[platform]map[string]*types.Package
+	fset *token.FileSet
 }
 
-// importStdlib imports one GOROOT package through the shared source importer.
-func importStdlib(path string) (*types.Package, error) {
-	stdlib.mu.Lock()
-	defer stdlib.mu.Unlock()
-	if checked, ok := stdlib.seen[path]; ok {
+// get returns one cached standard package.
+func (s *stdlibCache) get(pl platform, importPath string) (*types.Package, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	checked, ok := s.pkgs[pl][importPath]
+	return checked, ok
+}
+
+// put stores one checked standard package, or returns the one a concurrent
+// check stored first, so every importer of a package sees the same type object.
+func (s *stdlibCache) put(pl platform, importPath string, checked *types.Package) *types.Package {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pkgs[pl] == nil {
+		s.pkgs[pl] = map[string]*types.Package{}
+	}
+	if existing, ok := s.pkgs[pl][importPath]; ok {
+		return existing
+	}
+	s.pkgs[pl][importPath] = checked
+	return checked
+}
+
+// importListed resolves one import from the go list closure.
+func (c *typeChecker) importListed(importPath string) (*types.Package, error) {
+	if importPath == "unsafe" {
+		return types.Unsafe, nil
+	}
+	listed := c.listed[importPath]
+	if listed == nil {
+		return nil, fmt.Errorf("%s is not in the go list closure", importPath)
+	}
+	if listed.Error != nil {
+		return nil, errors.New(listed.Error.Err)
+	}
+	fset := c.fset
+	if listed.Standard {
+		fset = stdlib.fset
+		if checked, ok := stdlib.get(c.pl, importPath); ok {
+			return checked, nil
+		}
+	} else if checked, ok := c.external[importPath]; ok {
 		return checked, nil
 	}
-	checked, err := stdlib.imp.Import(path)
-	if err != nil {
-		return nil, err
+	files := make([]*ast.File, 0, len(listed.GoFiles))
+	for _, name := range listed.GoFiles {
+		file, err := parser.ParseFile(fset, filepath.Join(listed.Dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, file)
 	}
-	stdlib.seen[path] = checked
+	config := c.config()
+	config.Importer = importerFunc(func(dependency string) (*types.Package, error) {
+		if mapped, ok := listed.ImportMap[dependency]; ok {
+			dependency = mapped
+		}
+		return c.Import(dependency)
+	})
+	checked, _ := checkPackage(config, importPath, fset, files, nil)
+	if checked == nil {
+		checked = types.NewPackage(importPath, "")
+	}
+	if listed.Standard {
+		return stdlib.put(c.pl, importPath, checked), nil
+	}
+	c.external[importPath] = checked
 	return checked, nil
 }
 
-// Boundary stub sources: the packages a synthetic fixture imports but rarely
-// carries. They model exactly the declarations the fixtures use and import
-// nothing, so type checking stays self-contained.
-const (
-	loaderStub = `package loader
+// importerFunc adapts a function to types.Importer.
+type importerFunc func(string) (*types.Package, error)
 
-type Imports map[string][]string
-
-type Spec struct {
-	ID, Summary string
-	Floor       bool
-	Requires    []string
-	After       []string
-}
-
-type Registry struct{}
-
-type Session struct{}
-
-type RoleSpec struct {
-	Name       string
-	Default    bool
-	Diagnostic bool
-	Run        func(Session) int
-	Disabled   func(Session) int
-}
-
-func Add(*Registry, Spec, func(*Registry) error) error { return nil }
-
-func SetImports(*Registry, Imports) error { return nil }
-
-func Role(*Registry, RoleSpec) error { return nil }
-
-type KindOptions[T any] struct {
-	Unique, Schema bool
-	Validate       func([]T) error
-}
-
-type Kind[T any] struct{}
-
-func NewKind[T any](string, KindOptions[T]) Kind[T] { var k Kind[T]; return k }
-
-type Service[T any] struct{}
-
-func NewService[T any](string) Service[T] { var s Service[T]; return s }
-`
-
-	instancesStub = `package instances
-
-type Registry struct{}
-
-func NewRegistry() *Registry { return &Registry{} }
-
-func ID(kind, typ string) string { return kind + "/" + typ }
-
-type Kind[T any] struct{}
-
-func NewKind[T any](string) Kind[T] { var k Kind[T]; return k }
-
-func RegisterProvider[T any](*Registry, string) error { return nil }
-`
-
-	protectionStub = `package protection
-
-type Ledger struct{}
-
-type LedgerOptions struct{}
-
-func NewLedger(LedgerOptions) *Ledger { return nil }
-
-func (*Ledger) Authorize(any) any { return nil }
-
-type Accounting interface {
-	Admit(string, string, int64, bool) bool
-	Shrink(string, string, int64)
-	Commit(string, string, int64)
-	Unreserve(string, string)
-}
-`
-
-	guardStub = `package guard
-
-type Authority struct{}
-
-type Port struct{}
-
-type Handle struct{}
-
-func (Port) Open(*Authority) (Handle, error) { return Handle{}, nil }
-
-type Remover struct{}
-
-func (Remover) Delete(any, string) error { return nil }
-
-type Destination struct{}
-
-func (Destination) Remover() Remover { return Remover{} }
-
-func Build(...any) (Destination, error) { var d Destination; return d, nil }
-
-func NewAuthority(any) *Authority { return nil }
-
-func Read(...any) Port { return Port{} }
-`
-
-	storageStub = `package storage
-
-type BuildInput struct{ CallParallelism int }
-
-type Storage interface{}
-
-func Build(...any) (Storage, error) { return nil, nil }
-
-func Register(...any) error { return nil }
-
-func AddFactory(...any) error { return nil }
-`
-
-	libraryStub = `package library
-
-const RoleExtra = "extra"
-
-var Spec struct{}
-
-func Authorize() {}
-`
-)
-
-// stubSource names the canonical source of one boundary package.
-func stubSource(path string) (string, bool) {
-	switch {
-	case isLoader(path):
-		return loaderStub, true
-	case isInstances(path):
-		return instancesStub, true
-	case strings.HasSuffix("/"+path, "/internal/plugins/protection"):
-		return protectionStub, true
-	case strings.HasSuffix("/"+path, "/internal/plugins/storage/guard"):
-		return guardStub, true
-	case strings.HasSuffix("/"+path, "/internal/plugins/storage"):
-		return storageStub, true
-	case strings.HasSuffix("/"+path, "/internal/plugins/library"):
-		return libraryStub, true
-	default:
-		return "", false
-	}
-}
+// Import satisfies types.Importer.
+func (f importerFunc) Import(importPath string) (*types.Package, error) { return f(importPath) }
