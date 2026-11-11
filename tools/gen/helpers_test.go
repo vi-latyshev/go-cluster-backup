@@ -11,7 +11,7 @@ import (
 const (
 	fixtureModule = "../internal/pluginmeta/testdata/corpus"
 
-	moduleGoMod = "module example.test/app\n\ngo 1.27.3\n"
+	moduleGoMod = "module example.test/app\n\ngo 1.27.4\n"
 
 	instancesSource = `package instances
 

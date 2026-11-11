@@ -65,11 +65,11 @@ func TestHandlerRendersAnEvent(t *testing.T) {
 	h := NewHandler(&buf, slog.LevelInfo)
 	at := time.Date(2026, 10, 18, 4, 13, 51, 0, time.UTC)
 	r := slog.NewRecord(at, slog.LevelInfo, "", 0)
-	r.AddAttrs(slog.Any(EventAttrKey, New("catalog.saved", Text("run", "r1"))))
+	r.AddAttrs(slog.Any(EventAttrKey, New("notify.sent", Text("event", "finished"))))
 	if err := h.Handle(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := buf.String(), "[04:13:51] saved run r1\n"; got != want {
+	if got, want := buf.String(), "[04:13:51] ✓ sent finished\n"; got != want {
 		t.Errorf("Handle = %q, want %q", got, want)
 	}
 }

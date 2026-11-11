@@ -25,7 +25,7 @@ type Public struct{ %s }
 import "example.test/app/internal/plugins/assembly"
 ` + body,
 					})
-					checker := newTypeChecker(r.Tree)
+					checker := fixtureChecker(t, r.Tree)
 					owner := checker.typesFor(r.ByDir[assemblyDir]).pkg
 					consumer := checker.typesFor(r.ByDir["internal/plugins/workflow/alternative"]).pkg
 					field, _, _ := types.LookupFieldOrMethod(owner.Scope().Lookup("Public").Type(), true, consumer, "Mutation")

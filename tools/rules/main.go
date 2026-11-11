@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 )
 
 // osExit is the one unprovokable exit seam: a test overrides it to observe the
@@ -81,6 +82,10 @@ func check(root string) ([]string, error) {
 		rulePluginFiles,
 	} {
 		findings = append(findings, rule(scanned, graph)...)
+	}
+	if len(scanned.modelErrors) > 0 {
+		return nil, fmt.Errorf("the type model is incomplete:\n%s",
+			strings.Join(uniqueSorted(scanned.modelErrors), "\n"))
 	}
 	return uniqueSorted(findings), nil
 }

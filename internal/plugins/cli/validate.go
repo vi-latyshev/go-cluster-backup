@@ -188,8 +188,8 @@ func validateConfiguration(ctx context.Context, opts Options, reg *instances.Reg
 // grace the chart sets. The cleanup bound is the release window the run owns
 // plus the lifecycle budgets a deployment may override; a chart grace shorter
 // than that bound kills the process mid-cleanup, leaving the writer lease and
-// the abort ledger to uncertainty. A grace of 0 means the flag was not given
-// and the check is skipped.
+// the abort ledger to uncertainty. Only an absent flag (seconds == nil) skips
+// the check; an explicit 0 is checked like any other chart promise.
 func graceProblems(cfg *configuration.Config, seconds *int) []error {
 	if seconds == nil {
 		return nil

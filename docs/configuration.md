@@ -449,8 +449,9 @@ values are 1m + 2m + 2m + 30s + 30s = 360s.
 The chart defaults `terminationGracePeriodSeconds` to 360 and passes the same
 literal to `validate --termination-grace-seconds`. The gate rejects a smaller
 value than effective config requires; raise chart grace when raising budgets.
-For a manual validate, zero or an omitted flag skips this check; negative values
-are usage errors. A grace period cannot force an uncooperative goroutine to stop.
+For a manual validate, only an omitted flag skips this check; an explicit 0 is
+checked and fails against any nonzero bound. Negative values are usage errors.
+A grace period cannot force an uncooperative goroutine to stop.
 
 ### Catalog
 

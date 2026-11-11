@@ -163,7 +163,7 @@ func TestRenderErrors(t *testing.T) {
 		},
 		{
 			name:  "go.mod has no module directive",
-			files: map[string]string{"go.mod": "go 1.27.3\n", "internal/plugins/p/plugin.go": validPlugin},
+			files: map[string]string{"go.mod": "go 1.27.4\n", "internal/plugins/p/plugin.go": validPlugin},
 			want:  "no module directive",
 		},
 		{

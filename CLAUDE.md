@@ -6,7 +6,7 @@ and `docs/restore.md`. This guide governs work; `CONTRIBUTING.md` covers plugins
 
 ## Tech Stack
 
-- **Language:** Go 1.27.3, module `github.com/vi-latyshev/go-cluster-backup`.
+- **Language:** Go 1.27.4, module `github.com/vi-latyshev/go-cluster-backup`.
   The Makefile derives `GOTOOLCHAIN` from go.mod. Separate `tools/go.mod` pins
   lint/vulnerability/chart tools and Helm v4, never linked into the binary.
   Targets/tests use `go tool`, never Helm from `PATH`. Tidy with
@@ -15,8 +15,8 @@ and `docs/restore.md`. This guide governs work; `CONTRIBUTING.md` covers plugins
   `go.yaml.in/yaml/v4`; domain code and plugins use JSON. The webhook also reads
   YAML but sends JSON for `body_format: yaml`. `internal/plugins/kubeapi` is
   standard-library-only.
-- **Image:** `docker.io/library/golang:1.27.3-alpine` cross-compiles from the
-  build platform into `docker.io/library/alpine:3.24.3`, with
+- **Image:** `docker.io/library/golang:1.27.4-alpine` cross-compiles from the
+  build platform into `docker.io/library/alpine:3.24.4`, with
   `postgresql18-client`, `redis`, `sqlite`, `tzdata`, `ca-certificates`.
   `/usr/local/bin/go-cluster-backup` runs `doctor` as the last build step.
 - **Runtime:** one-shot Kubernetes CronJobs from `charts/go-cluster-backup/`.
@@ -333,6 +333,9 @@ make hooks       # opt in to .githooks/commit-msg, the commit-message check
 `make rules` enforces the import graph, runtime Requires, factory IDs, loader
 purity, role/command disjointness, the raw-storage boundary, eagerinit and
 `plugin.go` presence. It also checks generated freshness and runs in `make lint`.
+Its go/types pass loads every import through `go list` for linux/amd64,
+linux/arm64 and darwin/arm64 with `CGO_ENABLED=0`, and refuses an incomplete type
+model: an unresolved import, a type error or a file no checked platform builds.
 
 CI has two jobs: `make lint vuln chart` and `make test e2e cover`. Lint's govet
 covers CI vet; keep `make vet` in the local gate. The first job checks every

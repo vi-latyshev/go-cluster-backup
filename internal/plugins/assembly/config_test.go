@@ -221,7 +221,7 @@ func yamlToJSON(t *testing.T, y string) jsontext.Value {
 	return raw
 }
 
-// normalizeYAML turns yaml.v3's map[string]any into JSON-marshalable data.
+// normalizeYAML turns yaml/v4's map[string]any into JSON-marshalable data.
 func normalizeYAML(v any) any {
 	switch x := v.(type) {
 	case map[string]any:

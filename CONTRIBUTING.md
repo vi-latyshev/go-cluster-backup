@@ -41,6 +41,13 @@ role/command disjointness, raw-storage access, eagerinit, `plugin.go` presence
 and generated freshness. It runs inside `make lint`. Regenerate tracked outputs
 with `make generate`, never by editing them.
 
+Its go/types pass loads every import through `go list` for linux/amd64,
+linux/arm64 and darwin/arm64 with `CGO_ENABLED=0`, and refuses an incomplete type
+model: an unresolved import, a type error, or a file no checked platform builds.
+A platform-specific file for another GOOS requires extending `platforms` in
+`tools/rules/typeinfo.go`, and `make rules` needs the root module's dependencies
+in the module cache (or network).
+
 `make e2e` needs `docker`, `k3d` and `kubectl`: it builds the `COVER=1` image
 itself (or takes `E2E_IMAGE`), the suite creates and deletes its own k3d
 cluster, and `make cover` then gates the union. See

@@ -93,22 +93,55 @@ func restrictedSelector(r *repo, p *pluginmeta.Package, f *pluginmeta.File, sele
 
 // authorityFindings is the one go/types pass over every non-boundary package:
 // every expression, type expression, selection and assertion whose static type
-// exposes the ledger, a Remover/Destination, or an Authorize method.
+// exposes the ledger, a Remover/Destination, or an Authorize method. The pass
+// runs once per checked platform; every production file must be built by at
+// least one of them, or the model is incomplete and check refuses the tree.
 func (r *repo) authorityFindings() []string {
 	if r.checkedAuthorities {
 		return r.authority
 	}
 	r.checkedAuthorities = true
-	checker := newTypeChecker(r.Tree)
-	var findings []string
+	paths := make([]string, 0, len(r.Packages))
 	for _, p := range r.Packages {
-		// The declaring and assembling packages are exempt; the Floor is not,
-		// because adoption of a Remover/Destination is closed to it as well.
-		if dirAllowed(p.Dir, protectionDir, assemblyDir, guardDir) {
+		paths = append(paths, p.Path)
+	}
+	built := map[string]bool{}
+	complete := true
+	var findings []string
+	for _, pl := range platforms {
+		listed, err := listPackages(r.Root, pl, paths)
+		if err != nil {
+			r.modelErrors = append(r.modelErrors, err.Error())
+			complete = false
 			continue
 		}
-		findings = append(findings, r.packageAuthorities(checker, p,
-			dirAllowed(p.Dir, floorDir), dirAllowed(p.Dir, cliPluginDir))...)
+		checker := newTypeChecker(r.Tree, pl, listed, &r.modelErrors)
+		for _, p := range r.Packages {
+			for _, f := range checker.selected(p) {
+				built[f.Rel] = true
+			}
+			// The declaring and assembling packages are exempt from findings;
+			// their type errors still count, so the model is checked whole.
+			// The Floor is not exempt: adoption of a Remover/Destination is
+			// closed to it as well.
+			if dirAllowed(p.Dir, protectionDir, assemblyDir, guardDir) {
+				checker.typesFor(p)
+				continue
+			}
+			findings = append(findings, r.packageAuthorities(checker, p,
+				dirAllowed(p.Dir, floorDir), dirAllowed(p.Dir, cliPluginDir))...)
+		}
+	}
+	if complete {
+		for _, p := range r.Packages {
+			for _, f := range p.Files {
+				if !built[f.Rel] {
+					r.modelErrors = append(r.modelErrors, fmt.Sprintf(
+						"%s: excluded by build constraints on every checked platform (%s)",
+						f.Rel, platformList()))
+				}
+			}
+		}
 	}
 	r.authority = uniqueSorted(findings)
 	return r.authority

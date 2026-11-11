@@ -148,10 +148,8 @@ func render(ev Event) string {
 		return "✗ describing the storage: " + b.text("reason")
 	case "storage.check.failed":
 		return "✗ the preflight check failed: " + b.text("reason")
-	case "catalog.saved":
-		return "saved run " + b.text("run")
 	case "catalog.failed":
-		return fmt.Sprintf("✗ saving run %s: %s", b.text("run"), b.text("reason"))
+		return "✗ the catalog preflight check failed: " + b.text("reason")
 	case "notify.sent":
 		return "✓ sent " + b.text("event")
 	case "notify.failed":
