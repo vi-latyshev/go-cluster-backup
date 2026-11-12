@@ -11,6 +11,7 @@ import (
 	"text/template"
 	"text/template/parse"
 
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
 )
@@ -109,6 +110,11 @@ func parseEndpoint(name, src string, read bool) (parsedEndpoint, error) {
 	if err := literalSecretPaths(tmpl, allowed); err != nil {
 		return parsedEndpoint{}, fmt.Errorf("%s: %w", name, err)
 	}
+	// The endpoint executes with no data; the checker walks every definition,
+	// called or not, and refuses any field or method read on the dot or on $.
+	if err := configuration.CheckTemplate(tmpl, nil, funcs); err != nil {
+		return parsedEndpoint{}, fmt.Errorf("%s: %w", name, err)
+	}
 	return parsedEndpoint{tmpl: tmpl, allowed: allowed}, nil
 }
 
@@ -178,8 +184,6 @@ func literalSecretNodes(n parse.Node, allowed map[string]struct{}) error {
 				return err
 			}
 		}
-	case *parse.ChainNode:
-		return literalSecretNodes(t.Node, allowed)
 	case *parse.IfNode:
 		return literalSecretBranch(t.Pipe, t.List, t.ElseList, allowed)
 	case *parse.RangeNode:
@@ -188,13 +192,10 @@ func literalSecretNodes(n parse.Node, allowed map[string]struct{}) error {
 		return literalSecretBranch(t.Pipe, t.List, t.ElseList, allowed)
 	case *parse.TemplateNode:
 		return literalSecretNodes(t.Pipe, allowed)
-	case *parse.IdentifierNode:
-		// The identifier outside a command's own argument list — a chain like
-		// `secret.X` reaches here — is not the checked call form.
-		if t.Ident == "secret" {
-			return errSecretArgument
-		}
 	}
+	// A bare identifier outside a command's own argument list is not the checked
+	// call form: an identifier named secret there has no arguments, and
+	// literalSecretCommand refuses it before this walk reaches it.
 	return nil
 }
 

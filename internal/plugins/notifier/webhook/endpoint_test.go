@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
 	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
@@ -594,14 +595,35 @@ func TestEndpointHeaderSecretIsRenderedAndRefusedWhenItBreaksTheHeader(t *testin
 	}
 }
 
-// TestEndpointTemplateThatCannotBeRenderedIsPermanent: a template that names
-// data the endpoint set does not carry fails at delivery, naming the stage and
-// never the executor's own text.
+// TestEndpointDataReferenceIsRefusedOffline: the endpoint set runs with no
+// data, so any field reference is refused by validate — before the night — and
+// the refusal names the field, never a rendered value.
+func TestEndpointDataReferenceIsRefusedOffline(t *testing.T) {
+	cfg := endpointConfig(t, "https://hooks.example.com/{{ .NoSuchField }}")
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = testRegistry(t).Check("notifier", "webhook", jsontext.Value(raw))
+	if err == nil {
+		t.Fatal("an endpoint template referencing data passed validate")
+	}
+	for _, want := range []string{"url", "endpoint templates render with no data", ".NoSuchField"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+// TestEndpointTemplateThatCannotBeRenderedIsPermanent: a template the parser
+// accepts can still fail while executing — an index past a string's end is the
+// one failure left to runtime — and delivery names the stage, never the
+// executor's own text.
 func TestEndpointTemplateThatCannotBeRenderedIsPermanent(t *testing.T) {
-	n := build(t, endpointConfig(t, "http://127.0.0.1:1/{{ .NoSuchField }}"))
+	n := build(t, endpointConfig(t, `http://127.0.0.1:1/{{ index "ab" 5 }}`))
 	err := n.Notify(context.Background(), notifiertest.Event())
 	if err == nil {
-		t.Fatal("an endpoint template referencing absent data was delivered")
+		t.Fatal("an endpoint template that cannot render was delivered")
 	}
 	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Errorf("class = %v, want permanent", class)

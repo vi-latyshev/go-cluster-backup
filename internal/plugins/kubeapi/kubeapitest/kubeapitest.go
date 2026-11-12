@@ -113,6 +113,10 @@ type Server struct {
 	// the read itself. The key is the request's most specific key — the one
 	// Calls counts.
 	Hold map[string]time.Duration
+	// delayEntered, when set, receives one value before a delayed request
+	// starts waiting: the test's ordering point for cancelling a request that
+	// is provably inside the delay. Production leaves it nil.
+	delayEntered chan struct{}
 	// Tokens records the bearer token of every request, oldest first, so a test
 	// can prove the client re-reads the token file.
 	Tokens []string
@@ -165,8 +169,12 @@ func (s *Server) delayed(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delay := s.Delay
+		entered := s.delayEntered
 		s.mu.Unlock()
 		if delay > 0 {
+			if entered != nil {
+				entered <- struct{}{}
+			}
 			select {
 			case <-time.After(delay):
 			case <-r.Context().Done():

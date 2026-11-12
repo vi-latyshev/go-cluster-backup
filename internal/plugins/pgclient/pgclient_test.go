@@ -864,6 +864,39 @@ func TestStreamReportsACancelledWait(t *testing.T) {
 	}
 }
 
+// TestStreamReportsACancelledWaitOfASurvivingCommand: the bytes ended, the
+// command still ran, and the run was cancelled before it exited — the
+// cancellation is the answer, never the exit classification. The command is not
+// bound to the context, so cancelling cannot kill it before its exit is
+// observed; the test releases the exit after cancelling, which reaches the
+// branch under any scheduler load instead of racing the kill against Wait.
+func TestStreamReportsACancelledWaitOfASurvivingCommand(t *testing.T) {
+	conn := newConn(t, "/nonexistent/postgresql18")
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Close stdout first, so the copy ends; then announce it and wait for the
+	// test's file before exiting non-zero.
+	cmd := exec.Command("/bin/sh", "-c",
+		`exec 1>&-; : > "$STUB_LOG/ready"; while [ ! -e "$STUB_LOG/go" ]; do sleep 0.01; done; exit 3`)
+	cmd.Env = append(os.Environ(), "STUB_LOG="+dir)
+	done := make(chan error, 1)
+	go func() { _, err := conn.Stream(ctx, cmd, io.Discard); done <- err }()
+	waitStarted(t, filepath.Join(dir, "ready"))
+	cancel()
+	if err := os.WriteFile(filepath.Join(dir, "go"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Stream = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stream did not return after the command exited")
+	}
+}
+
 // TestStreamReportsACommandThatCannotStart: a missing program is a transient
 // fault of the call; under cancellation it is the cancellation.
 func TestStreamReportsACommandThatCannotStart(t *testing.T) {

@@ -260,6 +260,44 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   examples with defaults to check enums, ranges and combinations; `validate`
   builds declared instances. Nested discovery sources get shape, null and type
   checks without construction; the run checks semantics when building them.
+  `validate` also checks every template surface with
+  `configuration.CheckTemplate`: webhook messages, payload and endpoints, layout
+  keys, `kubernetes_labels` rule templates and `side_by_side_dir`.
+  `layout.Check` also refuses a bad `run_prefix` shape and a key that is always
+  absolute, always contains `..` or is empty. Each `restore.apply.<type>` block
+  is decoded through `source.ApplyOptionsChecker` on that type's config value,
+  against the `layout.SampleRunIDs` labels, with no instance and no I/O. Apply
+  and the check share one decoder per backend. A type's config implements the
+  checker exactly when its instance is a `source.Restorer`
+  (`internal/plugins/instances/restore_apply_test.go`); a block for an unknown
+  or non-restoring type is refused.
+- **The template checker refuses only certain errors and declared policy.**
+  `CheckTemplate` refuses as certain a field or method name that names nothing
+  on a statically certain non-interface, non-map type, any endpoint selector,
+  and `pick`/`pickdef` key/text arguments that do not pair. Policy P1 refuses
+  the same name defect in a branch or definition that may never run; policy P2
+  refuses a constant `pick`/`pickdef` key outside the value list of the
+  registry field it picks directly (`""` stays allowed). Everything else is
+  unknown and accepted. Every definition is walked: a called one against each
+  call site's dot, an uncalled one with an unknown dot.
+  `TestRefusalsAreCertain` proves each certain refusal fails every evaluation;
+  positive conformance requires every template the executor runs to pass,
+  except under P2. A new refusal is certain or a declared policy. The enum
+  registry keys each enum field by owning struct and field name, so
+  `ArtifactResult.Outcome` and `StorageResult.Outcome` stay `string`. Each entry
+  names a `model.*Values` list of `model.EnumValue`, marking `Everywhere` the
+  values every deployment produces; `Valid`, `Known`, `model.Listed` in the
+  manifest reader and the checker read those lists.
+  `TestEveryReachableEnumIsListed` fails a reachable enum field without an
+  entry. Validate renders only the fixed, production-shaped `samples()`, on a
+  `JudgeTemplate` copy; the run's template is never touched. In the copy, a
+  `pick`/`pickdef` over a selector `R.Field` becomes
+  `JudgedFieldPick`/`JudgedFieldPickDef` over `R` and `"Field"`: the executor
+  evaluates `R` once, the judge resolves `Field` in the executor's lookup order,
+  and the registry entry of that runtime `(struct, field)` refuses an unnamed
+  `Everywhere` value. Without an entry, the value's named enum type decides;
+  other values and every `pickdef` stay tolerant. Field coverage belongs to the
+  checker, never to new samples.
 - **One attempt per backend call.** `execution` owns retries, backoff, budgets
   and timeouts from config. A backend never retries inside that accounting unit.
   A notification retries only while its wait plus the notifier's attempt timeout
@@ -322,7 +360,10 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   error says to narrow it to one such node. Under `node_scope`, a volume proven
   on a declared peer is `elsewhere`, and an own node that cannot be proven
   refuses the discovery; without it, an unreadable own node warns and fails the
-  affected artifact. Anything unproven fails, never reads. An unset or empty
+  affected artifact. Anything unproven fails, never reads. A failed node read
+  keeps the API's class: a 403 or an unclassified cause is permanent and names
+  the RBAC remedy, a 404 stays not-found, and a timeout, 409/429/5xx or
+  transport failure stays transient, so planning reads again. An unset or empty
   `node_env` without `node_scope` keeps the old read.
 - **Restore follows the recorded chain, never the current pipeline.** Keep
   manifest JSON keys explicit so Go renames do not silently alter stored data.
@@ -347,7 +388,7 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   workflows never derive holders. `MarkUncertain`
   protects the uncertain run's prefix, marks occupancy unknown and closes cap
   eviction.
-- **A catalog lease serialises writes.** Discover `catalog.Leaser` by call,
+- **A catalog lease serialises writes.** Discover `catalog.Catalog.Acquire` by call,
   with `errors.ErrUnsupported` meaning absent. Acquire before any storage mutation.
   Without it, manual runs refuse and scheduled runs are lease-free. Take over
   only on the exact holder pod's terminal phase (scheduled), or absent/changed
@@ -391,9 +432,19 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   `endpoint_templates: true`; payload and message templates never get it. Its
   one argument is a string-literal absolute path: offline validation refuses a
   computed, nested or piped argument, so secret bytes never reach diagnostics.
+  Endpoint templates render with no data, so offline validation also refuses
+  every field reference (`.X`, `$.X`, `$p.X`, `(…).X`) in every definition.
   Test the current surface in
   `internal/plugins/configuration/template_surface_test.go`. Adding a field is a
-  minor change; renaming or removing one is a major change.
+  minor change; renaming or removing one is a major change. A new field also
+  needs a value in the test-only `maximal` events of
+  `internal/plugins/notifier/webhook/sample_test.go`. The fill gate there derives
+  every path from `model.Event` and fails while an event's maximum leaves one
+  zero; `TestCheckerAgreesOnEveryPath` requires the checker to accept and execute
+  each path and to refuse a one-letter typo. `run_started` is exempt only under
+  `notOnStarted`, and each prefix must match a reachable path. The gate descends
+  only into the root package's structs, through pointers and slices; a map,
+  interface or anonymous field fails it until the walker learns that shape.
 - **Rules 4/5 exception:** the mandatory everything-is-a-plugin architecture
   keeps the `discovery`, `catalog` and `notifier` seams even with one backend each
   (`kubernetes_labels`, `kubernetes_configmap`, `webhook`).

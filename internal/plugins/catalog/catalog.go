@@ -121,8 +121,9 @@ type Lease struct {
 
 // LeaseRequest asks for the lease. Holder, Kind, HolderPod and HolderUID are the
 // caller's own identity. TakeoverToken, when set, asks to take over exactly that
-// claim: the run sets it only after the Leaser proved the holder terminated,
-// and a claim whose token has changed in the meantime is refused.
+// claim: the run sets it only after the optional Liveness capability's
+// HolderState proved the holder terminated, and a claim whose token has changed
+// in the meantime is refused.
 type LeaseRequest struct {
 	Holder          string
 	Kind            model.RunKind

@@ -345,6 +345,100 @@ func TestApplySideBySideRefusesExistingTarget(t *testing.T) {
 	}
 }
 
+// TestReviewInPlaceIgnoresSideBySideDir is the reviewer's counterexample:
+// side_by_side_dir belongs to the side-by-side mode alone. An in-place restore
+// replaces the root and never renders that directory into a path, so a value
+// the other mode could not use is not this mode's business — a working 2.2.0
+// restore keeps working.
+func TestReviewInPlaceIgnoresSideBySideDir(t *testing.T) {
+	root := tree(t)
+	s, err := build(t, config(root, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := applyTar(t, []tar.Header{{Name: "top.txt", Typeflag: tar.TypeReg, Mode: 0o600}}, []string{"restored"})
+	_, err = s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
+		Mode: source.ApplyInPlace, Label: "run", Options: jsontext.Value(`{"preserve_owner":false,"side_by_side_dir":"/unused"}`),
+	}, bytes.NewReader(archive))
+	if err != nil {
+		t.Fatalf("working in-place restore refused: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "top.txt")); err != nil || string(got) != "restored" {
+		t.Fatalf("restore = %q, %v", got, err)
+	}
+}
+
+// applyWithSideBySideDir runs one small archive through the real restorer with
+// a chosen side_by_side_dir and mode.
+func applyWithSideBySideDir(t *testing.T, root, dir string, mode source.ApplyMode) error {
+	t.Helper()
+	s, err := build(t, config(root, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := applyTar(t, []tar.Header{{Name: "top.txt", Typeflag: tar.TypeReg, Mode: 0o600}}, []string{"restored"})
+	_, err = s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
+		Mode: mode, Label: "l",
+		Options: jsontext.Value(fmt.Sprintf(`{"preserve_owner": false, "side_by_side_dir": %q}`, dir)),
+	}, bytes.NewReader(archive))
+	return err
+}
+
+// TestApplyModeAndSideBySideDirMatrix: mode and directory are independent
+// facts. In-place ignores side_by_side_dir whatever it renders — only the
+// shared decoder's syntax, required-member, render and empty-render rules
+// apply, exactly as in 2.2.0. Side-by-side additionally confines the rendered
+// directory under the root and refuses an absolute path or a traversal before
+// the first write. The empty render is the one value both modes refuse, because
+// the decoder judged it before either mode ran.
+func TestApplyModeAndSideBySideDirMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		dir     string
+		inPlace bool
+		side    bool
+		why     string
+	}{
+		{"a relative directory", "restore", true, true, ""},
+		{"a nested relative directory", "a/b", true, true, ""},
+		{"an absolute directory", "/unused", true, false, "escapes the root"},
+		{"a traversal", "../x", true, false, "escapes the root"},
+		{"an empty render", `{{ "" }}`, false, false, "renders empty"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mode := range bothApplyModes {
+				t.Run(string(mode), func(t *testing.T) {
+					root := tree(t)
+					want := tc.side
+					target := filepath.Join(root, filepath.FromSlash(tc.dir))
+					if mode == source.ApplyInPlace {
+						want = tc.inPlace
+						target = root
+					}
+					escapeTarget := filepath.Join(filepath.Dir(root), "x")
+					err := applyWithSideBySideDir(t, root, tc.dir, mode)
+					if !want {
+						if err == nil || (tc.why != "" && !strings.Contains(err.Error(), tc.why)) {
+							t.Fatalf("Apply(%s, %q) = %v, want a refusal containing %q", mode, tc.dir, err, tc.why)
+						}
+						if _, statErr := os.Lstat(escapeTarget); statErr == nil {
+							t.Fatalf("a refused side-by-side restore wrote outside the root at %q", escapeTarget)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("Apply(%s, %q) = %v, want the restore to proceed", mode, tc.dir, err)
+					}
+					if got, err := os.ReadFile(filepath.Join(target, "top.txt")); err != nil || string(got) != "restored" {
+						t.Fatalf("restored file at %q = %q, %v", target, got, err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestApplyInPlaceReplacesFilesAndKeepsOthers(t *testing.T) {
 	root := tree(t)
 	s, err := build(t, config(root, true))
@@ -2370,5 +2464,39 @@ func TestAReadOnlyTreeIsUndeletableUntilUnlocked(t *testing.T) {
 	unlockTreeNow(root)
 	if err := os.RemoveAll(locked); err != nil {
 		t.Fatalf("an unlocked read-only tree still refused deletion: %v", err)
+	}
+}
+
+// TestCheckApplyOptionsMatchesApply: the offline check decodes restore.apply.files
+// exactly as every mode of Apply does — the strict members, the render against
+// the run label, the empty result. It builds nothing and reads no file. The
+// directory's confinement is the side-by-side mode's own rule, so an absolute
+// path or a traversal is not refused where no mode is chosen.
+func TestCheckApplyOptionsMatchesApply(t *testing.T) {
+	const label = "20260102T030405Z"
+	var cfg files.Config
+	valid := []string{
+		`{"preserve_owner": false, "side_by_side_dir": "{{ .Label }}"}`,
+		`{"preserve_owner": true, "side_by_side_dir": "restore"}`,
+		`{"preserve_owner": false, "side_by_side_dir": "/unused"}`,
+		`{"preserve_owner": false, "side_by_side_dir": "../x"}`,
+	}
+	for _, raw := range valid {
+		if err := cfg.CheckApplyOptions(jsontext.Value(raw), label); err != nil {
+			t.Errorf("%s: a usable block was refused: %v", raw, err)
+		}
+	}
+	invalid := map[string]string{
+		`{"preserve_owner": false, "side_by_side_dir": "{{ .Lable }}"}`:                         "Lable",
+		`{"preserve_owner": false, "side_by_side_dir": "{{ if .Label }}{{ .Lable }}{{ end }}"}`: "Lable",
+		`{"preserve_owner": false, "side_by_side_dir": "{{ \"\" }}"}`:                           "renders empty",
+		`{"preserve_owner": true}`:                                      "side_by_side_dir",
+		`{"preserve_owner": true, "side_by_side_dir": "x", "extra": 1}`: "extra",
+	}
+	for raw, want := range invalid {
+		err := cfg.CheckApplyOptions(jsontext.Value(raw), label)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s = %v, want a refusal naming %q", raw, err, want)
+		}
 	}
 }

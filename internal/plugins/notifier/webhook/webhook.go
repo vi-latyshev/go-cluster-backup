@@ -17,6 +17,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -153,6 +154,9 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("events/%s: the run delivers %s, and a key naming no event it sends is a message nobody ever receives",
 				name, strings.Join(eventNames, " and ")))
 		}
+		if err := c.Events[name].Check(reflect.TypeFor[model.Event]()); err != nil {
+			errs = append(errs, fmt.Errorf("events/%s: %w", name, err))
+		}
 		event, err := newMessage(name, c.Events[name])
 		if err != nil {
 			errs = append(errs, err)
@@ -165,14 +169,17 @@ func (c Config) Validate() error {
 				// still has.
 				continue
 			}
-			if _, err := event.render(cleanEvent(s.ev)); err != nil {
+			if _, err := event.renderJudged(cleanEvent(s.ev)); err != nil {
 				errs = append(errs, fmt.Errorf("%w (rendered against %s)", err, s.name))
 			}
 		}
 	}
+	if err := c.Payload.Check(reflect.TypeFor[payloadData]()); err != nil {
+		errs = append(errs, fmt.Errorf("payload: %w", err))
+	}
 	if c.BodyFormat == formatYAML || c.BodyFormat == formatText {
 		for _, s := range samples() {
-			if _, err := c.body(sampleMessage(), cleanEvent(s.ev)); err != nil {
+			if _, err := c.bodyJudged(sampleMessage(), cleanEvent(s.ev)); err != nil {
 				errs = append(errs, fmt.Errorf("payload: rendered against %s: %w", s.name, err))
 			}
 		}
@@ -193,6 +200,25 @@ func (c Config) body(msg Message, ev model.Event) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rendering the payload: %w", err)
 	}
+	return c.bodyFrom(rendered)
+}
+
+// bodyJudged is body with validate's pick judge: an enum value every
+// deployment produces and no pair names fails the payload here instead of the
+// night. The notifier a run uses renders with the real pick.
+func (c Config) bodyJudged(msg Message, ev model.Event) ([]byte, error) {
+	rendered, err := c.Payload.RenderJudged(reflect.TypeFor[payloadData](), payloadData{
+		Title: msg.Title, Lines: msg.Lines, Text: msg.Text(), Event: ev,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("rendering the payload: %w", err)
+	}
+	return c.bodyFrom(rendered)
+}
+
+// bodyFrom turns one rendered payload into the request body its format
+// promises.
+func (c Config) bodyFrom(rendered string) ([]byte, error) {
 	switch c.BodyFormat {
 	case formatYAML:
 		// What a receiver takes as a document is cleaned first: a byte the

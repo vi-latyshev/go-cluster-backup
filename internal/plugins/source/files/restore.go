@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -81,7 +82,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	if req.Mode == source.ApplySideBySide {
 		rootPath, err = sideBySideSubdir(rootPath, opts.sideBySideDir)
 		if err != nil {
-			return source.ApplyReport{}, pluginerrors.Permanent(err)
+			return source.ApplyReport{}, pluginerrors.Permanent(fmt.Errorf("restore.apply.files/side_by_side_dir: %w", err))
 		}
 		if _, err := os.Lstat(rootPath); err == nil {
 			return source.ApplyReport{}, pluginerrors.Permanent(fmt.Errorf("%s already exists; a side-by-side target is never overwritten", rootPath))
@@ -518,13 +519,48 @@ func replaceEntry(root *os.Root, name string) error {
 	return nil
 }
 
+// CheckApplyOptions decodes restore.apply.files offline exactly as every mode
+// of Apply does: the same strict decode, the same render against the run label,
+// the same empty-render refusal. It builds nothing and reads no file. The
+// directory's confinement is the side-by-side mode's own rule and stays at
+// Apply, because validation has not chosen a mode — the same boundary
+// PostgreSQL draws for in_place with jobs > 1.
+func (c Config) CheckApplyOptions(raw jsontext.Value, label string) error {
+	opts, err := decodeApplyConfig(raw)
+	if err != nil {
+		return err
+	}
+	// Every definition is checked, called or not: a name the label does not
+	// have is refused here even where a branch would never render it.
+	if err := opts.SideBySideDir.Check(reflect.TypeFor[struct{ Label string }]()); err != nil {
+		return fmt.Errorf("restore.apply.files/side_by_side_dir: %w", err)
+	}
+	_, err = renderApplyOptions(opts, label)
+	return err
+}
+
+// decodeApplyConfig strictly decodes restore.apply.files, without rendering its
+// template.
+func decodeApplyConfig(raw jsontext.Value) (ApplyOptions, error) {
+	return configuration.DecodeOptions[ApplyOptions](raw, "restore.apply.files")
+}
+
 // decodeApplyOptions decodes the options strictly and renders the side-by-side
-// directory template against the run label.
+// directory template against the run label. It judges what every mode shares —
+// syntax, required members, a render that fails and an empty render, the rules
+// 2.2.0 applied before either mode ran — and never the directory's confinement:
+// that one belongs to the side-by-side mode alone, which Apply enforces. Apply
+// and the offline restore.apply check call this one function.
 func decodeApplyOptions(raw jsontext.Value, label string) (renderedOptions, error) {
-	opts, err := configuration.DecodeOptions[ApplyOptions](raw, "restore.apply.files")
+	opts, err := decodeApplyConfig(raw)
 	if err != nil {
 		return renderedOptions{}, err
 	}
+	return renderApplyOptions(opts, label)
+}
+
+// renderApplyOptions renders the decoded options against the run label.
+func renderApplyOptions(opts ApplyOptions, label string) (renderedOptions, error) {
 	dir, err := opts.SideBySideDir.Render(struct{ Label string }{Label: label})
 	if err != nil {
 		return renderedOptions{}, fmt.Errorf("restore.apply.files/side_by_side_dir: %w", err)
@@ -535,12 +571,25 @@ func decodeApplyOptions(raw jsontext.Value, label string) (renderedOptions, erro
 	return renderedOptions{preserveOwner: opts.PreserveOwner, sideBySideDir: dir}, nil
 }
 
-// sideBySideSubdir joins the rendered directory onto the root and refuses
-// anything that would land outside it.
+// sideBySideSubdir joins the rendered directory onto the root and refuses a
+// path that would land outside it. Only the side-by-side mode calls this: an
+// in-place restore never uses the directory, so its value must not refuse a
+// restore that does not read it.
 func sideBySideSubdir(root, dir string) (string, error) {
+	clean, err := sideBySideDir(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, clean), nil
+}
+
+// sideBySideDir is the lexical rule alone: the rendered directory is a relative
+// path that does not climb out of the root. Apply joins it under the root and
+// the offline check judges the render without one.
+func sideBySideDir(dir string) (string, error) {
 	clean := filepath.Clean(filepath.FromSlash(dir))
 	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("side_by_side_dir %q escapes the root", dir)
 	}
-	return filepath.Join(root, clean), nil
+	return clean, nil
 }

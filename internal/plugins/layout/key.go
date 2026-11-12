@@ -1,8 +1,10 @@
 package layout
 
 import (
+	"errors"
 	"fmt"
 	"path"
+	"reflect"
 	"strings"
 	"text/template"
 	"text/template/parse"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
 )
 
 // Config is the typed options of this library: the key templates and the run id
@@ -73,29 +76,35 @@ func (l Layout) Kind(id string) model.RunKind {
 // and checks its shape: a non-empty literal followed by exactly
 // {{ .Run.ID }}. Anything else cannot be surveyed.
 func (l Layout) Prefix() (string, error) {
-	return runPrefixLiteral(l.cfg.RunPrefix.Text())
-}
-
-func runPrefixLiteral(text string) (string, error) {
-	tmpl, err := template.New("run_prefix").Parse(text)
+	lit, err := runPrefixLiteral(l.cfg.RunPrefix.Text())
 	if err != nil {
 		return "", fmt.Errorf("layout.run_prefix: %w", err)
 	}
+	return lit, nil
+}
+
+// runPrefixLiteral is the shape rule without the config path, so the offline
+// check can report it under /layout/run_prefix while a run names the field.
+func runPrefixLiteral(text string) (string, error) {
+	tmpl, err := template.New("run_prefix").Parse(text)
+	if err != nil {
+		return "", fmt.Errorf("the template does not parse: %w", err)
+	}
 	nodes := tmpl.Root.Nodes
 	if len(nodes) != 2 {
-		return "", fmt.Errorf("layout.run_prefix %q must be a literal prefix followed by exactly {{ .Run.ID }}", text)
+		return "", fmt.Errorf("%q must be a literal prefix followed by exactly {{ .Run.ID }}", text)
 	}
 	lit, ok := nodes[0].(*parse.TextNode)
 	if !ok || len(lit.Text) == 0 {
-		return "", fmt.Errorf("layout.run_prefix %q must start with literal text (the survey listing prefix)", text)
+		return "", fmt.Errorf("%q must start with literal text (the survey listing prefix)", text)
 	}
 	act, ok := nodes[1].(*parse.ActionNode)
 	if !ok || act.Pipe == nil || len(act.Pipe.Cmds) != 1 || len(act.Pipe.Cmds[0].Args) != 1 {
-		return "", fmt.Errorf("layout.run_prefix %q must be a literal prefix followed by exactly {{ .Run.ID }}", text)
+		return "", fmt.Errorf("%q must be a literal prefix followed by exactly {{ .Run.ID }}", text)
 	}
 	fld, ok := act.Pipe.Cmds[0].Args[0].(*parse.FieldNode)
 	if !ok || len(fld.Ident) != 2 || fld.Ident[0] != "Run" || fld.Ident[1] != "ID" {
-		return "", fmt.Errorf("layout.run_prefix %q must be a literal prefix followed by exactly {{ .Run.ID }}", text)
+		return "", fmt.Errorf("%q must be a literal prefix followed by exactly {{ .Run.ID }}", text)
 	}
 	return string(lit.Text), nil
 }
@@ -145,4 +154,82 @@ func (l Layout) ManifestKey(runID string) (string, error) {
 		return "", err
 	}
 	return path.Join(prefix, rel), nil
+}
+
+// SampleRunIDs is the fixed pair of run ids validate renders every key template
+// against — one of each kind at one instant, in this layout — and that the
+// restore.apply check renders a side-by-side label against, so a label rule is
+// judged by the same shape production uses. A config without a run section
+// carries no id layout; its keys still render, so the fallback is one fixed id
+// with the manual suffix, never an empty one.
+func (l Layout) SampleRunIDs() []string {
+	at := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	if id := l.RunID(model.RunKindScheduled, at); id != "" {
+		return []string{id, l.RunID(model.RunKindManual, at)}
+	}
+	id := "20260102T030405Z"
+	return []string{id, id + l.cfg.ManualIDSuffix}
+}
+
+// Check type-checks every key template and refuses one whose rendered result
+// is provably unsafe: the survey prefix's shape, a field or function the key
+// data does not have, and a key that always starts absolute, always carries
+// ".." or is empty. It runs at construction — `validate` and `run` alike — so a
+// typo in a key template is the configuration's error, never a night's.
+func (l Layout) Check() error {
+	var errs []error
+	add := func(err error) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if _, err := runPrefixLiteral(l.cfg.RunPrefix.Text()); err != nil {
+		add(fmt.Errorf("/layout/run_prefix: %w", err))
+	}
+	keys := []struct {
+		path string
+		tmpl configuration.Template
+	}{
+		{"/layout/run_prefix", l.cfg.RunPrefix},
+		{"/layout/manifest_key", l.cfg.ManifestKey},
+		{"/layout/artifact_key", l.cfg.ArtifactKey},
+	}
+	check := func(path string, err error) {
+		if err != nil {
+			add(fmt.Errorf("%s: %w", path, err))
+		}
+	}
+	for _, key := range keys {
+		check(key.path, key.tmpl.Check(reflect.TypeFor[keyData]()))
+		check(key.path, unsafeKeyLiteral(key.tmpl))
+	}
+	return errors.Join(errs...)
+}
+
+// unsafeKeyLiteral refuses a key template whose every render is unsafe: it has
+// no node at all, its first top-level node is literal text starting with "/",
+// or a top-level unconditional TextNode contains "..". That mirrors renderKey's
+// run-time rule (key.go:113) on the one part a render provably carries; a "/"
+// after an action is a separator, and a literal inside if, range, with or
+// define is not judged.
+func unsafeKeyLiteral(t configuration.Template) error {
+	if t.Text() == "" {
+		return errors.New("the template renders an empty key")
+	}
+	// The decoder parsed the same source with the same functions, so a parse
+	// failure here cannot happen.
+	tmpl := must.Do(template.New("key").Funcs(configuration.CoreFuncs()).Parse(t.Text()))
+	nodes := tmpl.Root.Nodes
+	if len(nodes) == 0 {
+		return errors.New("the template renders an empty key")
+	}
+	if text, ok := nodes[0].(*parse.TextNode); ok && strings.HasPrefix(string(text.Text), "/") {
+		return fmt.Errorf("the template always starts with %q: a key must be relative", "/")
+	}
+	for _, node := range nodes {
+		if text, ok := node.(*parse.TextNode); ok && strings.Contains(string(text.Text), "..") {
+			return fmt.Errorf("the template always contains %q: a key never steps out of its prefix", "..")
+		}
+	}
+	return nil
 }

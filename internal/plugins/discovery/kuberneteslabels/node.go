@@ -108,17 +108,44 @@ type nodeResult struct {
 }
 
 // warnNodeUnreadable is the one warning a collect says about a node it cannot
-// read. The affected artifacts carry the failure themselves; the warning names
-// the remedy, so a missing RBAC grant is never mistaken for a cluster without
-// nodes.
+// read. The affected artifacts carry the failure themselves; a permanent
+// failure names the remedy, so a missing RBAC grant is never mistaken for a
+// cluster without nodes, and a transient one says the API did not answer and
+// the discovery is read again.
 func (s *state) warnNodeUnreadable(err error) {
 	if s.node.warned {
 		return
 	}
 	s.node.warned = true
+	reason := err.Error()
+	switch class, _ := pluginerrors.ClassOf(err); class {
+	case pluginerrors.ClassPermanent:
+		reason += "; grant get on nodes, or set node_env to an empty string to opt out of node checks"
+	case pluginerrors.ClassTransient:
+		reason += "; the API did not answer, and the discovery is read again"
+	}
 	s.log.Warn("discovery.node.unreadable", slog.Any("event", human.Warning("discovery.node.unreadable",
 		human.Text("env", s.nodeEnv),
-		human.Text("reason", err.Error()+"; grant get on nodes, or set node_env to an empty string to opt out of node checks"))))
+		human.Text("reason", reason))))
+}
+
+// proofError keeps the class of the API's own node-read failure: a 403 stays
+// permanent, a 404 stays not-found, and a timeout, 409/429/5xx or transport
+// failure stays transient — planning's retry pass then reads the node again, so
+// an API blip costs a pass, not the night. Only a cause with no class of its own
+// (a name mismatch, a cancelled context) is marked permanent: a retry would ask
+// the same question. The remedy text belongs to the permanent answer alone.
+func proofError(err error, msg, remedy string) error {
+	switch class, _ := pluginerrors.ClassOf(err); class {
+	case pluginerrors.ClassPermanent:
+		return fmt.Errorf("%s: %w; %s", msg, err, remedy)
+	case pluginerrors.ClassTransient:
+		return fmt.Errorf("%s: %w; the API did not answer, and the discovery is read again", msg, err)
+	case "":
+		return pluginerrors.Permanent(fmt.Errorf("%s: %w; %s", msg, err, remedy))
+	default:
+		return fmt.Errorf("%s: %w", msg, err)
+	}
 }
 
 // bindNode is the proof a node-scoped discovery owes before it lists anything:
@@ -144,7 +171,8 @@ func (d *Discoverer) bindNode(ctx context.Context) error {
 		return pluginerrors.Permanent(fmt.Errorf("node_scope names node %q in %s, but the API has no such node: set it from spec.nodeName, or set node_scope: false to opt out",
 			st.nodeName(), st.nodeEnv))
 	case err != nil:
-		return pluginerrors.Permanent(fmt.Errorf("node_scope cannot prove this pod's node: %w; grant get on nodes, or set node_env to an empty string and node_scope: false to opt out", err))
+		return proofError(err, "node_scope cannot prove this pod's node",
+			"grant get on nodes, or set node_env to an empty string and node_scope: false to opt out")
 	case !slices.Contains(st.writerNodes, info.name):
 		return pluginerrors.Permanent(fmt.Errorf("node_scope is on but this pod's node %q is not in writer_nodes (%s): add it there, or set node_scope: false",
 			info.name, strings.Join(st.writerNodes, ", ")))
@@ -200,7 +228,7 @@ func (s *state) volumePlacement(o object, v volume, own nodeInfo, proofErr error
 	switch {
 	case proofErr != nil:
 		s.warnNodeUnreadable(proofErr)
-		return placement{}, pluginerrors.Permanent(fmt.Errorf("%s: %w; grant get on nodes, or set node_env to an empty string to opt out of node checks", o.id(), proofErr))
+		return placement{}, proofError(proofErr, o.id(), "grant get on nodes, or set node_env to an empty string to opt out of node checks")
 	case v.pinned:
 		candidates, err := s.affinityCandidates(o, v)
 		if err != nil {
@@ -264,7 +292,9 @@ func (s *state) affinityCandidates(o object, v volume) ([]string, error) {
 		}
 		node, err := s.nodeBy(s.ctx, name)
 		if err != nil {
-			return nil, pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is pinned away from this node and node %q cannot be read to prove it is a declared peer: %w", o.id(), o.volumeName, name, err))
+			return nil, proofError(err,
+				fmt.Sprintf("%s: persistentvolume %q is pinned away from this node and node %q cannot be read to prove it is a declared peer", o.id(), o.volumeName, name),
+				"grant get on nodes, or remove the peer from writer_nodes")
 		}
 		if affinityMatches(v.affinity, node) {
 			candidates = append(candidates, name)

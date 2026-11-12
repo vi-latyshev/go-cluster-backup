@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -394,6 +395,7 @@ func New(ctx context.Context, raw jsontext.Value, defs *configuration.Defaults, 
 		}
 	}
 	errs = append(errs, configuration.CheckRules(e.reg, e.active, cfg)...)
+	errs = append(errs, e.checkRestoreApply()...)
 	for _, name := range sortedKeys(cfg.Notifiers) {
 		inst := cfg.Notifiers[name]
 		n, err := build(e, ctx, notifier.Kind, "notifier", name, inst)
@@ -410,6 +412,11 @@ func New(ctx context.Context, raw jsontext.Value, defs *configuration.Defaults, 
 		} else {
 			e.catalog = c
 		}
+	}
+	// Every key template is checked once here: a typo or an unsafe key is the
+	// configuration's, refused before a run starts or a restore surveys.
+	if err := e.layout.Check(); err != nil {
+		errs = append(errs, err)
 	}
 	errs = append(errs, e.buildReporter(ctx))
 	errs = append(errs, e.buildLifecycle())
@@ -1029,6 +1036,49 @@ func (e *Assembly) EffectiveConfig() (jsontext.Value, []string) {
 // own answer.
 func (e *Assembly) Warnings() []model.Warning {
 	return append([]model.Warning(nil), e.warnings...)
+}
+
+// checkRestoreApply decodes every restore.apply block offline, exactly as the
+// restore will: a key is a source TYPE, and that type's own config value judges
+// the block — no instance is built and nothing is read, so a restore-only
+// target type with no declared instance is still checked, and a disabled type
+// with a restorer is checked too. A key naming no source type and a block for a
+// type with no restore are dead configuration and are refused with the block
+// named; a block its own decoder refuses is reported under its key.
+func (e *Assembly) checkRestoreApply() []error {
+	if e.cfg.Restore == nil {
+		return nil
+	}
+	var errs []error
+	for _, typ := range sortedKeys(e.cfg.Restore.Apply) {
+		path := "/restore/apply/" + typ
+		ct, known := e.reg.ConfigType(source.Kind.Name(), typ)
+		if !known {
+			errs = append(errs, fmt.Errorf("%s: no source type %q (known: %s)",
+				path, typ, strings.Join(e.reg.Types(source.Kind.Name()), ", ")))
+			continue
+		}
+		// The config type is the capability's home: a pointer to a zero config
+		// finds a value-receiver method, and the checker decodes the same bytes
+		// Apply would.
+		checker, ok := reflect.New(ct).Interface().(source.ApplyOptionsChecker)
+		if !ok {
+			errs = append(errs, fmt.Errorf("%s: source type %q has no restore; remove the block", path, typ))
+			continue
+		}
+		for _, label := range e.layout.SampleRunIDs() {
+			err := checker.CheckApplyOptions(e.cfg.Restore.Apply[typ], label)
+			if errors.Is(err, errors.ErrUnsupported) {
+				errs = append(errs, fmt.Errorf("%s: source type %q has no restore; remove the block", path, typ))
+				break
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", path, err))
+				break
+			}
+		}
+	}
+	return errs
 }
 
 // writerIdentity is the stable writer id the run section states, "" when the

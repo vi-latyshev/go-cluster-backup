@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"encoding/json/jsontext"
+
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
@@ -27,6 +29,21 @@ type ApplyOptions struct {
 	NoACL           bool           `json:"no_acl" doc:"pass --no-acl"`
 	ConnectAttempts int            `json:"connect_attempts" doc:"TCP connect attempts before the restore gives up"`
 	ConnectInterval model.Duration `json:"connect_interval" doc:"wait between connect attempts; also the per-attempt dial timeout"`
+}
+
+// decodeApplyOptions is the one decoder of restore.apply.postgres: the strict
+// decode with the required members and Validate. Apply and the offline check
+// call it, so a block validate accepts is one Apply decodes too.
+func decodeApplyOptions(raw jsontext.Value) (ApplyOptions, error) {
+	return configuration.DecodeOptions[ApplyOptions](raw, "restore.apply.postgres")
+}
+
+// CheckApplyOptions decodes restore.apply.postgres offline exactly as Apply
+// does. A refusal that depends on the apply mode — in_place with jobs > 1 —
+// stays in Apply, where the mode is known.
+func (c Config) CheckApplyOptions(raw jsontext.Value, _ string) error {
+	_, err := decodeApplyOptions(raw)
+	return err
 }
 
 func (o ApplyOptions) Validate() error {
@@ -61,7 +78,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		// fetch-only, and says so by call rather than by failing deep inside.
 		return source.ApplyReport{}, fmt.Errorf("a %s-format dump is restored with psql, which this plugin does not drive: %w", s.cfg.Format, errors.ErrUnsupported)
 	}
-	opts, err := configuration.DecodeOptions[ApplyOptions](req.Options, "restore.apply.postgres")
+	opts, err := decodeApplyOptions(req.Options)
 	if err != nil {
 		return source.ApplyReport{}, err
 	}

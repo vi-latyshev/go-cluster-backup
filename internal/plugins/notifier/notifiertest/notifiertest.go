@@ -36,8 +36,8 @@ func Run(t *testing.T, newFn func(t *testing.T) notifier.Notifier) {
 }
 
 // Event is the sample event every notifier must be able to deliver: one
-// artifact, one storage and one exclusion of each kind, so a template that
-// walks the report meets every record the run can carry.
+// artifact, one storage, and an ignored and a covered exclusion — the two
+// verdicts a single writer can reach without a node-scoped deployment.
 func Event() model.Event {
 	return model.Event{
 		Name: "run_finished",

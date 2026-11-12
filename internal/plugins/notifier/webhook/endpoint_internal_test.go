@@ -73,7 +73,6 @@ func TestLiteralSecretPathsCoversEveryNodeForm(t *testing.T) {
 		`{{ with . }}{{ secret "/run/token" }}{{ end }}`,
 		`{{ define "x" }}{{ . }}{{ end }}{{ template "x" (secret "/run/token") }}`,
 		`{{ define "x" }}{{ . }}{{ end }}{{ template "x" }}`,
-		`{{ (secret "/run/token").Missing }}`,
 		`{{ secret "/run/token" | printf "%s" }}`,
 		`{{ printf "%s" . }}`,
 	}
@@ -88,6 +87,17 @@ func TestLiteralSecretPathsCoversEveryNodeForm(t *testing.T) {
 		}
 	}
 	invalid := []string{
+		// Data references: the endpoint set runs with no data, so a field can
+		// only fail at delivery. Every spelling the grammar offers is refused.
+		`{{ .X }}`,
+		`{{ $.X }}`,
+		`{{ $p := secret "/run/token" }}{{ $p.X }}`,
+		`{{ $p := . }}{{ $p.X }}`,
+		`{{ with . }}{{ .X }}{{ end }}`,
+		`{{ if .X }}{{ end }}`,
+		`{{ define "d" }}{{ .X }}{{ end }}`,
+		`{{ (secret "/run/token").Missing }}`,
+		// Computed secret paths.
 		`{{ secret (secret "/run/token") }}`,
 		`{{ (secret (printf "/%s" (secret "/run/token"))).Missing }}`,
 		`{{ secret.X }}`,

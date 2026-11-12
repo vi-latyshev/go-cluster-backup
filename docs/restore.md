@@ -156,6 +156,27 @@ scoped to the prefix keeps the damage of a leaked key inside it. Keep
 versioning or object lock on the bucket, and run a restore with a role that is
 not the deployment's superuser. `SECURITY.md` states the trust model.
 
+## Apply options
+
+`restore.apply.<type>` holds one source type's options for `restore apply`, and
+`validate` decodes every block offline through that type's own decoder — no
+instance, no target and no I/O — before any fetch. A key that names no source
+type, a block for a type that cannot restore, a mistyped or missing required
+member, and a value its own rule refuses are all configuration errors there,
+not a restore's failure: a type that cannot restore is refused with *remove the
+block*, since the block is dead config. The check needs no declared instance,
+so a restore-only target type is checked too.
+
+`files` checks `side_by_side_dir` against its one value, `.Label`, and renders
+it against a sample run id: a render that fails or comes out empty is refused,
+as every mode did before. The directory's confinement under the restore root is
+the side-by-side mode's own rule, so `validate` does not refuse an absolute
+path or a traversal there — an in-place restore never reads the directory, and
+a side-by-side apply refuses it where the mode is known. Same boundary as a
+mode-dependent rule: `postgres` `in_place` requiring `jobs: 1` stays at apply
+time. `postgres` proves its required members and their ranges; `sqlite` proves
+its file mode.
+
 ## One Postgres database
 
 1. **Stop the writers** — scale the Deployments that use the database to 0 (and

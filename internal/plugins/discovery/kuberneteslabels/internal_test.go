@@ -3,6 +3,7 @@ package kuberneteslabels
 import (
 	"context"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 
 	"encoding/json/jsontext"
 
+	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi"
 )
 
@@ -362,5 +364,39 @@ func TestSecretValueThatIsNotBase64(t *testing.T) {
 	_, err = st.fromEnvVar(o, 0, e)
 	if err == nil || !strings.Contains(err.Error(), `secret ns/cred: key "PW" is not valid base64`) {
 		t.Fatalf("fromEnvVar = %v, want the undecodable value refused", err)
+	}
+}
+
+// TestProofErrorKeepsEveryClass: the helper that wraps a node read keeps the
+// API's own class — 403 permanent with the remedy, 404 not-found, a timeout or
+// 5xx transient with the retry wording — and marks only a cause with no class
+// of its own permanent, because a retry would ask the same question.
+func TestProofErrorKeepsEveryClass(t *testing.T) {
+	const remedy = "grant get on nodes"
+	cases := []struct {
+		name    string
+		cause   error
+		class   pluginerrors.Class
+		remedy  bool
+		retried bool
+	}{
+		{"permanent", pluginerrors.Permanent(errors.New("denied")), pluginerrors.ClassPermanent, true, false},
+		{"transient", pluginerrors.Transient(errors.New("503")), pluginerrors.ClassTransient, false, true},
+		{"not found", pluginerrors.NotFound(errors.New("missing")), pluginerrors.ClassNotFound, false, false},
+		{"unclassified", errors.New("mismatch"), pluginerrors.ClassPermanent, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := proofError(tc.cause, "cannot prove the node", remedy)
+			if class, _ := pluginerrors.ClassOf(err); class != tc.class {
+				t.Errorf("class = %q, want %q: %v", class, tc.class, err)
+			}
+			if got := strings.Contains(err.Error(), remedy); got != tc.remedy {
+				t.Errorf("remedy present = %t, want %t: %v", got, tc.remedy, err)
+			}
+			if got := strings.Contains(err.Error(), "read again"); got != tc.retried {
+				t.Errorf("retry wording present = %t, want %t: %v", got, tc.retried, err)
+			}
+		})
 	}
 }

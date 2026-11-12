@@ -265,6 +265,17 @@ type Restorer interface {
 	Apply(ctx context.Context, req ApplyRequest, src io.Reader) (ApplyReport, error)
 }
 
+// ApplyOptionsChecker is the optional capability of a source TYPE's config: it
+// decodes one restore.apply.<type> block offline exactly as Apply will — no
+// instance, no target and no I/O — so a mistyped member, a required one missing
+// or an unusable side-by-side label is refused by validate, not at the restore.
+// The label is the run id the restore would pass. A config answering
+// errors.ErrUnsupported has no restore-apply options, exactly like a type whose
+// instance is no Restorer.
+type ApplyOptionsChecker interface {
+	CheckApplyOptions(raw jsontext.Value, label string) error
+}
+
 type ProbeReport struct {
 	Entries int64
 	Bytes   int64

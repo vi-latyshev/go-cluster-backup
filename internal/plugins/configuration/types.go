@@ -29,6 +29,10 @@ type Validator interface{ Validate() error }
 type Template struct {
 	text string
 	tmpl *template.Template
+	// funcs is the function set the template was parsed with: the checker
+	// judges calls against it, and a judged render replaces one entry on a
+	// clone.
+	funcs template.FuncMap
 }
 
 func (t *Template) UnmarshalJSON(b []byte) error {
@@ -71,6 +75,7 @@ func (t *Template) finalize(name string, funcs template.FuncMap) error {
 		return err
 	}
 	t.tmpl = tmpl
+	t.funcs = funcs
 	return nil
 }
 

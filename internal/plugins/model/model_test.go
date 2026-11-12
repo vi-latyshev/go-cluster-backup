@@ -276,3 +276,35 @@ func TestStoredRunPolicyInputIsNeverStored(t *testing.T) {
 		t.Fatalf("policy input reached the stored form: %s", body)
 	}
 }
+
+// TestEnumListsAnswerMembership: every value list is the one membership source
+// the readers share — Valid, Known, the manifest validator — and a value
+// outside it is refused.
+func TestEnumListsAnswerMembership(t *testing.T) {
+	if !model.RunKind(model.RunKindScheduled).Valid() || !model.RunKind(model.RunKindManual).Valid() {
+		t.Fatal("a declared run kind is not valid")
+	}
+	if model.RunKind("hourly").Valid() {
+		t.Fatal("an unknown run kind is valid")
+	}
+	if !model.ExclusionIgnored.Known() || !model.ExclusionCovered.Known() || !model.ExclusionElsewhere.Known() {
+		t.Fatal("a declared exclusion kind is not known")
+	}
+	if model.ExclusionKind("guess").Known() {
+		t.Fatal("an unknown exclusion kind is known")
+	}
+	if !model.Listed(model.ArtifactOutcomeValues, model.ArtifactOK) || !model.Listed(model.ArtifactOutcomeValues, model.ArtifactFailed) {
+		t.Fatal("a declared artifact outcome is not listed")
+	}
+	if model.Listed(model.ArtifactOutcomeValues, "partial") {
+		t.Fatal("an unknown artifact outcome is listed")
+	}
+	for _, outcome := range []string{model.StorageVerified, model.StorageFailed, model.StorageSkipped} {
+		if !model.Listed(model.StorageOutcomeValues, outcome) {
+			t.Fatalf("a declared storage outcome %q is not listed", outcome)
+		}
+	}
+	if model.Listed(model.StorageOutcomeValues, "lost") {
+		t.Fatal("an unknown storage outcome is listed")
+	}
+}

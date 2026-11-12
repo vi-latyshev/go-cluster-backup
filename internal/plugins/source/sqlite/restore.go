@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 
+	"encoding/json/jsontext"
+
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
@@ -21,6 +23,20 @@ import (
 type ApplyOptions struct {
 	FileMode     string `json:"file_mode" doc:"octal mode of the restored database file, e.g. \"0644\""`
 	KeepPrevious bool   `json:"keep_previous" doc:"an in-place restore moves the current file aside instead of dropping it"`
+}
+
+// decodeApplyOptions is the one decoder of restore.apply.sqlite: the strict
+// decode with the required members and Validate. Apply and the offline check
+// call it, so a block validate accepts is one Apply decodes too.
+func decodeApplyOptions(raw jsontext.Value) (ApplyOptions, error) {
+	return configuration.DecodeOptions[ApplyOptions](raw, "restore.apply.sqlite")
+}
+
+// CheckApplyOptions decodes restore.apply.sqlite offline exactly as Apply does.
+// It builds nothing and reads no database.
+func (c Config) CheckApplyOptions(raw jsontext.Value, _ string) error {
+	_, err := decodeApplyOptions(raw)
+	return err
 }
 
 func (o ApplyOptions) Validate() error {
@@ -56,7 +72,7 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 	if !labelRe().MatchString(req.Label) {
 		return source.ApplyReport{}, fmt.Errorf("apply label %q is empty or carries characters no file name should carry", req.Label)
 	}
-	opts, err := configuration.DecodeOptions[ApplyOptions](req.Options, "restore.apply.sqlite")
+	opts, err := decodeApplyOptions(req.Options)
 	if err != nil {
 		return source.ApplyReport{}, err
 	}

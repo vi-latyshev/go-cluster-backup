@@ -46,12 +46,28 @@ const (
 	SensitivitySecret Sensitivity = "secret"
 )
 
+// SensitivityValues lists Sensitivity. Neither value is produced everywhere: a
+// deployment configures what its sources hold, and an undeclared accounting
+// entry is always plain (kuberneteslabels.go:1026).
+var SensitivityValues = []EnumValue{
+	{Value: string(SensitivityPlain), Everywhere: false, Producer: "kuberneteslabels/kuberneteslabels.go:1026 (an undeclared claim is plain)"},
+	{Value: string(SensitivitySecret), Everywhere: false, Producer: "a source's own artifact envelope"},
+}
+
 type Importance string
 
 const (
 	ImportanceRequired   Importance = "required"
 	ImportanceBestEffort Importance = "best_effort"
 )
+
+// ImportanceValues lists Importance. Neither value is produced everywhere: a
+// deployment decides each artifact's importance, and the config enum is the
+// only producer (kuberneteslabels.go:1080,1102).
+var ImportanceValues = []EnumValue{
+	{Value: string(ImportanceRequired), Everywhere: false, Producer: "a source's or rule's artifact envelope; kuberneteslabels.go:1080"},
+	{Value: string(ImportanceBestEffort), Everywhere: false, Producer: "a rule's or the accounting entry's envelope; kuberneteslabels.go:1102"},
+}
 
 type Outcome string
 
@@ -61,6 +77,28 @@ const (
 	OutcomeDegraded  Outcome = "degraded"
 	OutcomeFailed    Outcome = "failed"
 )
+
+// EnumValue is one value of a named string enum of this package: the value
+// itself, whether every deployment produces it, and the production site that
+// emits it. Every value such an enum declares is listed beside the type, and
+// the template checker reads the list: a pick over a statically known enum must
+// cover exactly the values marked Everywhere, never one that needs a deployment
+// choice the validated config may not have made.
+type EnumValue struct {
+	Value      string
+	Everywhere bool
+	Producer   string
+}
+
+// OutcomeValues lists Outcome. Every run outcome is produced by every
+// deployment: the start emits running (run.go:267), and the finish derives
+// delivered, degraded or failed from the results (reportOutcome, run.go:1481).
+var OutcomeValues = []EnumValue{
+	{Value: string(OutcomeRunning), Everywhere: true, Producer: "workflow/backup/run.go:267"},
+	{Value: string(OutcomeDelivered), Everywhere: true, Producer: "workflow/backup/run.go:1510"},
+	{Value: string(OutcomeDegraded), Everywhere: true, Producer: "workflow/backup/run.go:1508"},
+	{Value: string(OutcomeFailed), Everywhere: true, Producer: "workflow/backup/run.go:1505"},
+}
 
 // RunKind is the identity of one run — who asked for it — not a second
 // configuration profile: a manual run reads the same file a scheduled one does.
@@ -73,21 +111,64 @@ const (
 	RunKindManual    RunKind = "manual"
 )
 
-// Valid reports whether k is one of the two kinds this build knows.
-func (k RunKind) Valid() bool { return k == RunKindScheduled || k == RunKindManual }
+// RunKindValues lists RunKind. A scheduled run is what every deployment's
+// CronJob writes; a manual run needs a catalog that can hold the lease and a
+// manual retention partition, so not every configuration produces one
+// (workflow/backup/run.go:226,238).
+var RunKindValues = []EnumValue{
+	{Value: string(RunKindScheduled), Everywhere: true, Producer: "charts/go-cluster-backup cronjob; model.RunKindScheduled"},
+	{Value: string(RunKindManual), Everywhere: false, Producer: "workflow/backup/run.go:226,238"},
+}
 
-// Artifact outcomes within one run.
+// Valid reports whether k is one of the kinds this build knows.
+func (k RunKind) Valid() bool { return knownValue(RunKindValues, string(k)) }
+
+// knownValue reports whether v is one of the listed values.
+func knownValue(values []EnumValue, v string) bool {
+	for _, value := range values {
+		if value.Value == v {
+			return true
+		}
+	}
+	return false
+}
+
+// Listed reports whether v is one of the listed values: the one membership rule
+// the manifest reader shares with the enum-carrying fields.
+func Listed(values []EnumValue, v string) bool { return knownValue(values, v) }
+
+// Artifact outcomes within one run. The field is a plain string, as it was in
+// 2.2.0: the template surface must not change, and the values are a closed set
+// the value list below and the manifest reader check.
 const (
 	ArtifactOK     = "ok"
 	ArtifactFailed = "failed"
 )
 
-// Storage outcomes within one run.
+// ArtifactOutcomeValues lists the artifact outcomes. Every run produces both: a
+// produced artifact is ok (run.go:1209) and a failed plan or stream is failed
+// (run.go:1037).
+var ArtifactOutcomeValues = []EnumValue{
+	{Value: ArtifactOK, Everywhere: true, Producer: "workflow/backup/run.go:1209"},
+	{Value: ArtifactFailed, Everywhere: true, Producer: "workflow/backup/run.go:1037"},
+}
+
+// Storage outcomes within one run. The field is a plain string, as in 2.2.0.
 const (
 	StorageVerified = "verified"
 	StorageFailed   = "failed"
 	StorageSkipped  = "skipped"
 )
+
+// StorageOutcomeValues lists the storage outcomes. Every run produces all
+// three: a storage that uploaded is verified, one that failed is failed, and
+// one never tried — a refused run, an excluded storage — is skipped
+// (assembleResults, run.go:1458).
+var StorageOutcomeValues = []EnumValue{
+	{Value: StorageVerified, Everywhere: true, Producer: "workflow/backup/run.go:1462"},
+	{Value: StorageFailed, Everywhere: true, Producer: "workflow/backup/run.go:1460"},
+	{Value: StorageSkipped, Everywhere: true, Producer: "workflow/backup/run.go:1460"},
+}
 
 // Artifact is one logical unit of a run: one database dump, one cache snapshot,
 // one file TREE (a single tar stream), one sealed snapshot. One artifact = one object.
@@ -156,12 +237,20 @@ const (
 	ExclusionElsewhere ExclusionKind = "elsewhere"
 )
 
+// ExclusionKindValues lists ExclusionKind. Only the marker verdict is produced
+// by every deployment; covered needs a covering pod's dump (covers_volumes,
+// kuberneteslabels.go:494) and elsewhere needs declared peers
+// (kuberneteslabels.go:935).
+var ExclusionKindValues = []EnumValue{
+	{Value: string(ExclusionIgnored), Everywhere: true, Producer: "kuberneteslabels/kuberneteslabels.go:592"},
+	{Value: string(ExclusionCovered), Everywhere: false, Producer: "kuberneteslabels/kuberneteslabels.go:494 (covers_volumes)"},
+	{Value: string(ExclusionElsewhere), Everywhere: false, Producer: "kuberneteslabels/kuberneteslabels.go:935 (writer_nodes)"},
+}
+
 // Known reports whether k is an exclusion this build understands. Every reader
 // — the manifest validator, the discovery conformance kit — asks this one
 // method, so a new verdict is added here and nowhere else.
-func (k ExclusionKind) Known() bool {
-	return k == ExclusionIgnored || k == ExclusionCovered || k == ExclusionElsewhere
-}
+func (k ExclusionKind) Known() bool { return knownValue(ExclusionKindValues, string(k)) }
 
 // Exclusion is one object a run saw and deliberately did not back up: a record
 // of a decision, never of a failure. A run manifest carries one entry per
@@ -322,8 +411,9 @@ type RunReport struct {
 	// did not configure one.
 	WriterIdentity string `json:"writer_identity,omitempty"`
 	// Warnings are the run's coded, non-fatal problems that have no artifact
-	// to belong to — a catalog mark, settle or clear failure, a credential
-	// exception read from a stage record. Omitted when there are none.
+	// to belong to — a catalog mark, settle or clear failure. An artifact's own
+	// warning, such as a credential exception read from a stage record, lands on
+	// ArtifactResult.Warnings. Omitted when there are none.
 	Warnings []Warning `json:"warnings,omitempty"`
 }
 
