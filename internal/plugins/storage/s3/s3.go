@@ -22,7 +22,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -59,6 +61,16 @@ const (
 // part_bytes would be rejected at Complete time, so it is a config error here.
 const minPartBytes = 5 << 20
 
+// storageClassToken is the shape of one payload storage class the endpoint may
+// accept. It is deliberately not the AWS enum: an S3-compatible service names
+// its own classes (cloud.ru ICE, COLD, SINGLE), and the token is passed through
+// exactly as the deployment wrote it. Empty is the other accepted value and
+// means "send no class header", which leaves the bucket's default. The regexp is
+// built lazily: a package initializer does no work.
+var storageClassToken = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+})
+
 type Config struct {
 	Endpoint        string               `json:"endpoint" required:"true" doc:"base URL of the S3 endpoint, e.g. https://s3.example.com"`
 	Region          string               `json:"region" required:"true" doc:"signing region of the endpoint"`
@@ -67,7 +79,7 @@ type Config struct {
 	AccessKeyID     configuration.Secret `json:"access_key_id" doc:"file holding the access key id; an opaque string, e.g. <tenant_id>:<key_id>"`
 	SecretAccessKey configuration.Secret `json:"secret_access_key" doc:"file holding the secret access key"`
 	Addressing      string               `json:"addressing" required:"true" doc:"addressing style: path or virtual"`
-	StorageClass    string               `json:"storage_class" doc:"storage class of every object, e.g. STANDARD"`
+	StorageClass    string               `json:"storage_class" doc:"storage class of artifact objects, exactly as the endpoint names it, e.g. STANDARD or ICE; empty sends no class header and leaves the bucket's default. Run manifests are always STANDARD"`
 	RequestChecksum string               `json:"request_checksum" doc:"request checksum mode: when_required or when_supported"`
 	PartBytes       model.ByteSize       `json:"part_bytes" doc:"bytes per part of a multipart upload; at least 5 MiB"`
 	MaxRequestBytes model.ByteSize       `json:"max_request_bytes" doc:"largest single request the endpoint accepts"`
@@ -103,18 +115,9 @@ func newStorage(ctx context.Context, cfg Config, _ instances.Deps, _ storage.Bui
 	default:
 		return nil, fmt.Errorf("addressing %q must be %q or %q", cfg.Addressing, AddressingPath, AddressingVirtual)
 	}
-	if cfg.StorageClass == "" {
-		return nil, errors.New("storage_class is empty")
-	}
-	known := false
-	for _, sc := range types.StorageClass("").Values() {
-		if string(sc) == cfg.StorageClass {
-			known = true
-			break
-		}
-	}
-	if !known {
-		return nil, fmt.Errorf("storage_class %q is not one S3 defines", cfg.StorageClass)
+	if cfg.StorageClass != "" && !storageClassToken().MatchString(cfg.StorageClass) {
+		return nil, fmt.Errorf("storage_class %q must be 1-64 letters, digits, %q or %q, or empty to send no class header",
+			cfg.StorageClass, "_", "-")
 	}
 	var checksum aws.RequestChecksumCalculation
 	switch cfg.RequestChecksum {
@@ -252,10 +255,23 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 		return model.ObjectInfo{}, err
 	}
 	full := s.key(req.Key)
-	if err := s.putSingle(ctx, c, full, req.Size, body); err != nil {
+	if err := s.putSingle(ctx, c, full, req.Size, s.storageClass(req.Purpose), body); err != nil {
 		return model.ObjectInfo{}, err
 	}
 	return model.ObjectInfo{Key: req.Key, Size: req.Size}, nil
+}
+
+// storageClass is the class one request declares. A run manifest is metadata:
+// it is always STANDARD, whatever class the artifacts use, because every
+// survey, retention pass and restore reads it first and a cold payload class
+// must never make that read a retrieval or an InvalidObjectState. An artifact
+// gets the configured token; an empty token sends no header at all, which
+// leaves the bucket's default in force.
+func (s *Storage) storageClass(p storage.Purpose) types.StorageClass {
+	if p == storage.PurposeMetadata {
+		return types.StorageClassStandard
+	}
+	return types.StorageClass(s.cfg.StorageClass)
 }
 
 // putSingle sends the whole object in one request — the only path that can be
@@ -263,7 +279,7 @@ func (s *Storage) Put(ctx context.Context, req storage.PutRequest, body io.Reade
 // returns the object's md5 as its ETag. A body shorter than ContentLength fails
 // the request inside net/http, so the declared size is never a claim the send
 // did not honour.
-func (s *Storage) putSingle(ctx context.Context, c *s3.Client, full string, size int64, body io.Reader) error {
+func (s *Storage) putSingle(ctx context.Context, c *s3.Client, full string, size int64, class types.StorageClass, body io.Reader) error {
 	rctx, cancel := s.reqCtx(ctx)
 	defer cancel()
 	_, err := c.PutObject(rctx, &s3.PutObjectInput{
@@ -271,7 +287,7 @@ func (s *Storage) putSingle(ctx context.Context, c *s3.Client, full string, size
 		Key:           aws.String(full),
 		Body:          body,
 		ContentLength: aws.Int64(size),
-		StorageClass:  types.StorageClass(s.cfg.StorageClass),
+		StorageClass:  class,
 	})
 	if err != nil {
 		return s.classify(ctx, err, "put "+full)

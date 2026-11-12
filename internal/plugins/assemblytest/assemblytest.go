@@ -48,9 +48,15 @@ type World struct {
 	ExtraStorages map[string]storage.Storage
 	Storages      map[string]*storagetest.Fake
 	Processors    map[string]*Processor
-	Discoveries   map[string]*Discovery
-	Notifiers     map[string]*Notifier
-	Catalog       *Catalog
+	// ExtraProcessors replaces the plain fake for one instance name, for a
+	// processor whose Describe a test scripts beyond the fake's fields.
+	ExtraProcessors map[string]processor.Processor
+	Discoveries     map[string]*Discovery
+	Notifiers       map[string]*Notifier
+	Catalog         *Catalog
+	// ExtraDiscoveries replaces the plain fake for one instance name, for a
+	// discovery that answers an optional capability beyond the fake's fields.
+	ExtraDiscoveries map[string]discovery.Discoverer
 	// configs is the config every source instance was built from, by instance
 	// name: what proves the run handed a unit's own config to the build.
 	Configs map[string]map[string]jsontext.Value
@@ -58,15 +64,17 @@ type World struct {
 
 func NewWorld(register RegisterFunc) (*World, error) {
 	w := &World{
-		Registry:      instances.NewRegistry(),
-		Sources:       map[string]*Source{},
-		ExtraSources:  map[string]source.Source{},
-		ExtraStorages: map[string]storage.Storage{},
-		Storages:      map[string]*storagetest.Fake{},
-		Processors:    map[string]*Processor{},
-		Discoveries:   map[string]*Discovery{},
-		Notifiers:     map[string]*Notifier{},
-		Configs:       map[string]map[string]jsontext.Value{},
+		Registry:         instances.NewRegistry(),
+		Sources:          map[string]*Source{},
+		ExtraSources:     map[string]source.Source{},
+		ExtraStorages:    map[string]storage.Storage{},
+		Storages:         map[string]*storagetest.Fake{},
+		Processors:       map[string]*Processor{},
+		ExtraProcessors:  map[string]processor.Processor{},
+		Discoveries:      map[string]*Discovery{},
+		Notifiers:        map[string]*Notifier{},
+		ExtraDiscoveries: map[string]discovery.Discoverer{},
+		Configs:          map[string]map[string]jsontext.Value{},
 	}
 	registerFakes(w)
 	lr := loader.New()
@@ -118,6 +126,9 @@ func registerFakes(w *World) {
 	must.Do(0, instances.Register(w.Registry, processor.Kind, instances.FactorySpec[map[string]jsontext.Value, processor.Processor]{
 		Type: "fake", Example: []byte(`{}`),
 		New: func(_ context.Context, _ map[string]jsontext.Value, deps instances.Deps) (processor.Processor, error) {
+			if p, ok := w.ExtraProcessors[deps.Instance]; ok {
+				return p, nil
+			}
 			p, ok := w.Processors[deps.Instance]
 			if !ok {
 				p = &Processor{}
@@ -130,6 +141,9 @@ func registerFakes(w *World) {
 	must.Do(0, instances.Register(w.Registry, discovery.Kind, instances.FactorySpec[map[string]jsontext.Value, discovery.Discoverer]{
 		Type: "fake", Example: []byte(`{}`),
 		New: func(_ context.Context, _ map[string]jsontext.Value, deps instances.Deps) (discovery.Discoverer, error) {
+			if d, ok := w.ExtraDiscoveries[deps.Instance]; ok {
+				return d, nil
+			}
 			d, ok := w.Discoveries[deps.Instance]
 			if !ok {
 				d = &Discovery{}
@@ -260,6 +274,7 @@ func ConfigRun(spoolDir string) map[string]any {
 		"holder_namespace_env":      "",
 		"holder_pod_env":            "",
 		"holder_uid_env":            "",
+		"writer_identity":           "",
 		"retry": map[string]any{
 			"attempts": 3, "initial_delay": "1ms", "max_delay": "5ms", "jitter": 0,
 		},
@@ -284,7 +299,10 @@ func SourceInstance(typ, group, name string, pipeline []string, importance, sens
 		"type":     typ,
 		"artifact": map[string]any{"group": group, "name": name, "importance": importance, "sensitivity": sensitivity},
 		"pipeline": pipeline,
-		"config":   map[string]any{},
+		// The defaults document supplies this in a real merged config; a test
+		// config is decoded strictly without the merge, so the fixture states it.
+		"rate_limit": int64(0),
+		"config":     map[string]any{},
 	}
 }
 
@@ -443,6 +461,24 @@ func (c *ChainSource) RecordedChain(ctx context.Context) ([]model.ProcessorStep,
 		return nil, Err
 	}
 	return c.Chain, nil
+}
+
+// CredentialSource is a source whose bytes carry credentials, answering the
+// optional policy with the verdict a test configures: the one way a source type
+// declares its published plaintext exception.
+type CredentialSource struct {
+	Source
+	Verdict     source.CredentialVerdict
+	PolicyErr   error
+	PolicyCalls int
+}
+
+func (c *CredentialSource) CredentialPolicy(ctx context.Context) (source.CredentialVerdict, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	c.PolicyCalls++
+	return c.Verdict, c.PolicyErr
 }
 
 func (f *Source) Dump(ctx context.Context, dst io.Writer) error {

@@ -346,10 +346,11 @@ func completedDigest(digest string) string { return strings.TrimPrefix(digest, p
 // survey that did not finish is recorded as the empty digest, invalidating the
 // earlier observation.
 //
-// It reports whether occupancy is now known. A clear that fails leaves the
-// record uncertain — conservative, and the run continues unknown. Only a
-// scheduled run observes: a manual run under unknown occupancy writes nothing,
-// and its survey is not evidence anyone trusts.
+// It reports whether occupancy is now known. A clear or observation that fails
+// leaves the record uncertain — conservative, the run continues unknown — and
+// returns the failure: the caller reports it beside the outcome, never as a
+// refusal. Only a scheduled run observes: a manual run under unknown occupancy
+// writes nothing, and its survey is not evidence anyone trusts.
 func (l *Lease) SettleInheritedUncertainty(ctx context.Context, kind model.RunKind, runID string,
 	storages []string, surveys map[string]inventory.Survey) (bool, error) {
 	if !l.held {
@@ -367,7 +368,10 @@ func (l *Lease) SettleInheritedUncertainty(ctx context.Context, kind model.RunKi
 	}
 	if l.clean && l.completed != "" && l.completed == digest {
 		if err := l.ClearUncertainty(ctx); err != nil {
-			return false, nil
+			// The record stays uncertain — conservative, and the run continues
+			// unknown. The error is the caller's warning, never a reason to refuse:
+			// clearing is not a condition of writing.
+			return false, err
 		}
 		return true, nil
 	}

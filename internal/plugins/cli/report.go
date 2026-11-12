@@ -72,6 +72,12 @@ func printRunReport(w io.Writer, rep model.RunReport, machine bool) {
 		human.Count("ok", int64(ok)), human.Count("failed", int64(failed)),
 		human.Count("excluded", int64(len(rep.Excluded))),
 		human.Bytes("raw", raw), human.Bytes("stored", stored)), machine)
+	// Coded, non-fatal facts are part of the answer: a credential exception that
+	// only lived in the manifest would read as a clean night.
+	for _, warn := range rep.Warnings {
+		writeEvent(w, now, human.New("run.warning",
+			human.Text("code", warn.Code), human.Text("reason", warn.Message)), machine)
+	}
 	// A failure is the one thing the summary must not bury: name each one with
 	// the reason it failed, before the storage lines.
 	for _, a := range rep.Artifacts {
@@ -93,6 +99,13 @@ func printRunReport(w io.Writer, rep model.RunReport, machine bool) {
 				human.Text("artifact", human.ArtifactLabel(a.Artifact.Group, a.Artifact.Name)),
 				human.Count("skipped", a.Stats.SkippedEntries),
 				human.Count("padded", a.Stats.PaddedFiles)), machine)
+		}
+		// An artifact's own coded facts: the credential exception the stage and
+		// the run record beside it, shown where the artifact is named.
+		for _, warn := range a.Warnings {
+			writeEvent(w, now, human.New("artifact.warning",
+				human.Text("artifact", human.ArtifactLabel(a.Artifact.Group, a.Artifact.Name)),
+				human.Text("code", warn.Code), human.Text("reason", warn.Message)), machine)
 		}
 	}
 	// The covered/ignored objects are machine detail: the summary counts them and

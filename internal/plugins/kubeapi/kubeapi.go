@@ -164,6 +164,10 @@ type Volume struct {
 type Pod struct {
 	Metadata ObjectMeta `json:"metadata"`
 	Spec     struct {
+		// NodeName is the node the pod is scheduled on; empty while it is
+		// not. It is how a node-scoped discovery proves which writer owns the
+		// pod, and which node's directory an unpinned hostPath claim lives in.
+		NodeName   string      `json:"nodeName"`
 		Containers []Container `json:"containers"`
 		Volumes    []Volume    `json:"volumes"`
 	} `json:"spec"`
@@ -254,6 +258,15 @@ type Event struct {
 	LastTimestamp string `json:"lastTimestamp"`
 }
 
+// Node is a core/v1 Node, as far as proving which node this process runs on
+// needs it: the name the API server answers for. Reading it is the write-side
+// ownership proof — a node-local path may be read only on a node the API
+// confirms exists, and a denied read is a missing RBAC grant, not an absent
+// node.
+type Node struct {
+	Metadata ObjectMeta `json:"metadata"`
+}
+
 // PVC is a persistent volume claim. Phase is the API server's own vocabulary —
 // Pending, Bound, Lost — which no rule chooses: a Lost claim has lost its
 // binding and with it its data.
@@ -267,6 +280,33 @@ type PVC struct {
 	Status struct {
 		Phase string `json:"phase"`
 	} `json:"status"`
+}
+
+// NodeSelectorRequirement is one match expression or field requirement of a
+// required node affinity term. Operator is the API's own vocabulary — In,
+// NotIn, Exists, DoesNotExist, Gt, Lt — and a value no operator argues for
+// matches nothing, so an affinity this client cannot evaluate is never read as
+// compatible.
+type NodeSelectorRequirement struct {
+	Key      string   `json:"key"`
+	Operator string   `json:"operator"`
+	Values   []string `json:"values"`
+}
+
+// NodeSelectorTerm is one alternative of a required node affinity: every
+// requirement in it must hold, and the terms are ORed.
+type NodeSelectorTerm struct {
+	MatchExpressions []NodeSelectorRequirement `json:"matchExpressions"`
+	MatchFields      []NodeSelectorRequirement `json:"matchFields"`
+}
+
+// NodeAffinity is the node selector half of a persistent volume's affinity.
+// Required is the one a volume cannot be used without; an absent or empty
+// required block pins nothing.
+type NodeAffinity struct {
+	Required *struct {
+		NodeSelectorTerms []NodeSelectorTerm `json:"nodeSelectorTerms"`
+	} `json:"required"`
 }
 
 // PV is a persistent volume: where a claim's data actually lives, which is how
@@ -283,6 +323,11 @@ type PV struct {
 		HostPath *struct {
 			Path string `json:"path"`
 		} `json:"hostPath"`
+		// NodeAffinity is where the volume says its data lives. A local volume
+		// without a required affinity cannot prove a node at all, and one
+		// whose affinity does not match this writer's node holds another
+		// node's directory.
+		NodeAffinity *NodeAffinity `json:"nodeAffinity"`
 		// ClaimRef is the claim the volume is bound to: the API server sets it
 		// on binding, and no claim owns a volume without one. UID is the
 		// claim's incarnation — deleting and recreating a claim of the same
@@ -510,6 +555,18 @@ func (c *Client) GetPod(ctx context.Context, namespace, name string) (Pod, error
 		return Pod{}, err
 	}
 	return p, nil
+}
+
+// GetNode fetches one Node by name — a cluster-scoped read. It is how a writer
+// proves the node it believes it runs on is readable: a 403 is a missing
+// `nodes get` grant, never evidence that the node is absent.
+func (c *Client) GetNode(ctx context.Context, name string) (Node, error) {
+	var n Node
+	path := "/api/v1/nodes/" + url.PathEscape(name)
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &n); err != nil {
+		return Node{}, err
+	}
+	return n, nil
 }
 
 // GetConfigMap fetches one ConfigMap by name.

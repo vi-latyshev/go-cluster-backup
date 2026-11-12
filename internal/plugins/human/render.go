@@ -66,9 +66,18 @@ func render(ev Event) string {
 	case "artifact.machine":
 		return fmt.Sprintf("  machine %s", b.text("detail"))
 	case "discovery.summary":
-		return fmt.Sprintf("discovery: %d artifacts (%d covered or ignored)", b.num("artifacts"), b.num("covered"))
+		line := fmt.Sprintf("discovery: %d artifacts (%d covered or ignored", b.num("artifacts"), b.num("covered"))
+		// An elsewhere object is a declared delegation, not a decision this
+		// writer made: it is named apart, so a night that delegated half the
+		// cluster does not read as a night that ignored it.
+		if elsewhere := b.num("elsewhere"); elsewhere != 0 {
+			line += fmt.Sprintf(", %d elsewhere", elsewhere)
+		}
+		return line + ")"
 	case "discovery.excluded":
 		return fmt.Sprintf("excluded %s (%s): %s", b.text("object"), b.text("kind"), b.text("reason"))
+	case "discovery.node.unreadable":
+		return fmt.Sprintf("cannot prove this pod's node (%s): %s", b.text("env"), b.text("reason"))
 	case "artifact.start":
 		return fmt.Sprintf("── %s (%s)", b.text("artifact"), b.text("importance"))
 	case "artifact.done":
@@ -107,7 +116,9 @@ func render(ev Event) string {
 	case "storage.upload.failed":
 		return fmt.Sprintf("✗ %s: %s", b.text("artifact"), b.text("reason"))
 	case "storage.cap.refused":
-		return fmt.Sprintf("✗ %s: refused, over the configured cap — %s", b.text("artifact"), b.text("reason"))
+		// A refusal says the cap decided, not that the cap was exceeded: the
+		// ledger may not know the occupancy at all, and the reason names which.
+		return fmt.Sprintf("✗ %s: refused by the storage cap — %s", b.text("artifact"), b.text("reason"))
 	case "storage.cap.overflow":
 		return fmt.Sprintf("✗ over the configured cap by %s: %s", Size(b.num("over")), b.text("reason"))
 	case "lease.acquired":
@@ -158,6 +169,8 @@ func render(ev Event) string {
 		return fmt.Sprintf("✗ %s: the check failed, the event is not delivered: %s", b.text("event"), b.text("reason"))
 	case "source.file.padded":
 		return fmt.Sprintf("padded %s: %s", b.text("path"), b.text("reason"))
+	case "source.file.changed":
+		return fmt.Sprintf("changed %s: %s", b.text("path"), b.text("reason"))
 	case "source.entry.skipped":
 		return fmt.Sprintf("left out %s: %s", b.text("path"), b.text("reason"))
 	case "storage.folder.empty":

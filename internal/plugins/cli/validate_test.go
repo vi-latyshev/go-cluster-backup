@@ -16,6 +16,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
 // harnessLoader is the compiled view of the harness configuration: the hostless
@@ -386,6 +387,12 @@ func TestValidatePreflightReportsExclusions(t *testing.T) {
 		Type:     "a-type-no-registry-knows",
 		Artifact: model.Artifact{Group: "volumes", Name: "ns/media", Importance: model.ImportanceRequired, Sensitivity: model.SensitivityPlain},
 		Excluded: model.ExclusionIgnored, ExcludedReason: "carries the exclusion marker backup.example/ignore=true",
+	}, {
+		Name:     "peer_thing",
+		Type:     "a-type-no-registry-knows",
+		Artifact: model.Artifact{Group: "volumes", Name: "ns/peer", Importance: model.ImportanceRequired, Sensitivity: model.SensitivityPlain},
+		Excluded: model.ExclusionElsewhere, ExcludedReason: "a declared peer writer backs it up",
+		ExcludedNode: "node-b",
 	}}
 	body := `discoveries:
   workloads:
@@ -400,8 +407,9 @@ func TestValidatePreflightReportsExclusions(t *testing.T) {
 	}
 	for _, want := range []string{
 		"source/excluded_thing: excluded (ignored): carries the exclusion marker backup.example/ignore=true",
+		"source/peer_thing: excluded (elsewhere of node node-b): a declared peer writer backs it up",
 		"preflight: 0 of 4 instances failed",
-		"preflight: 1 objects excluded",
+		"preflight: 2 objects excluded",
 	} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("preflight output does not carry %q:\n%s", want, stdout)
@@ -598,5 +606,155 @@ storages:
 				t.Errorf("the refusal does not carry %q:\n%s", tc.want, stderr)
 			}
 		})
+	}
+}
+
+// TestValidateWarnsAboutAPublishedCredentialException: a plain k3s_state
+// configuration is the type's published exception, so validate names the coded
+// warning and stays valid — the same bytes a run warns about, not fails.
+func TestValidateWarnsAboutAPublishedCredentialException(t *testing.T) {
+	w := newWorld()
+	dir := t.TempDir()
+	path := mustWrite(t, dir, "config.yaml", configYAML(dir, "storages:\n"+exchangeYAML(dir+"/exchange")+faultyYAML+`
+sources:
+  node_state:
+    type: k3s_state
+    artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: plain}
+    pipeline: [zstd]
+    config: {datastore: /k3s-db/state.db, token: {file: /k3s-token}, scratch_dir: /plain, busy_timeout: 10s, integrity_check: quick, timeout: 2m}
+processors:
+  zstd: {type: zstd, config: {level: fastest, concurrency: 1, window_bytes: 1MiB, decode_window_bytes: 1MiB}}
+`))
+	code, stdout, stderr := w.main(context.Background(), "validate", "--config", path)
+	if code != exitOK {
+		t.Fatalf("validate: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "warning: source.credentials.unsealed:") {
+		t.Fatalf("validate did not name the credential warning:\n%s", stderr)
+	}
+	if !strings.Contains(stdout, "valid") {
+		t.Fatalf("validate did not answer:\n%s", stdout)
+	}
+}
+
+// TestValidateRefusesPlaintextCredentialBytes: a source whose bytes are
+// credentials unconditionally — k3s_etcd has no published exception — is
+// refused offline, before the first byte, exactly as the run's Resolve refuses
+// it.
+func TestValidateRefusesPlaintextCredentialBytes(t *testing.T) {
+	w := newWorld()
+	dir := t.TempDir()
+	path := mustWrite(t, dir, "config.yaml", configYAML(dir, "storages:\n"+exchangeYAML(dir+"/exchange")+faultyYAML+`
+sources:
+  node_etcd:
+    type: k3s_etcd
+    artifact: {group: control-plane, name: k3s-etcd, importance: required, sensitivity: plain}
+    pipeline: []
+    config: {snapshot_dir: /var/lib/rancher/k3s/server/db/snapshots, token: {file: /var/lib/rancher/k3s/server/token}, max_age: 26h}
+`))
+	code, _, stderr := w.main(context.Background(), "validate", "--config", path)
+	if code != exitFailure {
+		t.Fatalf("validate accepted plaintext credential bytes: exit %d\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "carries credentials and its pipeline has no sealing processor") {
+		t.Fatalf("the refusal does not name the credential rule:\n%s", stderr)
+	}
+}
+
+// TestValidateRequiresAWriterIdentityForNodeScope: a discovery that narrows
+// every writer to its own node cannot account for a peer's runs without the
+// stable writer id protection partitions by. Validate refuses the pair offline,
+// naming both fields, and accepts the same file once the identity is stated.
+func TestValidateRequiresAWriterIdentityForNodeScope(t *testing.T) {
+	w := newWorld()
+	dir := t.TempDir()
+	body := `discoveries:
+  workloads:
+    type: kubernetes_labels
+    config:
+      api_host_env: KUBERNETES_SERVICE_HOST
+      api_port_env: KUBERNETES_SERVICE_PORT
+      token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      request_timeout: 5s
+      secrets_path: /tmp/secrets
+      list_page_size: 50
+      exclude: {label: backup.test/ignore, value: "true"}
+      undeclared_volumes: {name: undeclared, importance: required}
+      node_env: BACKUP_NODE_NAME
+      node_scope: true
+      writer_nodes: [node-a]
+      pods: []
+      volumes:
+        - name: volumes
+          selector: backup.test/engine=files
+          phase: Bound
+          min_matches: 0
+          rate_limit: 0
+          artifact: {group: volumes, name: "{{ .Namespace }}/{{ .Name }}", importance: required, sensitivity: plain}
+          pipeline: [squeeze]
+          source: {type: files, config: {root: "{{ volumePath }}", ignore_vanished: true, on_change: record}}
+` + zstdYAML + "storages:\n" + exchangeYAML(dir+"/exchange") + faultyYAML
+	path := mustWrite(t, dir, "config.yaml", configYAML(dir, body))
+
+	code, _, stderr := w.main(context.Background(), "validate", "--config", path)
+	if code != exitFailure {
+		t.Fatalf("validate accepted node_scope without a writer identity: exit %d\n%s", code, stderr)
+	}
+	for _, want := range []string{"node_scope", "run/writer_identity", "/discoveries/workloads"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the refusal does not name %q:\n%s", want, stderr)
+		}
+	}
+
+	// The same file with the writer named is valid: the rejection is the missing
+	// pair member, not the node scope itself.
+	withIdentity := strings.Replace(configYAML(dir, body), "  writer_identity: \"\"", "  writer_identity: node-a", 1)
+	path = mustWrite(t, dir, "named.yaml", withIdentity)
+	code, stdout, stderr := w.main(context.Background(), "validate", "--config", path)
+	if code != exitOK {
+		t.Fatalf("validate refused a named node-scoped writer: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
+// TestValidatePreflightShowsDiscoveredCredentialFacts is the review's M2/M3
+// surface: a discovered source answers the run's credential rule — the refusal
+// fails the preflight, the published exception is printed beside its ok row
+// instead of being swallowed.
+func TestValidatePreflightShowsDiscoveredCredentialFacts(t *testing.T) {
+	w := newWorld()
+	dir := t.TempDir()
+	w.credentialBytes["warned"] = true
+	w.credentialVerdicts["warned"] = source.CredentialWarn
+	w.credentialBytes["refused"] = true
+	config := jsontext.Value(`{"payload": "x", "dir": "", "origin": "test:found"}`)
+	w.found["workloads"] = []discovery.Found{
+		{Name: "warned", Type: "synthetic", Config: config,
+			Artifact: model.Artifact{Name: "g/warned", Group: "g", Importance: model.ImportanceRequired, Sensitivity: model.SensitivityPlain},
+			Pipeline: []string{}},
+		{Name: "refused", Type: "synthetic", Config: config,
+			Artifact: model.Artifact{Name: "g/refused", Group: "g", Importance: model.ImportanceRequired, Sensitivity: model.SensitivityPlain},
+			Pipeline: []string{}},
+	}
+	body := `discoveries:
+  workloads:
+    type: fakediscovery
+    config: {}
+` + "storages:\n" + exchangeYAML(dir+"/exchange") + faultyYAML
+	cfg := mustWrite(t, dir, "config.yaml", configYAML(dir, body))
+
+	code, stdout, stderr := w.main(context.Background(), "validate", "--config", cfg, "--preflight")
+	if code != exitFailure {
+		t.Fatalf("a discovered credential refusal did not fail the preflight: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"source/warned: ok (warning source.credentials.unsealed:",
+		"anyone who can read the storage",
+		"source/refused: FAILED",
+		"carries credentials",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("the preflight output does not carry %q:\n%s", want, stdout)
+		}
 	}
 }

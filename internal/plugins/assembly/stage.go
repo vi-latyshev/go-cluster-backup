@@ -57,6 +57,7 @@ func (e *Assembly) projectedStageSources() []stage.Source {
 			Instance:  sb.inst,
 			Artifact:  sb.artifact,
 			Pipeline:  sb.pipeline,
+			RateLimit: sb.rateLimit,
 			Steps:     e.pipelineSteps(sb.refs, sb.procs),
 		})
 	}

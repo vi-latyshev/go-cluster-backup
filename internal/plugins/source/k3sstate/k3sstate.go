@@ -13,7 +13,6 @@
 package k3sstate
 
 import (
-	"archive/tar"
 	"context"
 	"errors"
 	"fmt"
@@ -23,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
@@ -123,6 +121,8 @@ type Source struct {
 
 var _ instances.Checker = (*Source)(nil)
 
+var _ source.CredentialPolicy = (*Source)(nil)
+
 // Check is the preflight, and it asserts only what it can know from here: the
 // scratch directory exists and this process can write in it, the datastore and
 // the token can be opened, and sqlite3 is on PATH. The scratch directory's
@@ -156,14 +156,29 @@ func (s *Source) Check(ctx context.Context) error {
 
 // Describe names the datastore as the origin — a path, no credentials. The
 // artifact is not sealed here: the stage pipeline's processor is what seals it.
+// The bytes carry the server token, so they are credential content whatever the
+// config's sensitivity says; CredentialPolicy is the published exception that
+// keeps an existing plaintext configuration warning instead of refusing.
 func (s *Source) Describe(ctx context.Context) (source.SourceTraits, error) {
 	if err := ctx.Err(); err != nil {
 		return source.SourceTraits{}, err
 	}
 	return source.SourceTraits{
-		Ext:    ".tar",
-		Origin: (&url.URL{Scheme: "sqlite3", Path: s.cfg.Datastore}).String(),
+		Ext:         ".tar",
+		Origin:      (&url.URL{Scheme: "sqlite3", Path: s.cfg.Datastore}).String(),
+		Credentials: true,
 	}, nil
+}
+
+// CredentialPolicy keeps the published plaintext k3s_state configuration
+// working through 2.x: a run whose pipeline does not seal these bytes proceeds
+// with a coded warning naming the exposure, never silently and never as a run
+// that claims the artifact is protected. A sealed pipeline never asks.
+func (s *Source) CredentialPolicy(ctx context.Context) (source.CredentialVerdict, error) {
+	if err := ctx.Err(); err != nil {
+		return source.CredentialRefuse, err
+	}
+	return source.CredentialWarn, nil
 }
 
 // workPrefix names the entries this package creates in the scratch directory —
@@ -257,7 +272,9 @@ func (s *Source) checkIntegrity(ctx context.Context, work, copyPath string) erro
 	return nil
 }
 
-// pack writes one tar stream holding the copy and the token. The token is read
+// pack writes one tar stream holding the copy and the token through the shared
+// deterministic packer: fixed epoch, state.db 0644 and token 0600, so two
+// snapshots of an unchanged datastore are byte-identical. The token is read
 // from its source file straight into the stream: it never lands in the scratch
 // directory, so the only plaintext copy on disk is the datastore's.
 func (s *Source) pack(ctx context.Context, dst io.Writer, copyPath string) error {
@@ -269,50 +286,20 @@ func (s *Source) pack(ctx context.Context, dst io.Writer, copyPath string) error
 	if err != nil {
 		return fmt.Errorf("stat of the datastore copy: %w", err)
 	}
-	tw := tar.NewWriter(dst)
-	// Header times are fixed: two snapshots of an unchanged datastore must
-	// produce identical bytes, so the artifact is compared by content.
-	epoch := time.Unix(0, 0)
-	entries := []struct {
-		name string
-		mode int64
-		body []byte
-		size int64
-	}{
-		{"state.db", 0o644, nil, info.Size()},
-		{"token", 0o600, token, int64(len(token))},
+	f, err := openFile(copyPath)
+	if err != nil {
+		return fmt.Errorf("open of the datastore copy: %w", err)
 	}
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := tw.WriteHeader(&tar.Header{
-			Name: entry.name, Mode: entry.mode, Size: entry.size,
-			Typeflag: tar.TypeReg, ModTime: epoch,
-		}); err != nil {
-			return fmt.Errorf("tar header %s: %w", entry.name, err)
-		}
-		if entry.body != nil {
-			if _, err := tw.Write(entry.body); err != nil {
-				return fmt.Errorf("tar body %s: %w", entry.name, err)
-			}
-			continue
-		}
-		f, err := openFile(copyPath)
-		if err != nil {
-			return fmt.Errorf("open of the datastore copy: %w", err)
-		}
-		_, copyErr := pluginio.CopyContext(ctx, tw, f)
-		closeErr := closeFile(f)
-		if copyErr != nil {
-			return fmt.Errorf("tar body %s: %w", entry.name, copyErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close of the datastore copy: %w", closeErr)
-		}
+	packErr := pluginio.WriteTar(ctx, dst, []pluginio.TarEntry{
+		{Name: "state.db", Mode: 0o644, Read: f, Size: info.Size()},
+		{Name: "token", Mode: 0o600, Body: token},
+	})
+	closeErr := closeFile(f)
+	if packErr != nil {
+		return packErr
 	}
-	if err := tw.Close(); err != nil {
-		return fmt.Errorf("tar trailer: %w", err)
+	if closeErr != nil {
+		return fmt.Errorf("close of the datastore copy: %w", closeErr)
 	}
 	return nil
 }

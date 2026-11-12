@@ -48,6 +48,11 @@ run:
   holder_namespace_env: BACKUP_POD_NAMESPACE
   holder_pod_env: BACKUP_POD_NAME
   holder_uid_env: BACKUP_POD_UID
+  # The stable writer id a per-node deployment opts into: every manifest stores
+  # it, and protection tells a peer writer's runs from this writer's by it. Empty
+  # is the ordinary single-writer deployment; a shared prefix with several
+  # writers sets one per node and shares the catalog between them.
+  writer_identity: ""
 
 layout: # stored format: never change once runs exist
   run_prefix: "runs/{{ .Run.ID }}"
@@ -70,6 +75,12 @@ restore:
 instance:
   source:
     artifact: {importance: required}
+    # Raw bytes per second the source may produce, before the first processor:
+    # 0 is unlimited, and that is the default. The burst is part of the
+    # implementation (at most 1 MiB), never a second knob. Spreading reads over
+    # time extends the dump's snapshot and lock window; it never reduces the
+    # server's total work.
+    rate_limit: 0
   storage:
     # The most calls a run holds in flight to one storage: the manifest
     # reads of a survey, the parts of a multipart upload. Raise it for a fast
@@ -123,16 +134,24 @@ plugins:
       request_timeout: 30s
       list_page_size: 500
       undeclared_volumes: {name: undeclared}
+      # The chart fills this variable from spec.nodeName in every writer pod. An
+      # empty value is the explicit opt-out of every node check; node_scope turns
+      # the proof into a writer scope and requires the declared writer_nodes.
+      node_env: BACKUP_NODE_NAME
+      node_scope: false
+      writer_nodes: []
       pods[]:
         phase: Running
         # 0 is the explicit way to say "an empty result is fine": a rule that may
         # match nothing says so once, here, instead of in every rule.
         min_matches: 0
         artifact: {importance: required}
+        rate_limit: 0
       volumes[]:
         phase: Bound
         min_matches: 0
         artifact: {importance: required}
+        rate_limit: 0
 
     catalog/kubernetes_configmap:
       # The lease key is a stored format: another process reads the same claim.
@@ -148,6 +167,10 @@ plugins:
     notifier/webhook:
       method: POST
       headers: {}
+      # Opt-in endpoint templates: false keeps url and header values literal,
+      # {{ braces included, so an old file keeps its exact bytes. true renders
+      # them with the endpoint-only function secret PATH.
+      endpoint_templates: false
       # The message texts and the payload are the site's: what a receiver is told
       # belongs to the deployment, not to the service.
       body_format: yaml
@@ -170,12 +193,24 @@ plugins:
     retention/keep_last:
       min_keep: 1
 
+    retention/keep_versions:
+      min_keep: 1
+
     source/postgres:
       format: custom
       compression: none # none: the pipeline's processor compresses; a pg_dump compression instead of a pipeline processor is a deployment choice (docs)
       connect_attempts: 6
       connect_interval: 5s
       exclude_databases: []
+      # The image's exact-major suites, newest first. A directory that does not
+      # exist is skipped and PATH is the last candidate; every operational call
+      # then uses the suite of the server's exact major.
+      client_dirs: [/usr/libexec/postgresql18, /usr/libexec/postgresql17, /usr/libexec/postgresql16, /usr/libexec/postgresql15]
+
+    source/postgres_globals:
+      connect_attempts: 6
+      connect_interval: 5s
+      client_dirs: [/usr/libexec/postgresql18, /usr/libexec/postgresql17, /usr/libexec/postgresql16, /usr/libexec/postgresql15]
 
     source/redis:
       connect_attempts: 6
@@ -187,6 +222,10 @@ plugins:
 
     source/files:
       ignore_vanished: true # skipped entries are counted in the run report
+      # record counts a file that changes under the read and keeps the archive;
+      # fail fails that artifact on the first detected mutation. Static
+      # refusals — a socket, a FIFO, a tolerated delete — are neither.
+      on_change: record
 
     source/k3s_state:
       busy_timeout: 10s

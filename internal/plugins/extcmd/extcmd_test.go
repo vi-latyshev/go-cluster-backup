@@ -186,6 +186,61 @@ func TestReadPasswordTrimsTheTrailingNewline(t *testing.T) {
 	}
 }
 
+// TestReadSecretFileBoundsAndTrims: the endpoint reader is the password reader
+// plus a byte ceiling — the same CR/LF trim, a file of exactly the limit read
+// whole, one byte more refused, and an error that names the file without ever
+// quoting what it holds.
+func TestReadSecretFileBoundsAndTrims(t *testing.T) {
+	dir := t.TempDir()
+	atLimit := filepath.Join(dir, "at-limit")
+	if err := os.WriteFile(atLimit, []byte("token\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := extcmd.ReadSecretFile(atLimit, 7)
+	if err != nil || got != "token" {
+		t.Fatalf("ReadSecretFile = %q, %v; want the value with the trailing CR/LF trimmed", got, err)
+	}
+	over := filepath.Join(dir, "over")
+	if err := os.WriteFile(over, []byte("TOKEN-SENTINEL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := extcmd.ReadSecretFile(over, 5); err == nil {
+		t.Fatal("a file above the limit was accepted")
+	} else if !strings.Contains(err.Error(), over) {
+		t.Errorf("the refusal does not name the file: %v", err)
+	} else if strings.Contains(err.Error(), "TOKEN-SENTINEL") {
+		t.Errorf("the refusal quotes the file's bytes: %v", err)
+	}
+	whole := filepath.Join(dir, "whole")
+	if err := os.WriteFile(whole, []byte("whole-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := extcmd.ReadSecretFile(whole, 0); err != nil || got != "whole-value" {
+		t.Fatalf("a zero limit = %q, %v; want the whole file trimmed", got, err)
+	}
+	if _, err := extcmd.ReadSecretFile(filepath.Join(dir, "gone"), 4096); err == nil {
+		t.Fatal("a missing secret file was accepted")
+	}
+}
+
+// TestReadSecretFileFollowsAProjectedSecretLink: a projected Secret mounts each
+// key as a symlink into the volume, and the reader must take the file it names.
+func TestReadSecretFileFollowsAProjectedSecretLink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "..2026_11_12_04_20_00.01")
+	if err := os.WriteFile(real, []byte("projected\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "token")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := extcmd.ReadSecretFile(link, 4096)
+	if err != nil || got != "projected" {
+		t.Fatalf("ReadSecretFile through the projected link = %q, %v", got, err)
+	}
+}
+
 func TestCheckScratchDir(t *testing.T) {
 	if err := extcmd.CheckScratchDir(t.TempDir()); err != nil {
 		t.Fatal(err)

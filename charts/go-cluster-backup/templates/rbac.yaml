@@ -20,6 +20,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "persistentvolumeclaims", "persistentvolumes"]
     verbs: ["list"]
+  # get by name only: the node-local discovery reads its own node to prove the
+  # node it runs on is the node a pinned or local volume lives on, and never
+  # enumerates nodes. A missing grant fails the affected artifact with a
+  # warning, never a silent read of another node's directory.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

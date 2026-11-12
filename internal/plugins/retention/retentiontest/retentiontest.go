@@ -60,15 +60,34 @@ func failCheck(t fatalReporter, err error) {
 var Now = time.Date(2026, 10, 12, 4, 20, 0, 0, time.UTC)
 
 // FixtureRuns is a mixed two-weeks-of-runs set any policy must classify sanely.
+//
+// Every run observed "readings/live", and the oldest five observed
+// "readings/retired" too — an identity the source has since dropped. Only the
+// verified runs hold a successful copy of "readings/live", and the oldest run's
+// copy of "readings/retired" is the one it ever had. A policy that reads
+// identities therefore sees one live identity and one whose last successful copy
+// is far outside any newest-count window, while a policy that reads only run
+// status sees exactly the fixture it always did.
 func FixtureRuns() []model.StoredRun {
 	var runs []model.StoredRun
 	for i := range 15 {
-		runs = append(runs, model.StoredRun{
+		r := model.StoredRun{
 			RunID:    fmt.Sprintf("20261%03dT042000Z", 100+i),
 			At:       Now.AddDate(0, 0, -i),
 			Bytes:    int64(1000 + i*10),
 			Verified: i%5 != 0,
-		})
+		}
+		r.ObservedArtifacts = []string{"readings/live"}
+		if i >= 10 {
+			r.ObservedArtifacts = append(r.ObservedArtifacts, "readings/retired")
+		}
+		if r.Verified {
+			r.Artifacts = []string{"readings/live"}
+		}
+		if i == 14 {
+			r.Artifacts = append(r.Artifacts, "readings/retired")
+		}
+		runs = append(runs, r)
 	}
 	return runs
 }

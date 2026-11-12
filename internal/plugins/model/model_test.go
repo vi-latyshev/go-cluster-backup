@@ -57,6 +57,15 @@ func TestRunReportMarshalsUnderJSONV2(t *testing.T) {
 			t.Errorf("manifest JSON lacks %s:\n%s", want, body)
 		}
 	}
+	// The fields added for writer identity, warnings and the ledger's own cap
+	// facts are omitted while unset: a v2.1.0 reader refuses an unknown member,
+	// so an emitted zero would make every new run unreadable on a rollback.
+	for _, absent := range []string{`"changed_files"`, `"writer_identity"`, `"warnings"`,
+		`"retention_error"`, `"cap_overflow_bytes"`, `"cap_evicted"`, `"occupancy_unknown"`} {
+		if strings.Contains(string(body), absent) {
+			t.Errorf("manifest JSON carries %s while unset:\n%s", absent, body)
+		}
+	}
 	var back model.RunReport
 	if err := json.Unmarshal(body, &back); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -229,4 +238,41 @@ func isEmptyString(expr ast.Expr) bool {
 func isRunKindConstant(expr ast.Expr) bool {
 	ident, ok := expr.(*ast.Ident)
 	return ok && (ident.Name == "RunKindScheduled" || ident.Name == "RunKindManual")
+}
+
+// TestExclusionKindKnown pins the one enum root every reader and kit asks: the
+// three verdicts this build understands, and nothing else.
+func TestExclusionKindKnown(t *testing.T) {
+	for _, tc := range []struct {
+		kind  model.ExclusionKind
+		known bool
+	}{
+		{model.ExclusionIgnored, true},
+		{model.ExclusionCovered, true},
+		{model.ExclusionElsewhere, true},
+		{model.ExclusionKind(""), false},
+		{model.ExclusionKind("maybe"), false},
+	} {
+		if got := tc.kind.Known(); got != tc.known {
+			t.Errorf("ExclusionKind(%q).Known() = %v, want %v", tc.kind, got, tc.known)
+		}
+	}
+}
+
+// TestStoredRunPolicyInputIsNeverStored: the artifact identities retention reads
+// are policy input the protection ledger fills after a survey — they are not
+// part of the stored run and must never reach a manifest or a listing.
+func TestStoredRunPolicyInputIsNeverStored(t *testing.T) {
+	run := model.StoredRun{
+		RunID: "20261001T040000Z", Kind: model.RunKindScheduled, Manifest: true,
+		Artifacts:         []string{"databases/db/postgres"},
+		ObservedArtifacts: []string{"databases/db/postgres"},
+	}
+	body, err := json.Marshal(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "databases/db/postgres") || strings.Contains(string(body), "Observed") {
+		t.Fatalf("policy input reached the stored form: %s", body)
+	}
 }

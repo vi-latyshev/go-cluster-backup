@@ -542,3 +542,37 @@ func TestEveryArmedOrdinalAdvancesOncePerRequest(t *testing.T) {
 		}
 	}
 }
+
+// TestNodeGetServesNamesAndRefusesByRBACKey: the node read a writer's ownership
+// proof makes answers by name, is missing with 404, and refuses with 403 both as
+// a whole resource and as one named node — the two keys a test arms.
+func TestNodeGetServesNamesAndRefusesByRBACKey(t *testing.T) {
+	s := New(t)
+	s.AddNode(`{"metadata":{"name":"node-a"}}`)
+	s.AddNode(`{"metadata":{"name":"node-b"}}`)
+
+	code, body := get(t, s, "/api/v1/nodes/node-a")
+	if code != http.StatusOK || !strings.Contains(string(body), `"node-a"`) {
+		t.Fatalf("GET node-a = %d: %s", code, body)
+	}
+	if code, _ := get(t, s, "/api/v1/nodes/missing"); code != http.StatusNotFound {
+		t.Fatalf("GET missing node = %d, want 404", code)
+	}
+
+	s.Deny("nodes/node-b")
+	if code, _ := get(t, s, "/api/v1/nodes/node-b"); code != http.StatusForbidden {
+		t.Fatalf("denied node-b = %d, want 403", code)
+	}
+	if got := s.Calls("nodes/node-b"); got != 1 {
+		t.Fatalf("Calls(nodes/node-b) = %d", got)
+	}
+	if code, _ := get(t, s, "/api/v1/nodes/node-a"); code != http.StatusOK {
+		t.Fatal("denying one node refused another")
+	}
+
+	s.Allow("nodes/node-b")
+	s.Deny("nodes")
+	if code, _ := get(t, s, "/api/v1/nodes/node-b"); code != http.StatusForbidden {
+		t.Fatal("a whole-resource denial did not refuse the node read")
+	}
+}

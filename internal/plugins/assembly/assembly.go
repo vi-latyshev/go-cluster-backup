@@ -80,6 +80,9 @@ type sourceBinding struct {
 	pipeline  string
 	refs      []string // processor instance names of the pipeline, in order
 	procs     []processor.Processor
+	// rateLimit is the source envelope's raw-byte limit, applied before the
+	// first processor and never recorded in the chain: 0 is unlimited.
+	rateLimit model.ByteSize
 }
 
 type discoveryBinding struct {
@@ -162,6 +165,10 @@ type Assembly struct {
 	scope *lifecycle.Scope
 	// lifecycle is the effective cleanup budgets under plugins.config.lifecycle.
 	lifecycle lifecycle.Config
+	// warnings are the coded, non-fatal facts the offline configuration checks
+	// found — a source type's published credential exception. They are reported
+	// by validate and never fail a command.
+	warnings []model.Warning
 }
 
 // New merges the distribution's defaults under the configuration file, decodes
@@ -374,6 +381,17 @@ func New(ctx context.Context, raw jsontext.Value, defs *configuration.Defaults, 
 			continue
 		}
 		e.discoveries = append(e.discoveries, discoveryBinding{name: name, inst: d})
+		// A node-scoped discovery narrows every writer to its own node, and
+		// protection tells one writer's runs from a peer's only by the stable
+		// run.writer_identity. A deployment that opts into the scope without
+		// naming its writer cannot account for a peer's runs — retention would
+		// credit or delete them — so the configuration is refused here, where
+		// both fields are visible, before a run starts.
+		if ns, ok := d.(discovery.NodeScoped); ok && ns.NodeScoped() && writerIdentity(cfg) == "" {
+			errs = append(errs, fmt.Errorf(
+				"/discoveries/%s: node_scope is on and run/writer_identity is empty: state the stable writer id this node's runs carry, and one per peer sharing the prefix",
+				name))
+		}
 	}
 	errs = append(errs, configuration.CheckRules(e.reg, e.active, cfg)...)
 	for _, name := range sortedKeys(cfg.Notifiers) {
@@ -421,6 +439,7 @@ func (e *Assembly) buildBackupWorkflow() *backup.Workflow {
 			MaxArtifactBytes: cfg.MaxArtifactBytes, StorageParallelism: cfg.StorageParallelism,
 			MinVerifiedStorages: cfg.MinVerifiedStorages, DegradedExitCode: cfg.DegradedExitCode,
 			FailedExitCode: cfg.FailedExitCode, NotifierFailureIsFatal: cfg.NotifierFailureIsFatal,
+			WriterIdentity: cfg.WriterIdentity,
 		}
 	}
 	storages := make([]backup.Storage, 0, len(e.storages))
@@ -435,6 +454,7 @@ func (e *Assembly) buildBackupWorkflow() *backup.Workflow {
 		sources = append(sources, backup.Source{
 			Name: sb.name, CheckKind: sb.checkKind, Type: sb.typ, Instance: sb.inst,
 			Artifact: sb.artifact, Pipeline: sb.pipeline, Refs: sb.refs, Processors: sb.procs,
+			RateLimit: sb.rateLimit,
 		})
 	}
 	discoveries := make([]backup.Discovery, 0, len(e.discoveries))
@@ -518,11 +538,13 @@ func (e *Assembly) buildProtection() {
 	var (
 		wait, poll, hardBound, finish         time.Duration
 		holderNamespace, holderPod, holderUID string
+		writerIdentity                        string
 	)
 	stale := time.Now().UTC()
 	if cfg := e.cfg.Run; cfg != nil {
 		wait, poll, hardBound, finish = cfg.LeaseWait.Std(), cfg.LeasePoll.Std(), cfg.LeaseHardBound.Std(), cfg.FinishAllowance.Std()
 		holderNamespace, holderPod, holderUID = cfg.HolderNamespaceEnv, cfg.HolderPodEnv, cfg.HolderUIDEnv
+		writerIdentity = cfg.WriterIdentity
 		stale = stale.Add(-(cfg.Deadline.Std() + cfg.FinishAllowance.Std()))
 	}
 	e.lease = protection.NewLease(protection.LeaseOptions{
@@ -541,7 +563,7 @@ func (e *Assembly) buildProtection() {
 	}
 	e.ledger = protection.NewLedger(protection.LedgerOptions{
 		Destinations: destinations, Policies: policies, Caps: caps,
-		StaleCutoff: stale, Retry: e.retry,
+		StaleCutoff: stale, Retry: e.retry, WriterIdentity: writerIdentity,
 	})
 }
 
@@ -616,6 +638,7 @@ func (e *Assembly) PreflightResults(ctx context.Context, req planning.Request) [
 		Instances:   e.instancesFor(scopeAll),
 		Discoveries: discoveries,
 		Binaries:    e.declaredBinaries,
+		Credential:  e.credentialCheck,
 		Build: func(ctx context.Context, typ, instance string, raw jsontext.Value) (source.Source, error) {
 			return instances.BuildActive(ctx, e.loader, e.reg, source.Kind, typ, raw, e.deps("source", typ, instance))
 		},
@@ -673,6 +696,9 @@ func (e *Assembly) instancesFor(scope checkScope) []planning.Instance {
 		inst := planning.Instance{Kind: kind, Name: name}
 		if c, ok := v.(instances.Checker); ok {
 			inst.Check = c
+		}
+		if b, ok := v.(instances.CheckBinaries); ok {
+			inst.BinariesCheck = b
 		}
 		if d, ok := v.(processor.DecodeChecker); ok {
 			inst.Decode = d
@@ -823,12 +849,96 @@ func (e *Assembly) buildSource(ctx context.Context, section, name string, si con
 	if section == "stage.sources" {
 		checkKind = "stage_source"
 	}
-	return sourceBinding{
+	sb := sourceBinding{
 		name: name, checkKind: checkKind, typ: si.Type, inst: s, pipeline: pipelineName(refs),
-		refs: refs, procs: procs,
+		refs: refs, procs: procs, rateLimit: si.RateLimit,
 		artifact: model.Artifact{Name: si.Artifact.Name, Group: si.Artifact.Group,
 			Importance: si.Artifact.Importance, Sensitivity: si.Artifact.Sensitivity},
-	}, nil
+	}
+	// The credential rule is the run's own, applied offline: bytes that carry
+	// credentials and no sealing step are refused here, where the operator can
+	// fix the file, or warned about under a source type's published exception.
+	warning, err := e.checkCredentials(ctx, sb)
+	if err != nil {
+		return sourceBinding{}, fmt.Errorf("/%s/%s: %w", section, name, err)
+	}
+	if warning.Code != "" {
+		e.warnings = append(e.warnings, warning)
+	}
+	return sb, nil
+}
+
+// checkCredentials decides one declared source's credential bytes from the same
+// pure facts the run's Resolve uses: what the source says its bytes are, whether
+// the pipeline seals them, and the source type's own verdict. It reads no mount
+// and starts no client — Describe's contract is static facts — and a source
+// whose static facts cannot be answered here is left to the run, which reports
+// the failure against its own artifact.
+func (e *Assembly) checkCredentials(ctx context.Context, sb sourceBinding) (model.Warning, error) {
+	return e.credentialDecision(ctx, sb.name, sb.inst, sb.artifact, sb.procs)
+}
+
+// credentialCheck applies the same decision to one discovered source before the
+// planning preflight's operational Check: its pipeline names are this
+// configuration's processor instances, resolved the way a run resolves them. A
+// name this build does not know is left to the run, which fails that artifact.
+func (e *Assembly) credentialCheck(ctx context.Context, src source.Source, artifact model.Artifact, pipeline []string) (model.Warning, error) {
+	procs := make([]processor.Processor, 0, len(pipeline))
+	for _, name := range pipeline {
+		p, ok := e.processors[name]
+		if !ok {
+			return model.Warning{}, nil
+		}
+		procs = append(procs, p)
+	}
+	return e.credentialDecision(ctx, artifact.Name, src, artifact, procs)
+}
+
+// credentialDecision is the one credential/sealing decision shared by the
+// declared-source check, the discovered-source preflight and the run's Resolve:
+// bytes that carry credentials and no sealing step are refused, or warned about
+// under a source type's published exception.
+func (e *Assembly) credentialDecision(ctx context.Context, name string, src source.Source, artifact model.Artifact, procs []processor.Processor) (model.Warning, error) {
+	traits, err := execution.Attempt(ctx, e.checkPolicy(), "describe source "+name, func(ctx context.Context, _ int) (source.SourceTraits, error) {
+		return execution.SafeValue(func() (source.SourceTraits, error) { return src.Describe(ctx) })
+	})
+	if err != nil {
+		return model.Warning{}, nil
+	}
+	if !traits.Credentials {
+		return model.Warning{}, nil
+	}
+	sealed := traits.Sealed
+	if _, recorded := src.(source.RecordedChain); !recorded {
+		// A recorded chain's seals are the stage record's to say, and the run
+		// reads that record itself; this run's own pipeline is the only one an
+		// offline check can judge.
+		seals, err := e.pipelineSeals(ctx, procs)
+		if err != nil {
+			return model.Warning{}, nil
+		}
+		sealed = sealed || seals
+	}
+	if sealed {
+		return model.Warning{}, nil
+	}
+	verdict := source.CredentialRefuse
+	if cp, ok := src.(source.CredentialPolicy); ok {
+		v, err := execution.Attempt(ctx, e.checkPolicy(), "credential policy "+name, func(ctx context.Context, _ int) (source.CredentialVerdict, error) {
+			return execution.SafeValue(func() (source.CredentialVerdict, error) { return cp.CredentialPolicy(ctx) })
+		})
+		if err != nil && !errors.Is(err, errors.ErrUnsupported) {
+			return model.Warning{}, err
+		}
+		if err == nil {
+			verdict = v
+		}
+	}
+	decision := source.DecideCredentials(artifact, traits, sealed, verdict)
+	if decision.Refused != "" {
+		return model.Warning{}, errors.New(decision.Refused)
+	}
+	return decision.Warning, nil
 }
 
 // resolvePipeline turns one pipeline — the processor instance names of a source
@@ -911,6 +1021,23 @@ func (e *Assembly) Descriptors(_ context.Context) ([]instances.Descriptor, error
 // crossed a plugin boundary.
 func (e *Assembly) EffectiveConfig() (jsontext.Value, []string) {
 	return e.merged, e.defaultPointers
+}
+
+// Warnings returns the coded, non-fatal facts the offline checks found — a
+// source type's published credential exception, the same one a run records on
+// its artifact. They never fail a command, and a caller prints them beside its
+// own answer.
+func (e *Assembly) Warnings() []model.Warning {
+	return append([]model.Warning(nil), e.warnings...)
+}
+
+// writerIdentity is the stable writer id the run section states, "" when the
+// configuration carries no run section (a restore-only file).
+func writerIdentity(cfg *configuration.Config) string {
+	if cfg.Run == nil {
+		return ""
+	}
+	return cfg.Run.WriterIdentity
 }
 
 // sortedKeys returns a map's keys in a stable order.

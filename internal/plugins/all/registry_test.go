@@ -241,7 +241,10 @@ func TestSchemaDescribesEveryRegisteredType(t *testing.T) {
 }
 
 // TestDoctorNamesEveryMissingBinary: a stub PATH proves the check can fail; the
-// stub binaries then prove it can pass.
+// stub binaries then prove it can pass. The PostgreSQL clients are a configured
+// suite, not a PATH metadata list: doctor proves them through the instance's own
+// CheckBinaries capability, so the empty-PATH answer names the suite failure and
+// the stub supplies all four programs of one major.
 func TestDoctorNamesEveryMissingBinary(t *testing.T) {
 	empty := t.TempDir()
 	t.Setenv("PATH", empty)
@@ -253,7 +256,7 @@ func TestDoctorNamesEveryMissingBinary(t *testing.T) {
 	if code != exitFailure {
 		t.Fatalf("doctor on an empty PATH: exit %d, want %d", code, exitFailure)
 	}
-	for _, missing := range []string{"pg_dump", "pg_restore", "psql", "redis-cli", "sqlite3"} {
+	for _, missing := range []string{"redis-cli", "sqlite3"} {
 		if !strings.Contains(stdout.String(), missing+": missing") {
 			t.Errorf("doctor does not name %s missing:\n%s", missing, stdout.String())
 		}
@@ -261,9 +264,20 @@ func TestDoctorNamesEveryMissingBinary(t *testing.T) {
 			t.Errorf("the failure does not name %s:\n%s", missing, stderr.String())
 		}
 	}
+	if !strings.Contains(stderr.String(), "configured binary suite does not hold up") {
+		t.Errorf("the failure does not name the PostgreSQL client suite:\n%s", stderr.String())
+	}
 
 	stub := t.TempDir()
-	for _, bin := range []string{"pg_dump", "pg_restore", "psql", "redis-cli", "sqlite3"} {
+	// One complete PostgreSQL suite of one major on PATH: every program answers
+	// --version with the major it is.
+	for _, bin := range []string{"pg_dump", "pg_dumpall", "pg_restore", "psql"} {
+		script := "#!/bin/sh\necho \"" + bin + " (PostgreSQL) 18.6\"\n"
+		if err := os.WriteFile(filepath.Join(stub, bin), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, bin := range []string{"redis-cli", "sqlite3"} {
 		if err := os.WriteFile(filepath.Join(stub, bin), []byte("#!/bin/sh\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -277,7 +291,7 @@ func TestDoctorNamesEveryMissingBinary(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("doctor with every binary present: exit %d\n%s\n%s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), filepath.Join(stub, "pg_dump")) {
+	if !strings.Contains(stdout.String(), filepath.Join(stub, "redis-cli")) {
 		t.Errorf("doctor does not report where a binary was found:\n%s", stdout.String())
 	}
 }

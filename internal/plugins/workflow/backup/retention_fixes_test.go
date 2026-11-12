@@ -201,6 +201,46 @@ func TestPolicyAndCapShareOneDeletionState(t *testing.T) {
 	}
 }
 
+// TestRetentionDeleteFailureIsReportedApart: a deletion that fails is the
+// storage's RetentionError — never a rewrite of its verified upload outcome —
+// and the run still finishes.
+func TestRetentionDeleteFailureIsReportedApart(t *testing.T) {
+	w := newWorld(t)
+	f := storagetest.NewFake()
+	putCopiedRun(t, f, "alpha", "OLD", time.Now().Add(-2*time.Hour),
+		model.OutcomeDelivered, [][2]string{{"vpn", "wireguard"}})
+	f.Fault = func(op storagetest.Op, key string, _ int) error {
+		if op == storagetest.OpDelete && strings.HasPrefix(key, "runs/OLD/") {
+			return pluginerrors.Permanent(errors.New("delete refused"))
+		}
+		return nil
+	}
+	w.Storages["alpha"] = f
+	cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+	withRetention(cfg, "alpha", keepLastN(1))
+	e := w.newAssembly(t, cfg)
+	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := storageResult(rep, "alpha")
+	if got.Outcome != model.StorageVerified {
+		t.Fatalf("a failed retention rewrote the verified upload outcome: %+v", got)
+	}
+	if !strings.Contains(got.RetentionError, "deleting run OLD did not complete") {
+		t.Fatalf("the retention failure is not reported apart: %+v", got)
+	}
+	if !strings.Contains(got.Error, "deleting run OLD did not complete") {
+		t.Fatalf("the joined error lost the retention failure: %+v", got)
+	}
+	if rep.Outcome != model.OutcomeDelivered {
+		t.Fatalf("outcome = %q, want delivered: %+v", rep.Outcome, got)
+	}
+	if ids := runIDsOn(f); !ids["OLD"] {
+		t.Fatalf("a failed deletion claimed the run was removed: %v", ids)
+	}
+}
+
 // TestCommittedButUnverifiedScheduledWriteStaysCounted (M-ledger): a scheduled
 // write is reserved in the ledger before its Put too, so a Put that committed but
 // whose Stat failed still counts against the cap.

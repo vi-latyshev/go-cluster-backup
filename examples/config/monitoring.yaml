@@ -1,0 +1,127 @@
+# A monitoring deployment: one file tree, one S3-compatible storage, and a
+# webhook notifier that pushes the run's outcome and one presence/success series
+# per artifact to a Prometheus Pushgateway. The rules that read these series,
+# the expected-source presence alert and the Kubernetes-level Job/pod signals
+# are in examples/monitoring/ (PrometheusRule, promtool test, README).
+#
+# Pushgateway is a receiver for the LAST push of each grouping key, so writer
+# freshness reads `push_time_seconds`: a writer that never runs again must page
+# as an absent or stale push, never read as the last green run. The notifier
+# pushes with PUT, which replaces the whole group, so a vanished artifact loses
+# its presence series instead of keeping a stale one. See
+# examples/monitoring/README.md.
+
+run:
+  spool_dir: /spool
+  spool_reserve_bytes: 1GiB
+  max_artifact_bytes: 3GiB
+  deadline: 60m
+  lease_hard_bound: 4200s
+
+sources:
+  app_uploads:
+    type: files
+    artifact: {group: volumes, name: uploads, importance: required, sensitivity: plain}
+    pipeline: [compress]
+    # Raw bytes per second the source may produce, before the first processor:
+    # the burst is at most 1 MiB and the pace extends the copy's window — it
+    # never reduces the work. 0 (the default) is unlimited.
+    rate_limit: 8MiB
+    config: {root: /volumes/example/uploads, ignore_vanished: true, on_change: record}
+
+processors:
+  compress:
+    type: zstd
+    config: {level: better, window_bytes: 8MiB, decode_window_bytes: 16MiB}
+
+storages:
+  primary:
+    type: s3
+    retention:
+      scheduled: {type: keep_last, config: {count: 7, count_incomplete: true}}
+      manual: {type: keep_last, config: {count: 3, count_incomplete: true}}
+    max_total_bytes: 50GB
+    time_budget: 30m
+    config:
+      endpoint: https://s3.example.com
+      region: us-east-1
+      bucket: cluster-backup
+      prefix: cluster-backup
+      access_key_id: {file: /run/secrets/s3/access-key-id}
+      secret_access_key: {file: /run/secrets/s3/secret-access-key}
+      addressing: path
+
+catalog:
+  type: kubernetes_configmap
+  config:
+    namespace: backup
+    name: go-cluster-backup-catalog
+
+notifiers:
+  pushgateway:
+    type: webhook
+    config:
+      # The Pushgateway grouping key carries this writer's label. Here it is a
+      # literal in this writer's own config file: one file per writer already,
+      # so nothing has to be templated. A receiver that needs a credential in
+      # the URL or a header instead opts into `endpoint_templates: true` and
+      # reads it with the endpoint-only `secret PATH` function — the argument is
+      # one string-literal absolute path, and the authority stays literal, so a
+      # secret can supply a path segment or a token, never the host
+      # (docs/configuration.md, "Endpoint templates").
+      url: https://pushgateway.example.com/metrics/job/go-cluster-backup/writer/node-a
+      # PUT replaces the WHOLE grouping key on every push: an artifact that
+      # vanished from this run's report loses its series too, which is what
+      # makes the expected-source alert in examples/monitoring/ meaningful.
+      # POST only replaces metrics of the same name and leaves a vanished
+      # source's old series behind — do not switch to POST.
+      method: PUT
+      headers:
+        Content-Type: 'text/plain; version=0.0.4; charset=utf-8'
+      # Pushgateway reads the Prometheus text exposition format, not YAML.
+      body_format: text
+      timeout: 10s
+      success_status: [200, 202, 204]
+      # Both events are subscribed: run_started pushes gcb_run_started=1, so a
+      # run killed before its finish stays visible as a stuck run, and
+      # run_finished pushes it back to 0 with the outcome.
+      events:
+        run_started: |
+          Backup started
+          {{ .Run.RunID }}
+        run_finished: |
+          {{ pick .Run.Outcome "delivered" "✅ Backup completed" "degraded" "⚠️ Backup DEGRADED" "failed" "❌ Backup FAILED" }}
+          {{ range .Run.Warnings }}⚠️ {{ .Code }}: {{ .Message }}
+          {{ end }}
+          {{ range .Run.Storages }}{{ if .RetentionError }}⚠️ {{ .Storage }}: retention failed: {{ .RetentionError }}
+          {{ end }}{{ if .CapEvicted }}⚠️ {{ .Storage }}: cap evicted {{ len .CapEvicted }} run(s)
+          {{ end }}{{ if .OccupancyUnknown }}⚠️ {{ .Storage }}: occupancy is unknown
+          {{ end }}{{ end }}
+      # One body for every event. `.Event.Run` is the whole report, so the
+      # gauge set is rewritten on each push (PUT replaces the group). Run-level
+      # warnings (`gcb_run_warnings_total`) are `.Run.Warnings` only; an
+      # artifact's own warnings — the plaintext-credentials code lives there —
+      # are `gcb_artifact_warnings` per artifact, never copied into the run
+      # total. Artifact identity labels are `<group>/<name>`, the same identity
+      # `restore list` shows. Label values are JSON-quoted; keep storage names
+      # and artifact identities to letters, digits, `_`, `-`, `.` and `/` (see
+      # examples/monitoring/README.md).
+      payload: |
+        {{ $run := .Event.Run -}}
+        gcb_run_started {{ if eq .Event.Name "run_started" }}1{{ else }}0{{ end }}
+        gcb_run_outcome{outcome="{{ pickdef $run.Outcome "unknown" "delivered" "delivered" "degraded" "degraded" "failed" "failed" }}"} 1
+        gcb_run_kind{kind="{{ $run.Kind }}"} 1
+        gcb_run_artifacts_total {{ len $run.Artifacts }}
+        gcb_run_artifacts_failed {{ len (failed $run.Artifacts) }}
+        gcb_run_warnings_total {{ len $run.Warnings }}
+        {{ range $run.Artifacts }}
+        gcb_artifact_present{artifact={{ json (printf "%s/%s" .Artifact.Group .Artifact.Name) }}} 1
+        gcb_artifact_ok{artifact={{ json (printf "%s/%s" .Artifact.Group .Artifact.Name) }}} {{ if eq .Outcome "ok" }}1{{ else }}0{{ end }}
+        gcb_artifact_warnings{artifact={{ json (printf "%s/%s" .Artifact.Group .Artifact.Name) }}} {{ len .Warnings }}
+        {{ end }}
+        {{ range $run.Storages }}
+        gcb_storage_retention_error{storage={{ json .Storage }}} {{ if .RetentionError }}1{{ else }}0{{ end }}
+        gcb_storage_cap_overflow_bytes{storage={{ json .Storage }}} {{ .CapOverflowBytes }}
+        gcb_storage_cap_evicted_runs{storage={{ json .Storage }}} {{ len .CapEvicted }}
+        gcb_storage_occupancy_unknown{storage={{ json .Storage }}} {{ if .OccupancyUnknown }}1{{ else }}0{{ end }}
+        {{ end }}

@@ -11,9 +11,10 @@ import (
 	"strings"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/pgclient"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
@@ -70,15 +71,19 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		// refused here, before a byte is read or a connection is made.
 		return source.ApplyReport{}, pluginerrors.Permanent(fmt.Errorf("in_place with jobs %d is refused: pg_restore's --single-transaction and --jobs are mutually exclusive; set jobs to 1 or restore side_by_side", opts.Jobs))
 	}
-	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
+	pass, err := s.conn.ReadPassword()
 	if err != nil {
 		return source.ApplyReport{}, err
 	}
-	if err := extcmd.WaitTCP(ctx, s.host, s.port, opts.ConnectAttempts, opts.ConnectInterval.Std()); err != nil {
+	if err := extcmd.WaitTCP(ctx, s.conn.Host(), s.conn.Port(), opts.ConnectAttempts, opts.ConnectInterval.Std()); err != nil {
 		if ctx.Err() != nil {
 			return source.ApplyReport{}, ctx.Err()
 		}
 		return source.ApplyReport{}, pluginerrors.Transient(err)
+	}
+	suite, err := s.conn.Select(ctx, pass, s.cfg.Database)
+	if err != nil {
+		return source.ApplyReport{}, err
 	}
 
 	target := s.cfg.Database
@@ -87,11 +92,11 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 		if err != nil {
 			return source.ApplyReport{}, pluginerrors.Permanent(err)
 		}
-		if err := s.createDatabase(ctx, pass, target); err != nil {
+		if err := s.createDatabase(ctx, suite, pass, target); err != nil {
 			return source.ApplyReport{}, err
 		}
 	}
-	n, err := s.restore(ctx, pass, target, req.Mode, opts, src)
+	n, err := s.restore(ctx, suite, pass, target, req.Mode, opts, src)
 	if err != nil {
 		if req.Mode == source.ApplySideBySide {
 			return source.ApplyReport{}, fmt.Errorf("restoring into the new database %q (it may hold a partial restore): %w", target, err)
@@ -105,7 +110,9 @@ func (s *Source) Apply(ctx context.Context, req source.ApplyRequest, src io.Read
 func restorable(format string) bool { return format == "custom" || format == "tar" }
 
 // Probe proves the archive is whole without a server: pg_restore reads every
-// block and writes the SQL it would have run to /dev/null.
+// block and writes the SQL it would have run to /dev/null. It needs no source
+// server, so it runs the newest local client suite — any newer pg_restore
+// reads an older archive.
 func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, error) {
 	if err := ctx.Err(); err != nil {
 		return source.ProbeReport{}, err
@@ -113,8 +120,14 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 	if !restorable(s.cfg.Format) {
 		return source.ProbeReport{}, fmt.Errorf("a %s-format dump is not a pg_restore archive: %w", s.cfg.Format, errors.ErrUnsupported)
 	}
-	cmd := exec.CommandContext(ctx, "pg_restore", "--no-password", "-f", os.DevNull)
-	n, err := runCommand(ctx, cmd, src)
+	suite, err := s.conn.Newest(ctx)
+	if err != nil {
+		return source.ProbeReport{}, err
+	}
+	// A probe reads a local archive and writes nothing: no connection is made,
+	// so no connection arguments and no password are given to this command.
+	cmd := exec.CommandContext(ctx, suite.Path("pg_restore"), "--no-password", "-f", os.DevNull)
+	n, err := s.conn.Run(ctx, cmd, src)
 	if err != nil {
 		return source.ProbeReport{}, err
 	}
@@ -123,16 +136,11 @@ func (s *Source) Probe(ctx context.Context, src io.Reader) (source.ProbeReport, 
 
 // createDatabase makes the side-by-side target. A target that already exists is
 // a refusal, never a second restore over whatever is inside it.
-func (s *Source) createDatabase(ctx context.Context, pass, target string) error {
-	cmd := exec.CommandContext(ctx, "psql", append(s.connArgs(),
-		"--no-password", dbnameArg(s.cfg.Database), "-At",
-		"-c", "CREATE DATABASE "+quoteIdent(target),
-	)...)
-	cmd.Env = s.pgEnv(pass)
-	if _, err := extcmd.Output(ctx, cmd, classifyExit); err != nil {
-		return err
-	}
-	return nil
+func (s *Source) createDatabase(ctx context.Context, suite pgclient.Suite, pass, target string) error {
+	cmd := s.conn.Command(ctx, suite, "psql", pass, pgclient.DBNameArg(s.cfg.Database), "-At",
+		"-c", "CREATE DATABASE "+quoteIdent(target))
+	_, err := s.conn.Output(ctx, cmd)
+	return err
 }
 
 // quoteIdent quotes a PostgreSQL identifier: an embedded double quote is
@@ -142,18 +150,8 @@ func quoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-// dbnameArg passes a database name as a libpq conninfo value, never as a bare
-// argument: a server's own database name may contain '=', a space or a leading
-// '--', and a bare one either becomes another keyword's value or another
-// option. Inside a quoted conninfo value a backslash escapes the next byte, so
-// both it and the closing quote are escaped before the value is wrapped.
-func dbnameArg(name string) string {
-	return "--dbname=dbname='" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(name) + "'"
-}
-
-func (s *Source) restore(ctx context.Context, pass, target string, mode source.ApplyMode, opts ApplyOptions, src io.Reader) (int64, error) {
-	args := s.connArgs()
-	args = append(args, "--no-password")
+func (s *Source) restore(ctx context.Context, suite pgclient.Suite, pass, target string, mode source.ApplyMode, opts ApplyOptions, src io.Reader) (int64, error) {
+	args := []string{}
 	if opts.NoOwner {
 		args = append(args, "--no-owner")
 	}
@@ -164,17 +162,16 @@ func (s *Source) restore(ctx context.Context, pass, target string, mode source.A
 	case source.ApplySideBySide:
 		// --exit-on-error: a failed statement in the new database must fail the
 		// restore, not be counted and skipped.
-		args = append(args, "--exit-on-error", dbnameArg(target))
+		args = append(args, "--exit-on-error", pgclient.DBNameArg(target))
 	case source.ApplyInPlace:
 		// One transaction: either every statement lands or none does.
-		args = append(args, "--clean", "--if-exists", "--single-transaction", dbnameArg(target))
+		args = append(args, "--clean", "--if-exists", "--single-transaction", pgclient.DBNameArg(target))
 	}
-	cmd := exec.CommandContext(ctx, "pg_restore", args...)
-	cmd.Env = s.pgEnv(pass)
+	cmd := s.conn.Command(ctx, suite, "pg_restore", pass, args...)
 	if opts.Jobs > 1 {
 		return s.restoreParallel(ctx, cmd, opts.Jobs, src)
 	}
-	return runCommand(ctx, cmd, src)
+	return s.conn.Run(ctx, cmd, src)
 }
 
 // restoreParallel serves pg_restore --jobs, which refuses anything but a
@@ -196,7 +193,7 @@ func (s *Source) restoreParallel(ctx context.Context, cmd *exec.Cmd, jobs int, s
 		return 0, pluginerrors.Permanent(fmt.Errorf("jobs %d needs a regular file: %s is %s", jobs, f.Name(), st.Mode()))
 	}
 	cmd.Args = append(cmd.Args, "-j", strconv.Itoa(jobs), f.Name())
-	if _, err := runCommand(ctx, cmd, nil); err != nil {
+	if _, err := s.conn.Run(ctx, cmd, nil); err != nil {
 		return 0, err
 	}
 	return st.Size(), nil

@@ -711,6 +711,7 @@ func TestNotifierFailureVerdict(t *testing.T) {
 						"url": srv.URL, "method": "POST", "headers": map[string]string{},
 						"body_format": "text", "timeout": "5s", "success_status": []int{200},
 						"max_response_bytes": 512, "events": events, "payload": "{{ .Text }}",
+						"endpoint_templates": false, // literal endpoint: the pre-template behaviour
 					}}
 				default:
 					w.Notifiers["backup"] = &fakeNotifier{}

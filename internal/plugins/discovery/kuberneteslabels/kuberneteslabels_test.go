@@ -76,6 +76,7 @@ type objectFixture struct {
 		Labels    map[string]string `json:"labels"`
 	} `json:"metadata"`
 	Spec struct {
+		NodeName   string          `json:"nodeName"`
 		Containers []container     `json:"containers"`
 		Volumes    []volumeFixture `json:"volumes,omitempty"`
 	} `json:"spec"`
@@ -199,6 +200,7 @@ type ruleFixture struct {
 	Source        sourceFixture
 	CoversVolumes bool
 	MinMatches    int
+	RateLimit     int64
 }
 
 // podRule renders as a pods entry: resource is the builder's business, and a
@@ -207,7 +209,7 @@ func (r ruleFixture) podRule() map[string]any {
 	return map[string]any{
 		"name": r.Name, "selector": r.Selector, "phase": r.Phase, "artifact": r.Artifact,
 		"pipeline": r.Pipeline, "source": r.Source, "covers_volumes": r.CoversVolumes,
-		"min_matches": r.MinMatches,
+		"min_matches": r.MinMatches, "rate_limit": r.RateLimit,
 	}
 }
 
@@ -216,6 +218,7 @@ func (r ruleFixture) volumeRule() map[string]any {
 	return map[string]any{
 		"name": r.Name, "selector": r.Selector, "phase": r.Phase, "artifact": r.Artifact,
 		"pipeline": r.Pipeline, "source": r.Source, "min_matches": r.MinMatches,
+		"rate_limit": r.RateLimit,
 	}
 }
 
@@ -246,12 +249,18 @@ type configFixture struct {
 	Exclude        excludeFixture    `json:"exclude"`
 	Rules          []ruleFixture     `json:"-"` // routed into the two lists below
 	Undeclared     undeclaredFixture `json:"undeclared_volumes"`
+	NodeEnv        string            `json:"node_env"`
+	NodeScope      bool              `json:"node_scope"`
+	WriterNodes    []string          `json:"writer_nodes"`
 }
 
 // MarshalJSON is the fixture's one transformation: the rule list a fixture
 // declared becomes the pods and volumes lists the config reads.
 func (c configFixture) MarshalJSON() ([]byte, error) {
 	type plain configFixture
+	if c.WriterNodes == nil {
+		c.WriterNodes = []string{}
+	}
 	pods, volumes := []map[string]any{}, []map[string]any{}
 	for _, r := range c.Rules {
 		if r.Resource == "pods" {

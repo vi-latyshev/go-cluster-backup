@@ -37,6 +37,12 @@ type Options struct {
 	MaxArtifactBytes int64
 	Manual           bool
 	CallParallelism  int
+	// Eligible reports whether a stale upload found in the destination's
+	// inventory belongs to a run this writer owns, so Sweep never aborts
+	// another writer's parts. nil makes every upload eligible — the
+	// deployment's one-writer-per-prefix rule. AbortOwn never consults it: the
+	// upload IDs this run opened are always its own.
+	Eligible func(key string) bool
 }
 
 // Transfer drives one destination's multipart uploads in one run. The handle it
@@ -64,13 +70,15 @@ func New(o Options) *Transfer {
 }
 
 // Request identifies one object and, for the finished path, the spool file that
-// holds its bytes.
+// holds its bytes. Purpose is what the object is: an artifact's bytes or the
+// run's own metadata, which a storage may store under its own class rules.
 type Request struct {
-	Key    string
-	Label  string
-	File   string
-	Size   int64
-	SHA256 string
+	Key     string
+	Label   string
+	File    string
+	Size    int64
+	SHA256  string
+	Purpose storage.Purpose
 }
 
 // Outcome reports what one transfer decided and did. Handled false leaves the
@@ -95,7 +103,7 @@ func (t *Transfer) Upload(ctx context.Context, h guard.Handle, sp *spool.Spool, 
 	if !ok || req.Size <= 0 {
 		return Outcome{}, nil
 	}
-	session, attempts, err := t.begin(ctx, u, storage.PutRequest{Key: req.Key, Size: req.Size, SHA256: req.SHA256}, req.Label)
+	session, attempts, err := t.begin(ctx, u, storage.PutRequest{Key: req.Key, Size: req.Size, SHA256: req.SHA256, Purpose: req.Purpose}, req.Label)
 	if errors.Is(err, errors.ErrUnsupported) {
 		return Outcome{}, nil
 	}
@@ -160,7 +168,7 @@ func (t *Transfer) Follow(ctx context.Context, h guard.Handle, sp *spool.Spool, 
 			started = true
 		}
 		var attempts int
-		session, opened, attempts, err = t.probeBegin(ctx, u, req.Key, n, req.Label)
+		session, opened, attempts, err = t.probeBegin(ctx, u, storage.PutRequest{Key: req.Key, Size: n, Purpose: req.Purpose}, req.Label)
 		out.Attempts += attempts
 		if err != nil {
 			return t.failFollow(ctx, u, session, opened, req, err, started, out.Attempts)
@@ -295,6 +303,17 @@ func (t *Transfer) Sweep(ctx context.Context, h guard.Handle, cutoff time.Time) 
 		return attempts, true
 	}
 	for _, up := range stale {
+		if t.o.Eligible != nil && !t.o.Eligible(up.Key) {
+			// The upload cannot be attributed to this writer: another writer's
+			// run shares the prefix, or the run that left it cannot prove its
+			// owner. Its parts stay billed and its bytes keep the occupancy
+			// unknown; this run never aborts another writer's upload.
+			unknown = true
+			t.event(human.Warning("multipart.foreign-skipped",
+				human.Text("reason", "the upload's writer is not this run: it is left billed and occupancy stays unknown"),
+				human.ObjectKey("key", up.Key)))
+			continue
+		}
 		session := storage.MultipartSession{Key: up.Key, UploadID: up.UploadID}
 		_, err := execution.Attempt(ctx, t.o.Retry, "abort stale multipart "+up.Key, func(ctx context.Context, _ int) (struct{}, error) {
 			attempts++
@@ -358,8 +377,8 @@ func (t *Transfer) forget(session storage.MultipartSession) {
 
 // probeBegin asks the destination whether the bytes produced so far already need
 // parts. errors.ErrUnsupported means "not yet" and is not a failure.
-func (t *Transfer) probeBegin(ctx context.Context, u guard.Uploader, key string, size int64, label string) (storage.MultipartSession, bool, int, error) {
-	session, attempts, err := t.begin(ctx, u, storage.PutRequest{Key: key, Size: size}, label)
+func (t *Transfer) probeBegin(ctx context.Context, u guard.Uploader, req storage.PutRequest, label string) (storage.MultipartSession, bool, int, error) {
+	session, attempts, err := t.begin(ctx, u, req, label)
 	if errors.Is(err, errors.ErrUnsupported) {
 		return storage.MultipartSession{}, false, attempts, nil
 	}

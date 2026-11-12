@@ -23,7 +23,12 @@ TOOLS_MODULE := tools
 
 CHART := charts/go-cluster-backup
 HELM_RELEASE ?= check
-CHART_EXAMPLES := minimal k3s-single-node
+# Every examples/values/<name>.yaml is one example and must have its
+# examples/config/<name>.yaml counterpart. The set is derived so a new pair is
+# gated just by being added, and the chart target fails on a lone half instead
+# of silently dropping it.
+CHART_EXAMPLES := $(patsubst examples/values/%.yaml,%,$(wildcard examples/values/*.yaml))
+CHART_ORPHAN_CONFIGS := $(filter-out $(addprefix examples/config/,$(addsuffix .yaml,$(CHART_EXAMPLES))),$(wildcard examples/config/*.yaml))
 KUBERNETES_VERSIONS := 1.31.0 1.36.0 1.37.0
 
 # kubeconform downloads a schema per kind and version. The schemas are pinned to
@@ -158,18 +163,23 @@ vuln:
 generate:
 	cd $(TOOLS_MODULE) && $(GO) run ./gen -root ..
 
-# chart lints both examples, renders each of them once, validates every rendered
-# object against the Kubernetes API schema of each version the chart claims
-# (kubeVersion >=1.31.0-0), and proves the generated README is not stale. A kind
-# no pinned schema carries is an error: -ignore-missing-schemas is not passed.
+# chart lints every paired example (examples/values/<name>.yaml with
+# examples/config/<name>.yaml), renders each of them once, validates every
+# rendered object against the Kubernetes API schema of each version the chart
+# claims (kubeVersion >=1.31.0-0), and proves the generated README is not
+# stale. A kind no pinned schema carries is an error: -ignore-missing-schemas
+# is not passed.
 chart:
 	@set -e; \
 	helm="$$($(GO) tool $(TOOLS) -n helm)"; \
 	tmp="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp"' EXIT; \
+	[ -n "$(CHART_EXAMPLES)" ] || { echo "no examples/values/*.yaml: the chart gate would check nothing" >&2; exit 1; }; \
+	[ -z "$(CHART_ORPHAN_CONFIGS)" ] || { echo "examples/config has no examples/values counterpart for: $(CHART_ORPHAN_CONFIGS)" >&2; exit 1; }; \
 	mkdir -p $(KUBECONFORM_CACHE); \
 	for example in $(CHART_EXAMPLES); do \
 		echo "helm lint --strict ($(CHART), $$example)"; \
+		test -f examples/config/$$example.yaml || { echo "examples/config/$$example.yaml is missing: every examples/values file must have a paired config" >&2; exit 1; }; \
 		"$$helm" lint --strict $(CHART) \
 			-f examples/values/$$example.yaml \
 			--set-file config=examples/config/$$example.yaml || exit 1; \
@@ -179,7 +189,7 @@ chart:
 			> "$$tmp/$$example.yaml" || exit 1; \
 	done; \
 	for version in $(KUBERNETES_VERSIONS); do \
-		echo "kubeconform (both examples, kubernetes $$version)"; \
+		echo "kubeconform (every example, kubernetes $$version)"; \
 		$(GO) tool $(TOOLS) kubeconform -strict -summary \
 			-cache $(KUBECONFORM_CACHE) \
 			-schema-location '$(KUBECONFORM_SCHEMA_LOCATION)' \

@@ -33,6 +33,10 @@ run:
   unclassified_error: transient
   notifier_failure_is_fatal: false
   retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
+  # The stable writer id this deployment opts into. Empty is the ordinary
+  # single-writer deployment; a per-node deployment sets one per node and shares
+  # the catalog between the writers of one prefix.
+  writer_identity: ""
 
 layout:
   run_prefix: "runs/{{ .Run.ID }}"
@@ -50,6 +54,7 @@ stage:
       type: sqlite
       artifact: {group: state, name: host-state, importance: required, sensitivity: secret}
       pipeline: [seal]
+      rate_limit: 0
       config: {path: /host/state.db, scratch_dir: /plain, busy_timeout: 10s, integrity_check: quick}
 
 restore:
@@ -74,6 +79,12 @@ discoveries:
       request_timeout: 30s
       secrets_path: /tmp/discovered
       list_page_size: 500
+      # The chart fills this from spec.nodeName in every writer pod; empty opts
+      # out of every node check. node_scope is off for the single-writer
+      # reference; a per-node deployment turns it on and declares every writer.
+      node_env: BACKUP_NODE_NAME
+      node_scope: false
+      writer_nodes: []
       exclude: {label: backup.example/ignore, value: "true"}
       # A volume nobody declared and nobody excluded is one failed artifact
       # naming it — never a silent absence, and never a green copy of a live
@@ -91,6 +102,7 @@ discoveries:
           selector: "backup.example/engine=postgres"
           covers_volumes: true
           min_matches: 0
+          rate_limit: 0
           artifact:
             group: databases
             name: '{{ .Namespace }}/{{ label "backup.example/instance" }}'
@@ -104,6 +116,7 @@ discoveries:
               database: '{{ envValue 0 "POSTGRES_DB" }}'
               username: '{{ envValue 0 "POSTGRES_USER" }}'
               password: {file: '{{ envFile 0 "POSTGRES_PASSWORD" }}'}
+              client_dirs: [/usr/libexec/postgresql18, /usr/libexec/postgresql17, /usr/libexec/postgresql16, /usr/libexec/postgresql15]
               format: custom
               compression: none
               connect_attempts: 6
@@ -117,6 +130,7 @@ discoveries:
         - name: volumes
           selector: "backup.example/engine=files"
           min_matches: 0
+          rate_limit: 0
           artifact:
             group: volumes
             name: "{{ .Namespace }}/{{ .Name }}"
@@ -128,27 +142,47 @@ discoveries:
             config:
               root: "{{ volumePath }}"
               ignore_vanished: true
+              on_change: record
 
 sources:
   app_database:
     type: postgres
     artifact: {group: databases, name: app/postgres, importance: required, sensitivity: plain}
     pipeline: [compress]
+    rate_limit: 0
     config:
       address: postgres.example.svc.cluster.local:5432
       database: app
       username: app
       password: {file: /run/secrets/postgres/password}
+      client_dirs: [/usr/libexec/postgresql18, /usr/libexec/postgresql17, /usr/libexec/postgresql16, /usr/libexec/postgresql15]
       format: custom
       compression: none
       connect_attempts: 6
       connect_interval: 5s
       all_databases: false
       exclude_databases: []
+  postgres_globals:
+    type: postgres_globals
+    # The raw pg_dumpall globals output is credential content unconditionally:
+    # role settings can hold secrets even with no password hash, so the artifact
+    # is secret and the pipeline must seal it.
+    artifact: {group: databases, name: cluster/globals, importance: required, sensitivity: secret}
+    pipeline: [seal]
+    rate_limit: 0
+    config:
+      address: postgres.example.svc.cluster.local:5432
+      username: app
+      password: {file: /run/secrets/postgres/password}
+      client_dirs: [/usr/libexec/postgresql18, /usr/libexec/postgresql17, /usr/libexec/postgresql16, /usr/libexec/postgresql15]
+      role_hashes: false
+      connect_attempts: 6
+      connect_interval: 5s
   search_cache:
     type: redis
     artifact: {group: caches, name: search, importance: best_effort, sensitivity: plain}
     pipeline: [compress]
+    rate_limit: 0
     config:
       address: redis.example.svc.cluster.local:6379
       password: {file: /run/secrets/redis/password}
@@ -159,21 +193,47 @@ sources:
     type: files
     artifact: {group: volumes, name: uploads, importance: best_effort, sensitivity: plain}
     pipeline: [compress]
-    config: {root: /volumes/example/uploads, ignore_vanished: true}
+    rate_limit: 0
+    config: {root: /volumes/example/uploads, ignore_vanished: true, on_change: record}
   vpn_peers:
     type: sqlite
     artifact: {group: vpn, name: wireguard, importance: required, sensitivity: secret}
     pipeline: [compress, seal]
+    rate_limit: 0
     config: {path: /vpn-config/wireguard.db, scratch_dir: /backup/scratch, busy_timeout: 10s, integrity_check: quick}
   node_state:
     type: k3s_state
     artifact: {group: control-plane, name: k3s-datastore, importance: required, sensitivity: secret}
     pipeline: [seal]
+    rate_limit: 0
     config: {datastore: /k3s-db/state.db, token: {file: /k3s-token}, scratch_dir: /plain, busy_timeout: 10s, integrity_check: quick, timeout: 2m}
+  node_etcd:
+    type: k3s_etcd
+    # The snapshot and the server token are credential content unconditionally:
+    # a snapshot alone cannot bootstrap a cluster, and the pair is CA keys.
+    artifact: {group: control-plane, name: k3s-etcd, importance: required, sensitivity: secret}
+    pipeline: [seal]
+    rate_limit: 0
+    config:
+      snapshot_dir: /var/lib/rancher/k3s/server/db/snapshots
+      token: {file: /var/lib/rancher/k3s/server/token}
+      max_age: 26h
+  vendor_snapshot:
+    type: collected
+    # One file a vendor collector published after its own semantic check; the
+    # marker beside it is exactly <path>.sha256 and both must be fresh.
+    artifact: {group: vendors, name: example, importance: required, sensitivity: plain}
+    pipeline: [compress]
+    rate_limit: 0
+    config:
+      path: /collect/vendor-snapshot.tar
+      ext: .tar
+      max_age: 26h
   control_plane:
     type: staged
     artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: secret}
     pipeline: []
+    rate_limit: 0
     config: {dir: /backup/staged, name: k3s-state}
 
 processors:
@@ -195,7 +255,7 @@ storages:
     # is the storage's own cap over every kind, checked by the protection ledger.
     retention:
       scheduled: {type: gfs, config: {daily: 7, weekly: 4, monthly: 0, timezone: UTC, min_keep: 1, count_incomplete: true}}
-      manual: {type: keep_last, config: {count: 5, min_keep: 1, count_incomplete: true}}
+      manual: {type: keep_versions, config: {count: 5, min_keep: 1, count_incomplete: true}}
     max_total_bytes: 14GB
     time_budget: 30m
     config:
@@ -253,9 +313,18 @@ notifiers:
   ops:
     type: webhook
     config:
-      url: https://notify.example.com/backup
+      # Endpoint templates are opt-in. With them on, url and header values are
+      # templates over the endpoint-only function `secret PATH`: the argument is
+      # exactly one string-literal absolute path (a computed, nested or piped
+      # argument, or a relative literal, is refused offline at validate), the
+      # authority is literal and must end before the first action, so a mounted
+      # secret can supply a path segment or a bearer token but never the host.
+      endpoint_templates: true
+      url: https://notify.example.com/hooks/{{ secret "/run/secrets/webhook/path" }}
       method: POST
-      headers: {Content-Type: application/json}
+      headers:
+        Content-Type: application/json
+        Authorization: 'Bearer {{ secret "/run/secrets/webhook/authorization" }}'
       body_format: yaml
       timeout: 10s
       success_status: [200, 202]

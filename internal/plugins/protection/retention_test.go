@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
 	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/execution"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/human"
@@ -19,6 +21,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/inventory"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keepversions"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/guard"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
@@ -68,6 +71,14 @@ func testDestinationLogged(t *testing.T, name string, s storage.Storage, log *sl
 func testLedger(t *testing.T, storages map[string]storage.Storage, policies map[string]map[model.RunKind]retention.Retention,
 	caps map[string]int64, cutoff time.Time) *Ledger {
 	t.Helper()
+	return testLedgerWriting(t, "", storages, policies, caps, cutoff)
+}
+
+// testLedgerWriting is testLedger for a deployment that opted into a stable
+// writer identity.
+func testLedgerWriting(t *testing.T, writer string, storages map[string]storage.Storage,
+	policies map[string]map[model.RunKind]retention.Retention, caps map[string]int64, cutoff time.Time) *Ledger {
+	t.Helper()
 	destinations := make([]guard.Destination, 0, len(storages))
 	names := make([]string, 0, len(storages))
 	for name := range storages {
@@ -78,11 +89,12 @@ func testLedger(t *testing.T, storages map[string]storage.Storage, policies map[
 		destinations = append(destinations, testDestination(t, name, storages[name]))
 	}
 	return NewLedger(LedgerOptions{
-		Destinations: destinations,
-		Policies:     policies,
-		Caps:         caps,
-		StaleCutoff:  cutoff,
-		Retry:        execution.Options{Attempts: 1, Unclassified: pluginerrors.ClassPermanent},
+		Destinations:   destinations,
+		Policies:       policies,
+		Caps:           caps,
+		StaleCutoff:    cutoff,
+		Retry:          execution.Options{Attempts: 1, Unclassified: pluginerrors.ClassPermanent},
+		WriterIdentity: writer,
 	})
 }
 
@@ -115,7 +127,7 @@ func surveyOf(runs map[string]inventory.Run) inventory.Survey {
 // TestMarkCurrentSkipsAnUnnamedArtifact: a nameless artifact carries no identity
 // to credit, so it never enters the copy ledger.
 func TestMarkCurrentSkipsAnUnnamedArtifact(t *testing.T) {
-	st := newRetentionState(nil)
+	st := newRetentionState(nil, "")
 	st.markCurrent("run-1", model.RunKindScheduled, time.Now().UTC(),
 		[]model.ArtifactResult{{Artifact: model.Artifact{Group: "g"}, Outcome: model.ArtifactOK}}, nil, nil)
 	if len(st.held) != 0 {
@@ -129,7 +141,7 @@ func TestMarkCurrentSkipsAnUnnamedArtifact(t *testing.T) {
 // TestMarkCurrentCreditsOnlySavedVerifiedCopies: the run being written holds an
 // artifact only where it was verified and its manifest saved.
 func TestMarkCurrentCreditsOnlySavedVerifiedCopies(t *testing.T) {
-	st := newRetentionState(nil)
+	st := newRetentionState(nil, "")
 	artifacts := []model.ArtifactResult{{Artifact: model.Artifact{Group: "g", Name: "n"}, Outcome: model.ArtifactOK}}
 	st.markCurrent("run-1", model.RunKindScheduled, time.Now().UTC(), artifacts,
 		map[string]map[string]bool{"n": {"alpha": true, "beta": true}}, map[string]bool{"alpha": true})
@@ -144,7 +156,7 @@ func TestMarkCurrentCreditsOnlySavedVerifiedCopies(t *testing.T) {
 // TestLatestCopyManualOnlyHolder: a manual run is pinned only while it is the
 // storage's only verified copy of the artifact.
 func TestLatestCopyManualOnlyHolder(t *testing.T) {
-	st := newRetentionState(nil)
+	st := newRetentionState(nil, "")
 	st.kinds["m1"] = model.RunKindManual
 	st.markHeld("g/n", "alpha", model.RunKindManual, "m1", time.Now().UTC())
 	if got := st.latestCopy("m1", "alpha"); got != "it holds the only verified copy of g/n" {
@@ -159,7 +171,7 @@ func TestLatestCopyManualOnlyHolder(t *testing.T) {
 // TestLatestCopyNewestWins: among scheduled holders the newest copy is pinned,
 // ties broken by id the way NewestFirst does.
 func TestLatestCopyNewestWins(t *testing.T) {
-	st := newRetentionState(nil)
+	st := newRetentionState(nil, "")
 	base := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
 	st.kinds["old"], st.kinds["new"] = model.RunKindScheduled, model.RunKindScheduled
 	st.markHeld("g/n", "alpha", model.RunKindScheduled, "old", base)
@@ -179,7 +191,7 @@ func TestUncertainRunIsNeverDropped(t *testing.T) {
 		"dead": {Stored: model.StoredRun{RunID: "dead", Kind: model.RunKindScheduled}},
 		"old":  {Stored: model.StoredRun{RunID: "old", Kind: model.RunKindScheduled}},
 	})}
-	st := newRetentionState(surveys)
+	st := newRetentionState(surveys, "")
 	if ok, _ := st.canDrop("dead", "alpha"); !ok {
 		t.Fatal("the uncertain run was droppable before it was named")
 	}
@@ -198,7 +210,7 @@ func TestCanDropFloors(t *testing.T) {
 	st := newRetentionState(map[string]inventory.Survey{"alpha": surveyOf(map[string]inventory.Run{
 		"bad":  {ManifestProblem: "unreadable"},
 		"only": {Stored: model.StoredRun{RunID: "only", Verified: true}},
-	})})
+	})}, "")
 	if ok, reason := st.canDrop("bad", "alpha"); ok || reason == "" {
 		t.Fatalf("a problem run = (%v, %q), want a refusal", ok, reason)
 	}
@@ -436,7 +448,7 @@ func TestDropGuards(t *testing.T) {
 		t.Fatalf("drop of an in-flight run freed %d", got)
 	}
 	floor := newDeleter(nil)
-	l.state = newRetentionState(map[string]inventory.Survey{"alpha": surveyOf(runs)})
+	l.state = newRetentionState(map[string]inventory.Survey{"alpha": surveyOf(runs)}, "")
 	l.state.mark("r1", "alpha")
 	if got := floor.drop("r1"); got != 0 {
 		t.Fatalf("drop of the only verified run freed %d", got)
@@ -460,7 +472,7 @@ func TestEvictForCapStopsOnceTheIncompleteRunsFit(t *testing.T) {
 		}
 	}
 	l := testLedger(t, map[string]storage.Storage{"alpha": f}, nil, nil, now.Add(time.Hour))
-	l.state = newRetentionState(nil)
+	l.state = newRetentionState(nil, "")
 	d := &deleter{ctx: context.Background(), l: l, storage: "alpha", sur: surveyOf(runs),
 		cutoff: now.Add(time.Hour),
 		cap:    &capState{cap: 100, occupancy: 150, known: true, reserved: map[string]int64{}}}
@@ -494,7 +506,7 @@ func TestEvictForCapStopsMidScheduledHistory(t *testing.T) {
 		list = append(list, r.Stored)
 	}
 	l := testLedger(t, map[string]storage.Storage{"alpha": f}, nil, nil, base)
-	l.state = newRetentionState(nil)
+	l.state = newRetentionState(nil, "")
 	d := &deleter{ctx: context.Background(), l: l, storage: "alpha", sur: surveyOf(runs),
 		cutoff: base,
 		cap:    &capState{cap: 100, occupancy: 154, known: true, reserved: map[string]int64{}}}
@@ -517,7 +529,7 @@ func TestEvictForCapClosedOnUnknownAndFloor(t *testing.T) {
 	}
 	l := testLedger(t, map[string]storage.Storage{"alpha": f}, nil, nil, base)
 	unknown := &capState{cap: 100, occupancy: 154, known: false, reserved: map[string]int64{}}
-	l.state = newRetentionState(nil)
+	l.state = newRetentionState(nil, "")
 	d := &deleter{ctx: context.Background(), l: l, storage: "alpha", sur: surveyOf(runs),
 		cutoff: base, cap: unknown}
 	d.evictForCap(unknown, []model.StoredRun{runs["kept"].Stored})
@@ -526,7 +538,7 @@ func TestEvictForCapClosedOnUnknownAndFloor(t *testing.T) {
 	}
 
 	known := &capState{cap: 100, occupancy: 154, known: true, reserved: map[string]int64{}}
-	l.state = newRetentionState(nil)
+	l.state = newRetentionState(nil, "")
 	d = &deleter{ctx: context.Background(), l: l, storage: "alpha", sur: surveyOf(runs),
 		cutoff: base, cap: known, protected: map[string]bool{"kept": true}}
 	d.evictForCap(known, []model.StoredRun{runs["kept"].Stored})
@@ -620,7 +632,7 @@ func TestRetentionStateReadsProblemRuns(t *testing.T) {
 			}},
 		},
 	}
-	st := newRetentionState(map[string]inventory.Survey{"alpha": surveyOf(runs)})
+	st := newRetentionState(map[string]inventory.Survey{"alpha": surveyOf(runs)}, "")
 	if st.problems["bad"] == "" {
 		t.Fatal("the problem run was not recorded")
 	}
@@ -632,7 +644,7 @@ func TestRetentionStateReadsProblemRuns(t *testing.T) {
 // TestLatestCopyTieBreaksByID: equal instants order by run id the way
 // NewestFirst does, so only the lower id is the newest copy.
 func TestLatestCopyTieBreaksByID(t *testing.T) {
-	st := newRetentionState(nil)
+	st := newRetentionState(nil, "")
 	at := time.Now().UTC()
 	st.kinds["a"], st.kinds["b"] = model.RunKindScheduled, model.RunKindScheduled
 	st.markHeld("g/n", "alpha", model.RunKindScheduled, "b", at)
@@ -653,7 +665,7 @@ func TestLatestCopyTieBreaksByID(t *testing.T) {
 // return before any deletion.
 func TestEvictForCapGuards(t *testing.T) {
 	l := testLedger(t, map[string]storage.Storage{"alpha": storagetest.NewFake()}, nil, nil, time.Time{})
-	l.state = newRetentionState(nil)
+	l.state = newRetentionState(nil, "")
 	d := &deleter{ctx: context.Background(), l: l, storage: "alpha"}
 	d.evictForCap(nil, nil)
 	d.evictForCap(&capState{cap: 0}, nil)
@@ -678,7 +690,7 @@ func TestEvictForCapManualRunsBeforeHistory(t *testing.T) {
 			Objects: []model.ObjectInfo{{Key: "runs/n/x", Size: 60}}},
 	}
 	l := testLedger(t, map[string]storage.Storage{"alpha": f}, nil, nil, now)
-	l.state = newRetentionState(nil)
+	l.state = newRetentionState(nil, "")
 	d := &deleter{ctx: context.Background(), l: l, storage: "alpha", sur: surveyOf(runs),
 		cutoff: now, cap: &capState{cap: 100, occupancy: 150, known: true, reserved: map[string]int64{}}}
 	d.evictForCap(d.cap, []model.StoredRun{runs["m"].Stored, runs["n"].Stored})
@@ -997,4 +1009,316 @@ func TestR3_C2_AccountingViewIsSealed(t *testing.T) {
 		t.Fatalf("used through the view = %d, want 5", got)
 	}
 	view.Unreserve("alpha", "k")
+}
+
+// capturingPolicy records the run list the ledger hands the policy and applies a
+// scripted decision.
+type capturingPolicy struct {
+	drop      []string
+	keepFloor []string
+	got       []model.StoredRun
+}
+
+func (p *capturingPolicy) Decide(_ context.Context, req retention.DecideRequest) (retention.Decision, error) {
+	p.got = append([]model.StoredRun(nil), req.Runs...)
+	return retention.Decision{Drop: p.drop, KeepFloor: p.keepFloor}, nil
+}
+
+// TestSweepProjectsHeldAndObservedIdentities: the ledger is the ONE source of
+// the policy's artifact input — the successful copies it holds for this storage,
+// and every identity a readable manifest or the current run's own results named,
+// whatever the outcome.
+func TestSweepProjectsHeldAndObservedIdentities(t *testing.T) {
+	base := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
+	f := storagetest.NewFake()
+	past := verifiedRun("past", base, model.RunKindScheduled, "alpha")
+	past.Manifest.Artifacts = append(past.Manifest.Artifacts,
+		model.ArtifactResult{Artifact: model.Artifact{Group: "databases", Name: "dropped"}, Outcome: model.ArtifactFailed})
+	policy := &capturingPolicy{}
+	l := testLedger(t, map[string]storage.Storage{"alpha": f},
+		map[string]map[model.RunKind]retention.Retention{"alpha": {model.RunKindScheduled: policy}}, nil, base)
+	survey := surveyOf(map[string]inventory.Run{"past": past})
+	l.Start(map[string]inventory.Survey{"alpha": survey})
+	current := model.StoredRun{RunID: "current", Kind: model.RunKindScheduled, At: base.Add(time.Hour)}
+	res := l.Sweep(context.Background(), Sweep{RunStart: base.Add(time.Hour), Kind: model.RunKindScheduled,
+		Storage: "alpha", Survey: survey, Overlay: &current,
+		Artifacts: []model.ArtifactResult{
+			{Artifact: model.Artifact{Group: "databases", Name: "prod"}, Outcome: model.ArtifactOK},
+			{Artifact: model.Artifact{Group: "cache", Name: "redis"}, Outcome: model.ArtifactFailed},
+			{Artifact: model.Artifact{Group: "cache", Name: "redis"}, Outcome: model.ArtifactFailed},
+			{Artifact: model.Artifact{Group: "unnamed"}, Outcome: model.ArtifactFailed},
+		},
+		Verified: map[string]bool{"prod": true}, ManifestSaved: true})
+	if res.Err != nil {
+		t.Fatalf("sweep = %+v", res)
+	}
+	got := map[string]model.StoredRun{}
+	for _, r := range policy.got {
+		got[r.RunID] = r
+	}
+	if !slices.Equal(got["past"].Artifacts, []string{"databases/prod"}) {
+		t.Fatalf("past Artifacts = %v, want the one held copy", got["past"].Artifacts)
+	}
+	if !slices.Equal(got["past"].ObservedArtifacts, []string{"databases/prod", "databases/dropped"}) {
+		t.Fatalf("past ObservedArtifacts = %v, want every named identity", got["past"].ObservedArtifacts)
+	}
+	if !slices.Equal(got["current"].Artifacts, []string{"databases/prod"}) {
+		t.Fatalf("current Artifacts = %v, want the verified and saved copy", got["current"].Artifacts)
+	}
+	if !slices.Equal(got["current"].ObservedArtifacts, []string{"databases/prod", "cache/redis"}) {
+		t.Fatalf("current ObservedArtifacts = %v, want every produced identity", got["current"].ObservedArtifacts)
+	}
+}
+
+// TestForeignRunsAreIsolatedFromCreditPolicyAndDeletion: with a writer identity,
+// another writer's runs and runs whose manifest cannot prove ownership are never
+// handed to the policy, credited or deleted — a policy naming them changes
+// nothing — while the deletion root refuses them by name.
+func TestForeignRunsAreIsolatedFromCreditPolicyAndDeletion(t *testing.T) {
+	base := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
+	f := storagetest.NewFake()
+	ownOld := withManifest(verifiedRun("own-old", base, model.RunKindScheduled, "alpha"))
+	ownOld.Manifest.WriterIdentity = "node-a"
+	ownNew := withManifest(verifiedRun("own-new", base.Add(time.Hour), model.RunKindScheduled, "alpha"))
+	ownNew.Manifest.WriterIdentity = "node-a"
+	foreign := withManifest(verifiedRun("foreign", base.Add(2*time.Hour), model.RunKindScheduled, "alpha"))
+	foreign.Manifest.WriterIdentity = "node-b"
+	unowned := inventory.Run{
+		Stored:  model.StoredRun{RunID: "unowned", Kind: model.RunKindScheduled, At: base.Add(3 * time.Hour), Bytes: 4},
+		Objects: []model.ObjectInfo{{Key: "runs/unowned/x", Size: 4}},
+	}
+	runs := map[string]inventory.Run{"own-old": ownOld, "own-new": ownNew, "foreign": foreign, "unowned": unowned}
+	for _, r := range runs {
+		for _, o := range r.Objects {
+			f.PutObject(o.Key, []byte("0123456789")[:o.Size], base)
+		}
+	}
+	policy := &capturingPolicy{drop: []string{"own-old", "foreign", "unowned"}}
+	l := testLedgerWriting(t, "node-a", map[string]storage.Storage{"alpha": f},
+		map[string]map[model.RunKind]retention.Retention{"alpha": {model.RunKindScheduled: policy}}, nil, base)
+	survey := surveyOf(runs)
+	l.Start(map[string]inventory.Survey{"alpha": survey})
+	res := l.Sweep(context.Background(), Sweep{RunStart: base.Add(4 * time.Hour), Kind: model.RunKindScheduled,
+		Storage: "alpha", Survey: survey})
+	if res.Err != nil {
+		t.Fatalf("sweep = %+v", res)
+	}
+	for _, r := range policy.got {
+		if r.RunID != "own-old" && r.RunID != "own-new" {
+			t.Fatalf("a foreign run reached the policy: %+v", policy.got)
+		}
+	}
+	if len(policy.got) != 2 {
+		t.Fatalf("the policy saw %d runs, want this writer's two", len(policy.got))
+	}
+	if !slices.Contains(res.Deleted, "own-old") {
+		t.Fatalf("the policy's own drop did not run: %+v", res)
+	}
+	if _, ok := f.Bytes("runs/foreign/databases/prod"); !ok {
+		t.Fatal("a foreign run was deleted")
+	}
+	if _, ok := f.Bytes("runs/unowned/x"); !ok {
+		t.Fatal("a run that cannot prove its writer was deleted")
+	}
+	if ok, reason := l.state.canDrop("foreign", "alpha"); ok || reason == "" {
+		t.Fatalf("the deletion root let a foreign run through: (%v, %q)", ok, reason)
+	}
+	if ok, reason := l.state.canDrop("unowned", "alpha"); ok || reason == "" {
+		t.Fatalf("the deletion root let an unowned run through: (%v, %q)", ok, reason)
+	}
+	if l.state.verified["foreign"] != nil || l.state.verified["unowned"] != nil {
+		t.Fatalf("a foreign run was credited as a verified copy: %+v", l.state.verified)
+	}
+	for artifact, byStorage := range l.state.held {
+		for _, byKind := range byStorage["alpha"] {
+			if _, ok := byKind["foreign"]; ok {
+				t.Fatalf("%s credited a foreign run's copy: %+v", artifact, byKind)
+			}
+		}
+	}
+}
+
+// TestSweepReportsCapEvictedRunsAndOverflow: the cap's deletions are named apart
+// from the policy's, and the bytes it cannot free are reported as overflow. A
+// foreign run's bytes are part of the occupancy the cap is measured against.
+func TestSweepReportsCapEvictedRunsAndOverflow(t *testing.T) {
+	base := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
+	makeRuns := func(withForeign bool) (map[string]inventory.Run, *storagetest.Fake) {
+		f := storagetest.NewFake()
+		old := withManifest(verifiedRun("old", base, model.RunKindScheduled, "alpha"))
+		old.Manifest.WriterIdentity = "node-a"
+		newer := withManifest(verifiedRun("newer", base.Add(time.Hour), model.RunKindScheduled, "alpha"))
+		newer.Manifest.WriterIdentity = "node-a"
+		runs := map[string]inventory.Run{"old": old, "newer": newer}
+		if withForeign {
+			foreign := withManifest(verifiedRun("foreign", base.Add(2*time.Hour), model.RunKindScheduled, "alpha"))
+			foreign.Manifest.WriterIdentity = "node-b"
+			runs["foreign"] = foreign
+		}
+		for _, r := range runs {
+			for _, o := range r.Objects {
+				f.PutObject(o.Key, []byte("0123456789")[:o.Size], base)
+			}
+		}
+		return runs, f
+	}
+	// Two own runs are 5+7 bytes and the foreign one 9, against an 11-byte cap:
+	// the foreign bytes are part of the occupancy, so the cap cannot hold both
+	// own runs and still reports the bytes it could not free.
+	runs, f := makeRuns(true)
+	l := testLedgerWriting(t, "node-a", map[string]storage.Storage{"alpha": f}, nil,
+		map[string]int64{"alpha": 11}, base)
+	survey := surveyOf(runs)
+	l.Start(map[string]inventory.Survey{"alpha": survey})
+	res := l.Sweep(context.Background(), Sweep{RunStart: base.Add(3 * time.Hour), Kind: model.RunKindScheduled,
+		Storage: "alpha", Survey: survey})
+	if res.Err != nil {
+		t.Fatalf("sweep = %+v", res)
+	}
+	if !slices.Equal(res.CapEvicted, []string{"old"}) {
+		t.Fatalf("CapEvicted = %v, want the older own run", res.CapEvicted)
+	}
+	if res.CapOverflow != 5 {
+		t.Fatalf("CapOverflow = %d, want the 5 bytes the foreign occupancy leaves over", res.CapOverflow)
+	}
+	if _, ok := f.Bytes("runs/foreign/databases/prod"); !ok {
+		t.Fatal("the cap deleted a foreign run")
+	}
+
+	// Without the foreign bytes the same cap fits both own runs instead of
+	// spilling over, and the eviction is still named.
+	runs, f = makeRuns(false)
+	l = testLedger(t, map[string]storage.Storage{"alpha": f}, nil, map[string]int64{"alpha": 11}, base)
+	survey = surveyOf(runs)
+	l.Start(map[string]inventory.Survey{"alpha": survey})
+	res = l.Sweep(context.Background(), Sweep{RunStart: base.Add(3 * time.Hour), Kind: model.RunKindScheduled,
+		Storage: "alpha", Survey: survey})
+	if res.Err != nil {
+		t.Fatalf("sweep = %+v", res)
+	}
+	if !slices.Equal(res.CapEvicted, []string{"old"}) {
+		t.Fatalf("CapEvicted = %v, want the older own run", res.CapEvicted)
+	}
+	if res.CapOverflow != 0 {
+		t.Fatalf("CapOverflow = %d, want none after the eviction", res.CapOverflow)
+	}
+}
+
+// TestOccupancyKnownFollowsTheSurvey: the authoritative occupancy state is the// ledger's, not a caller's guess — unknown before and after a failed survey, and
+// whenever an earlier writer's accepted writes may still land.
+func TestOccupancyKnownFollowsTheSurvey(t *testing.T) {
+	l := testLedger(t, map[string]storage.Storage{"alpha": storagetest.NewFake()}, nil, nil, time.Time{})
+	if l.OccupancyKnown("alpha") {
+		t.Fatal("the occupancy was known before any survey")
+	}
+	l.Start(map[string]inventory.Survey{"alpha": {Storage: "alpha", OK: true}})
+	if !l.OccupancyKnown("alpha") {
+		t.Fatal("a completed survey left the occupancy unknown")
+	}
+	l.Unknown("alpha")
+	if l.OccupancyKnown("alpha") {
+		t.Fatal("an explicitly unknown occupancy reported itself known")
+	}
+	if (*Ledger)(nil).OccupancyKnown("alpha") {
+		t.Fatal("a nil ledger claimed a known occupancy")
+	}
+}
+
+// TestSweepKeepVersionsRetainsTheNewestCopiesOfLiveArtifacts is the issue #3.5
+// reproduction through the one ledger: the newest seven runs delivered both
+// databases, three older runs failed the first one but still hold a good copy of
+// the second — and the failed history goes, while seven usable copies stay.
+func TestSweepKeepVersionsRetainsTheNewestCopiesOfLiveArtifacts(t *testing.T) {
+	base := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
+	f := storagetest.NewFake()
+	makeRun := func(id string, day int, firstOK, secondOK bool) inventory.Run {
+		at := base.AddDate(0, 0, -day)
+		outcome := model.OutcomeDelivered
+		if !firstOK || !secondOK {
+			outcome = model.OutcomeFailed
+		}
+		r := inventory.Run{
+			Stored:      model.StoredRun{RunID: id, Kind: model.RunKindScheduled, At: at, Manifest: true},
+			ManifestKey: "runs/" + id + "/manifest.json",
+			Manifest:    &model.RunReport{RunID: id, Kind: model.RunKindScheduled, StartedAt: at, Outcome: outcome},
+		}
+		for _, a := range []struct {
+			name string
+			ok   bool
+		}{{"first", firstOK}, {"second", secondOK}} {
+			ar := model.ArtifactResult{Artifact: model.Artifact{Group: "databases", Name: a.name}, Outcome: model.ArtifactFailed}
+			if a.ok {
+				body := []byte(id + "/" + a.name)
+				key := "runs/" + id + "/databases/" + a.name
+				ar.Outcome, ar.Key, ar.Bytes, ar.SHA256 = model.ArtifactOK, key, int64(len(body)), model.SHA256Hex(body)
+				r.Objects = append(r.Objects, model.ObjectInfo{Key: key, Size: int64(len(body))})
+				r.Stored.Bytes += int64(len(body))
+			}
+			r.Manifest.Artifacts = append(r.Manifest.Artifacts, ar)
+		}
+		return r
+	}
+	runs := map[string]inventory.Run{}
+	for day := range 7 {
+		id := fmt.Sprintf("good-%d", day)
+		runs[id] = makeRun(id, day, true, true)
+	}
+	for day := 7; day < 10; day++ {
+		id := fmt.Sprintf("old-%d", day)
+		runs[id] = makeRun(id, day, false, true)
+	}
+	for _, r := range runs {
+		for _, o := range r.Objects {
+			f.PutObject(o.Key, bytes.Repeat([]byte("x"), int(o.Size)), r.Stored.At)
+		}
+	}
+	lr := loader.New()
+	reg := instances.NewRegistry()
+	if err := loader.Add(lr, keepversions.Spec, func(lr *loader.Registry) error {
+		return keepversions.Apply(lr, reg)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := instances.Build(context.Background(), reg, retention.Kind, "keep_versions",
+		jsontext.Value(`{"count": 7, "min_keep": 1, "count_incomplete": true}`),
+		instances.Deps{Instance: "keep_versions", Log: discardLog()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := testLedger(t, map[string]storage.Storage{"alpha": f},
+		map[string]map[model.RunKind]retention.Retention{"alpha": {model.RunKindScheduled: policy}}, nil, base)
+	survey := surveyOf(runs)
+	l.Start(map[string]inventory.Survey{"alpha": survey})
+	res := l.Sweep(context.Background(), Sweep{RunStart: base.AddDate(0, 0, 1), Kind: model.RunKindScheduled,
+		Storage: "alpha", Survey: survey})
+	if res.Err != nil {
+		t.Fatalf("sweep = %+v", res)
+	}
+	if res.Kept != 7 || len(res.Deleted) != 3 {
+		t.Fatalf("kept %d deleted %v, want the seven delivered runs", res.Kept, res.Deleted)
+	}
+	left := runIDsOf(f)
+	for day := range 7 {
+		if !left[fmt.Sprintf("good-%d", day)] {
+			t.Fatalf("a usable copy was deleted: %v", left)
+		}
+	}
+	if len(left) != 7 {
+		t.Fatalf("storage still holds %d runs: %v", len(left), left)
+	}
+}
+
+// runIDsOf lists the run ids a fake still holds objects for.
+func runIDsOf(f *storagetest.Fake) map[string]bool {
+	out := map[string]bool{}
+	for _, key := range f.Keys() {
+		rest, ok := strings.CutPrefix(key, "runs/")
+		if !ok {
+			continue
+		}
+		if id, _, found := strings.Cut(rest, "/"); found && id != "" {
+			out[id] = true
+		}
+	}
+	return out
 }

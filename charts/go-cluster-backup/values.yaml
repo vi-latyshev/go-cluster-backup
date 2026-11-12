@@ -173,6 +173,27 @@ writer:
   # -- VolumeMounts only the writer container mounts, on top of the shared ones.
   # Pair them with `writer.volumes`; the restore container never sees them.
   volumeMounts: []
+  # -- Init containers of the scheduled and manual writer pods, rendered before
+  # the stage initContainer and the writer container; an entry may mount any pod
+  # volume, including `writer.volumes`. The chart merges
+  # `terminationMessagePolicy: FallbackToLogsOnError` into every entry: a failed
+  # collector's last log lines then reach the previous-run report instead of a
+  # bare exit code. An explicit conflicting policy fails the render; stating
+  # FallbackToLogsOnError is accepted. The chart grants these containers no
+  # ServiceAccount rights of their own, but Kubernetes auto-mounts the pod's
+  # service account token into every container of the pod, so a collector sees
+  # that token and the pod's RBAC — Kubernetes offers no per-container opt-out;
+  # run no untrusted tool there, and never log credentials or argv tokens
+  # (vendor CLIs can print them, and a log tail can enter a notification).
+  # Example:
+  #   initContainers:
+  #     - name: sqlite-snapshot
+  #       image: example.com/collector:1
+  #       command: ["/collector", "/node/state"]
+  #       volumeMounts:
+  #         - name: writer-node
+  #           mountPath: /node
+  initContainers: []
 
 # ── Optional staging initContainer ────────────────────────────────────────
 # Runs `go-cluster-backup stage` before the writer container, to snapshot state
@@ -225,7 +246,12 @@ serviceAccount:
 
 # ── RBAC ──────────────────────────────────────────────────────────────────
 rbac:
-  # -- Create the ServiceAccount's RBAC.
+  # -- Create the ServiceAccount's RBAC. The ClusterRole lists every pod, claim
+  # and volume cluster-wide and gets nodes by name, which the node-local
+  # discovery needs to prove it runs on the node a hostPath volume lives on.
+  # With create false, carry both grants yourself: a missing nodes get fails the
+  # affected pinned or local artifacts with a warning, never a silent read of
+  # another node's directory.
   create: true
   # -- Namespaces whose Secrets and ConfigMaps the tool may read, through one
   # RoleBinding each onto the `<fullname>-workload-access` ClusterRole. That

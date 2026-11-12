@@ -85,6 +85,17 @@ func TestNewWorldRegistersTheKit(t *testing.T) {
 	if _, ok := p.(*Processor); !ok {
 		t.Fatalf("the processor factory answered %T", p)
 	}
+	// An explicitly provided processor or discovery wins over the fake too.
+	presetProcessor := &Processor{Ext: ".preset"}
+	w.ExtraProcessors["ep"] = presetProcessor
+	if got := must.Do(instances.Build(ctx, w.Registry, processor.Kind, "fake", jsontext.Value(`{}`), instances.Deps{Instance: "ep"})); got != presetProcessor {
+		t.Fatalf("the extra processor was not handed back: %T", got)
+	}
+	presetDiscovery := &Discovery{Found: []discovery.Found{{Name: "preset"}}}
+	w.ExtraDiscoveries["ed"] = presetDiscovery
+	if got := must.Do(instances.Build(ctx, w.Registry, discovery.Kind, "fake", jsontext.Value(`{}`), instances.Deps{Instance: "ed"})); got != presetDiscovery {
+		t.Fatalf("the extra discovery was not handed back: %T", got)
+	}
 	if again := must.Do(instances.Build(ctx, w.Registry, processor.Kind, "fake", jsontext.Value(`{}`), deps)); again != p {
 		t.Fatal("the processor factory built a second fake for one instance")
 	}
@@ -271,6 +282,11 @@ func TestSourceBranches(t *testing.T) {
 	defer cancel()
 	if err := delayed.Dump(dctx, &bytes.Buffer{}); err == nil {
 		t.Fatal("a delayed Dump ignored the context")
+	}
+	// A delay the context survives still writes the bytes.
+	var delayedOut bytes.Buffer
+	if err := (&Source{Data: []byte("d"), DumpDelay: time.Millisecond}).Dump(ctx, &delayedOut); err != nil || delayedOut.String() != "d" {
+		t.Fatalf("a delayed Dump wrote %q, %v", delayedOut.String(), err)
 	}
 	var out bytes.Buffer
 	if err := (&Source{Data: []byte("payload")}).Dump(ctx, &out); err != nil || out.String() != "payload" {
@@ -532,5 +548,23 @@ func TestNewWorldKeepsDistributionRoles(t *testing.T) {
 	}
 	if _, stacked := loader.Roles(w.Loader)["test-roles"]; stacked {
 		t.Fatal("the kit added stand-in roles beside the distribution's")
+	}
+}
+
+// TestCredentialSourceBranches: the credential verdict answers both ways, counts
+// its calls, and a cancelled context is the caller's own error.
+func TestCredentialSourceBranches(t *testing.T) {
+	ctx := context.Background()
+	cs := &CredentialSource{Verdict: source.CredentialWarn}
+	verdict, err := cs.CredentialPolicy(ctx)
+	if err != nil || verdict != source.CredentialWarn || cs.PolicyCalls != 1 {
+		t.Fatalf("CredentialPolicy = %q, %v, calls %d", verdict, err, cs.PolicyCalls)
+	}
+	cs.PolicyErr = errors.New("policy refused")
+	if _, err := cs.CredentialPolicy(ctx); err == nil {
+		t.Fatal("CredentialPolicy ignored PolicyErr")
+	}
+	if _, err := (&CredentialSource{}).CredentialPolicy(canceled()); err == nil {
+		t.Fatal("CredentialPolicy ignored the cancelled context")
 	}
 }

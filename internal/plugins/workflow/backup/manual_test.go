@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/workflow/backup"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -168,6 +169,9 @@ func TestManualCapAdmissionRefusesAndDeletesNothing(t *testing.T) {
 	if got := rep.Storages[0]; got.CapLimitBytes != 1 || got.CapUsedBytes <= 1 {
 		t.Fatalf("the refusal does not carry the limit and the bytes used: %+v", got)
 	}
+	if rep.Storages[0].OccupancyUnknown {
+		t.Fatalf("a known over-cap refusal reported an unknown occupancy: %+v", rep.Storages[0])
+	}
 	if !strings.Contains(rep.Storages[0].Error, "cap_exceeded") {
 		t.Fatalf("the reason does not carry cap_exceeded: %q", rep.Storages[0].Error)
 	}
@@ -246,6 +250,9 @@ func TestRunRefusesACollidingRunID(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("the refusal does not name the collision: %v", err)
 	}
+	if puts := w.storage(t, "alpha").CallCount(storagetest.OpPut, ""); puts != 0 {
+		t.Fatalf("the colliding run wrote %d objects before refusing", puts)
+	}
 }
 
 // TestManifestKindMustAgreeWithTheRunID: a manifest whose kind disagrees with
@@ -273,6 +280,16 @@ func TestScheduledNeverFailsOnTheCap(t *testing.T) {
 	}
 	if ids := runIDsOn(w.storage(t, "alpha")); ids["old"] {
 		t.Fatalf("the cap eviction did not free the old run: %v", ids)
+	}
+	got := storageResult(rep, "alpha")
+	if !slices.Contains(got.CapEvicted, "old") {
+		t.Fatalf("the cap eviction is not named in the report: %+v", got)
+	}
+	if got.CapOverflowBytes <= 0 {
+		t.Fatalf("the new run itself exceeds the one-byte cap, so the overflow must be reported: %+v", got)
+	}
+	if got.RetentionError != "" {
+		t.Fatalf("an eviction failure is not a retention error: %+v", got)
 	}
 }
 
@@ -305,6 +322,12 @@ func TestManualSurveyFailureRefusesOnlyItsStorage(t *testing.T) {
 	}
 	if got := byName["alpha"]; !got.CapExceeded || got.Outcome != model.StorageFailed {
 		t.Fatalf("alpha = %+v, want the unknown-occupancy refusal", got)
+	}
+	if !byName["alpha"].OccupancyUnknown {
+		t.Fatalf("alpha's unknown occupancy is not in the report: %+v", byName["alpha"])
+	}
+	if byName["beta"].OccupancyUnknown {
+		t.Fatalf("beta's known occupancy is reported unknown: %+v", byName["beta"])
 	}
 	if got := byName["beta"]; got.Outcome != model.StorageVerified {
 		t.Fatalf("beta = %+v, want the whole run", got)

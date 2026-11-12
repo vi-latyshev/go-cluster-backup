@@ -40,6 +40,12 @@ import (
 type Config struct {
 	Root           string `json:"root" required:"true" doc:"directory whose tree becomes one tar stream"`
 	IgnoreVanished bool   `json:"ignore_vanished" doc:"files deleted between the walk and their open are skipped instead of failing the artifact"`
+	// OnChange decides what a file that changes under the read does to the
+	// artifact. record leaves the entry out, counts it and keeps the archive;
+	// fail fails the artifact at the first detected mutation. Static refusals —
+	// a socket, a FIFO, a tolerated delete — are neither: they are the tree's
+	// own shape, not a write racing the read.
+	OnChange string `json:"on_change" doc:"record: count a file that changes under the read and keep the archive; fail: fail the artifact on the first detected mutation (a changed entry, a zero-padded short read or a post-copy metadata mismatch)"`
 }
 
 type Source struct {
@@ -54,6 +60,10 @@ type Source struct {
 	// package, and a swap a test performs any earlier is a different entry
 	// altogether.
 	testBeforeOpen func(path string)
+	// testAfterCopy is the matching seam after the body was copied: a workload
+	// appending to or rewriting a file while its bytes are read shows up in
+	// the post-copy stat, and no filesystem performs that on demand.
+	testAfterCopy func(path string)
 }
 
 // DumpStats reports what the Dump calls on this instance left out of the
@@ -254,7 +264,7 @@ func (s *Source) archiveEntry(ctx context.Context, tw *tar.Writer, root *os.Root
 			// The tolerated delete race.
 			return nil
 		case errors.Is(err, errChanged):
-			return s.leaveOut(rel, err.Error())
+			return s.changed(rel, err, false)
 		default:
 			// An unreadable file is a fault of the volume, not a race: it fails
 			// the artifact as it always has.
@@ -282,18 +292,75 @@ func (s *Source) archiveEntry(ctx context.Context, tw *tar.Writer, root *os.Root
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
+	if s.testAfterCopy != nil {
+		s.testAfterCopy(path)
+	}
 	if n < hdr.Size {
 		// The file shrank after the walk. The stream must still carry hdr.Size
 		// bytes, so the tail is zero-padded; the event is counted beside the
-		// artifact and reported in the log, never silent.
-		if err := padZeroes(tw, hdr.Size-n); err != nil {
+		// artifact and reported in the log, never silent — and the fail policy
+		// fails the artifact instead of publishing a stream that is not one
+		// moment of the tree.
+		if err := s.shortRead(tw, path, rel, n, hdr.Size); err != nil {
 			return err
 		}
-		s.stats.PaddedFiles++
-		s.log.Warn("source.file.padded", slog.Any("event", human.Warning("source.file.padded",
-			human.Text("path", path),
-			human.Text("reason", fmt.Sprintf("it shrank while it was archived; the entry is zero-padded (%d of %d bytes read)", n, hdr.Size)))))
+	} else if err := s.verifyUnchanged(f, info); err != nil {
+		if !errors.Is(err, errChanged) {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if err := s.changed(rel, err, true); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// shortRead handles an entry whose body was shorter than the size the walk
+// declared. Under the fail policy that is the artifact's failure; under the
+// record policy the tail is padded with the stream's declared size kept.
+func (s *Source) shortRead(tw *tar.Writer, path, rel string, n, size int64) error {
+	if s.cfg.OnChange == "fail" {
+		return fmt.Errorf("%s: %w: it shrank while it was archived (%d of %d bytes read)", rel, errChanged, n, size)
+	}
+	if err := padZeroes(tw, size-n); err != nil {
+		return err
+	}
+	s.stats.PaddedFiles++
+	s.log.Warn("source.file.padded", slog.Any("event", human.Warning("source.file.padded",
+		human.Text("path", path),
+		human.Text("reason", fmt.Sprintf("it shrank while it was archived; the entry is zero-padded (%d of %d bytes read)", n, size)))))
+	return nil
+}
+
+// verifyUnchanged stats the open file after its bytes were copied. The walk's
+// size is fixed in the header, so a file the workload appended to or rewrote in
+// place after the copy started can still hand out a structurally valid entry —
+// this is what tells the artifact it is not one moment of the tree.
+func (s *Source) verifyUnchanged(f *os.File, walked fs.FileInfo) error {
+	now, err := statOpenFile(f)
+	if err != nil {
+		return fmt.Errorf("reading what was copied: %w", err)
+	}
+	if sameAsWalked(now, walked) {
+		return nil
+	}
+	return fmt.Errorf("%w: it was appended to or rewritten while its bytes were copied", errChanged)
+}
+
+// changed reports one entry that changed under the read. In fail mode it fails
+// the artifact; in record mode it is counted — beside the entries left out when
+// it never reached the stream (skipped) — and only reported. Padding is not
+// this event: a file that shrank is the padding rule's, already counted.
+func (s *Source) changed(rel string, err error, copied bool) error {
+	if s.cfg.OnChange == "fail" {
+		return fmt.Errorf("%s: %w", rel, err)
+	}
+	if !copied {
+		s.stats.SkippedEntries++
+	}
+	s.stats.ChangedFiles++
+	s.log.Warn("source.file.changed", slog.Any("event", human.Warning("source.file.changed",
+		human.Text("path", rel), human.Text("reason", err.Error()))))
 	return nil
 }
 

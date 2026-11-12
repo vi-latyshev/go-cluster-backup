@@ -82,6 +82,15 @@ func doctorCommand(opts Options, reg *instances.Registry, defs *configuration.De
 			buildErrs = append(buildErrs, fmt.Errorf("%s: its own example does not hold up with the defaults merged under it: %w", d.ID, err))
 			continue
 		}
+		// A configured binary suite is proved locally, from the merged
+		// defaults, before the image can be built: a wrong-major directory or a
+		// missing program is the image's fault, never a PATH lookup's — the
+		// same optional capability the planning preflight reads.
+		if cb, ok := inst.(instances.CheckBinaries); ok {
+			if err := cb.CheckBinaries(context.Background()); err != nil {
+				buildErrs = append(buildErrs, fmt.Errorf("%s: its configured binary suite does not hold up: %w", d.ID, err))
+			}
+		}
 		if closer, ok := inst.(io.Closer); ok {
 			_ = closer.Close()
 		}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -706,6 +707,48 @@ func TestSweepAbortsOnlyStaleUploads(t *testing.T) {
 	}
 	if len(aborted) != 1 || aborted[0] != "runs/oldrun/databases/ns/db.dump.zst" {
 		t.Fatalf("aborted %v, want only the upload the killed run left behind", aborted)
+	}
+}
+
+// TestSweepSkipsUploadsItCannotAttribute: with an ownership filter, a stale
+// upload under an upload this writer cannot claim stays billed and keeps the
+// occupancy unknown; only the attributable upload is aborted.
+func TestSweepSkipsUploadsItCannotAttribute(t *testing.T) {
+	parts := newFakeMultipart(4)
+	parts.stale = []storage.StaleUpload{
+		{Key: "runs/own/x", UploadID: "u-own", Initiated: time.Now().Add(-3 * time.Hour)},
+		{Key: "runs/other/x", UploadID: "u-other", Initiated: time.Now().Add(-3 * time.Hour)},
+	}
+	h := handle(t, destination(t, "a_parts", parts))
+	tr := newTransfer(Options{Eligible: func(key string) bool { return key == "runs/own/x" }})
+	attempts, unknown := tr.Sweep(context.Background(), h, time.Now().Add(-time.Hour))
+	if !unknown {
+		t.Fatal("an upload this writer cannot claim left the occupancy reported known")
+	}
+	if attempts != 3 {
+		t.Fatalf("sweep = %d attempts, want the inventory, the listing and one abort", attempts)
+	}
+	if _, aborted := parts.sweepStats(); !slices.Equal(aborted, []string{"runs/own/x"}) {
+		t.Fatalf("aborted %v, want only the attributable upload", aborted)
+	}
+}
+
+// TestAbortOwnIgnoresTheSweepFilter: the shutdown abort reaches exactly the
+// upload IDs this run opened, even when the sweep's ownership filter would call
+// every key foreign.
+func TestAbortOwnIgnoresTheSweepFilter(t *testing.T) {
+	parts := newFakeMultipart(4)
+	h := handle(t, destination(t, "a_parts", parts))
+	tr := newTransfer(Options{Eligible: func(string) bool { return false }})
+	u, _ := h.Uploader()
+	if _, _, err := tr.begin(context.Background(), u, storage.PutRequest{Key: "k", Size: 10}, "g/n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.AbortOwn(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, aborted := parts.sweepStats(); !slices.Equal(aborted, []string{"k"}) {
+		t.Fatalf("aborted %v, want this run's own upload", aborted)
 	}
 }
 

@@ -150,7 +150,18 @@ const (
 	// ExclusionCovered: another artifact already carries the object's data —
 	// a volume a pod's own dump covers.
 	ExclusionCovered ExclusionKind = "covered"
+	// ExclusionElsewhere: the object is a declared peer writer's — its node is
+	// one the deployment names in writer_nodes — so this writer delegates it
+	// instead of backing it up.
+	ExclusionElsewhere ExclusionKind = "elsewhere"
 )
+
+// Known reports whether k is an exclusion this build understands. Every reader
+// — the manifest validator, the discovery conformance kit — asks this one
+// method, so a new verdict is added here and nowhere else.
+func (k ExclusionKind) Known() bool {
+	return k == ExclusionIgnored || k == ExclusionCovered || k == ExclusionElsewhere
+}
 
 // Exclusion is one object a run saw and deliberately did not back up: a record
 // of a decision, never of a failure. A run manifest carries one entry per
@@ -167,6 +178,10 @@ type Exclusion struct {
 	Kind  ExclusionKind `json:"kind"`
 	// Reason says why, in the terms the object and the rule supply.
 	Reason string `json:"reason"`
+	// Node is the declared peer writer's node that owns an elsewhere object.
+	// It is set only beside ExclusionElsewhere: a delegation that does not name
+	// the peer is a silent skip, not a decision this run can account for.
+	Node string `json:"node,omitempty"`
 }
 
 // DumpStats is what a source reports about one artifact beyond its validity:
@@ -182,6 +197,20 @@ type DumpStats struct {
 	// carries their recorded length zero-padded, so it is valid but not the
 	// tree of one moment.
 	PaddedFiles int64 `json:"padded_files"`
+	// ChangedFiles counts files that changed under the read in a way the
+	// padding rule does not describe: replaced, grown, or rewritten in place at
+	// the same size. It is omitted while it is zero (omitzero, because json/v2's
+	// omitempty never omits a numeric zero), so a manifest written before this
+	// field existed still decodes.
+	ChangedFiles int64 `json:"changed_files,omitzero"`
+}
+
+// Warning is one non-fatal problem a run has to report: a coded operation and a
+// safe message. The code is the machine-readable half a template or an external
+// rule matches; the message never carries secret bytes.
+type Warning struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type ArtifactResult struct {
@@ -208,6 +237,10 @@ type ArtifactResult struct {
 	// what an operator has to do, written for a notification. Empty for a
 	// failure with no single action, and a template falls back to Error.
 	Hint string `json:"hint,omitempty"`
+	// Warnings are this artifact's own coded, non-fatal problems — bytes that
+	// carry credentials and are not sealed under a published exception, a stage
+	// record's warnings carried forward. Omitted when there are none.
+	Warnings []Warning `json:"warnings,omitempty"`
 }
 
 type StorageResult struct {
@@ -234,6 +267,22 @@ type StorageResult struct {
 	Deleted []string `json:"deleted"`
 	Freed   int64    `json:"freed"`
 	Error   string   `json:"error"`
+	// RetentionError is the retention pass's own failure, kept apart from
+	// Error: the storage's outcome is the upload verdict, and a retention
+	// failure never rewrites a verified copy as a failed one.
+	RetentionError string `json:"retention_error,omitempty"`
+	// CapOverflowBytes is how much this storage held past its configured cap
+	// after the scheduled sweep could not free more — the floor protects more
+	// than the cap allows. Omitted while zero.
+	CapOverflowBytes int64 `json:"cap_overflow_bytes,omitzero"`
+	// CapEvicted names the runs this storage's cap deleted, so an operator can
+	// see what protection cost them. Omitted when the cap deleted nothing.
+	CapEvicted []string `json:"cap_evicted,omitempty"`
+	// OccupancyUnknown is true when the ledger could not establish this
+	// storage's occupancy — a failed survey or an earlier writer's accepted
+	// writes. It is distinct from a proven overflow: the cap numbers beside it
+	// are a lower bound, never zero.
+	OccupancyUnknown bool `json:"occupancy_unknown,omitzero"`
 }
 
 // ManifestSchema is the schema version every manifest this build writes carries.
@@ -267,6 +316,15 @@ type RunReport struct {
 	// run whose lease was taken and held to the end — the ordinary case — so a
 	// template reads its presence, never a guess from outcome and storages.
 	Lease *LeaseState `json:"lease,omitempty"`
+	// WriterIdentity is the stable writer this run belongs to, when the
+	// deployment opted in. It is stored so another writer of the same prefix can
+	// tell a foreign run from its own; empty for every run of a deployment that
+	// did not configure one.
+	WriterIdentity string `json:"writer_identity,omitempty"`
+	// Warnings are the run's coded, non-fatal problems that have no artifact
+	// to belong to — a catalog mark, settle or clear failure, a credential
+	// exception read from a stage record. Omitted when there are none.
+	Warnings []Warning `json:"warnings,omitempty"`
 }
 
 // LeaseState is the machine-readable record of the writer lease's effect on one
@@ -409,4 +467,14 @@ type StoredRun struct {
 	// read it: what separates a run retention judges by its own report from the
 	// objects of a run that was killed before it wrote one.
 	Manifest bool `json:"manifest"`
+	// Artifacts lists the artifact identities ("<group>/<name>") this run holds
+	// a successful copy of on this storage. It is internal policy input, filled
+	// by the protection ledger after the survey — never by inventory, and never
+	// stored: an identity is a fact about the objects a survey listed.
+	Artifacts []string `json:"-"`
+	// ObservedArtifacts lists every artifact identity the run's manifest names,
+	// whatever its outcome. It is internal policy input, filled by the
+	// protection ledger, and it is how keep_versions tells a live identity from
+	// one whose last successful run has already aged out.
+	ObservedArtifacts []string `json:"-"`
 }

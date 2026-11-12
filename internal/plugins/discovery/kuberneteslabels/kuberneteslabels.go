@@ -14,6 +14,15 @@
 // first runs); a claim in Lost has lost its binding and is reported wherever it
 // is seen.
 //
+// A deployment that names its writer nodes adds a scope to that accounting: an
+// object a declared peer's node owns is recorded as an elsewhere exclusion
+// naming that node, and an object whose node cannot be proven — a volume pinned
+// to another node, a hostPath claim no Running pod places, a pod not yet
+// scheduled — fails its artifact instead of reading a directory that may be
+// another node's. The node this process runs on is proven through the API, so a
+// missing nodes get grant is a visible warning and a failed artifact, never a
+// silent fall back to reading regardless.
+//
 // The plugin knows no label, namespace, project or host name: every selector,
 // phase, artifact envelope, pipeline and source config stands in the config
 // file. Only the two resource names it can list (pods and
@@ -84,6 +93,21 @@ type Config struct {
 	// UndeclaredVolumes names the one failed artifact every claim that no rule
 	// claimed and no marker excluded is reported as.
 	UndeclaredVolumes UndeclaredVolumes `json:"undeclared_volumes" doc:"what an object no rule accounted for is reported as"`
+	// NodeEnv is the NAME of the environment variable holding this pod's node.
+	// A deployment fills it from spec.nodeName (the chart does); the empty
+	// string is the explicit opt-out of every node check. When the variable is
+	// empty or unset and node_scope is false, the discovery keeps the old
+	// behaviour: it is a caller outside Kubernetes, not a cluster to prove.
+	NodeEnv string `json:"node_env" doc:"name of the environment variable holding this pod's node name; empty opts out of node checks"`
+	// NodeScope turns the node proof into a writer scope: only objects this
+	// node owns are backed up, a declared peer's objects are recorded as
+	// elsewhere delegations, and anything whose node cannot be proven fails.
+	NodeScope bool `json:"node_scope" doc:"true backs up only objects node_env proves this pod owns; declared peers' objects are excluded as elsewhere, unknown placement fails"`
+	// WriterNodes names every node that runs a writer of this configuration.
+	// It is required exactly when node_scope is on, and this pod's own node has
+	// to be in it: a set that excludes the writer reading it would delegate
+	// everything and back up nothing.
+	WriterNodes []string `json:"writer_nodes" doc:"stable node names of every writer using this configuration; required and nonempty with node_scope"`
 
 	state *state
 }
@@ -121,6 +145,9 @@ type PodRule struct {
 	// discovery: an empty list is not evidence of nothing to back up, and a
 	// silent empty backup is worse than a failed one.
 	MinMatches int `json:"min_matches" doc:"least number of matches this rule must produce; 0 allows an empty result. Fewer than this fails the run"`
+	// RateLimit is the raw bytes per second this rule's sources may produce,
+	// before the pipeline's first processor. 0 is unlimited.
+	RateLimit model.ByteSize `json:"rate_limit" doc:"raw bytes per second the rule's sources may produce, before the pipeline's first processor; 0 is unlimited"`
 }
 
 // VolumeRule is one rule over persistent volume claims: the claim declares
@@ -135,6 +162,9 @@ type VolumeRule struct {
 	Pipeline   []string       `json:"pipeline" required:"true" doc:"processor instances the discovered sources flow through, in encode order"`
 	Source     SourceConfig   `json:"source" required:"true" doc:"source plugin type and the config every discovered source is built from"`
 	MinMatches int            `json:"min_matches" doc:"least number of matches this rule must produce; 0 allows an empty result. Fewer than this fails the run"`
+	// RateLimit is the raw bytes per second this rule's sources may produce,
+	// before the pipeline's first processor. 0 is unlimited.
+	RateLimit model.ByteSize `json:"rate_limit" doc:"raw bytes per second the rule's sources may produce, before the pipeline's first processor; 0 is unlimited"`
 }
 
 // ExcludeConfig is the exclusion marker: an object whose label Label holds
@@ -178,6 +208,7 @@ type rule struct {
 	// other rule claimed.
 	Undeclared bool
 	MinMatches int
+	RateLimit  model.ByteSize
 }
 
 type ArtifactConfig struct {
@@ -210,6 +241,9 @@ func New(ctx context.Context, cfg Config, deps instances.Deps) (discovery.Discov
 	st.secretsDir = cfg.SecretsDir
 	st.pageSize = cfg.ListPageSize
 	st.exclude = cfg.Exclude
+	st.nodeEnv = cfg.NodeEnv
+	st.nodeScope = cfg.NodeScope
+	st.writerNodes = cfg.WriterNodes
 	st.opts = kubeapi.Options{
 		HostEnv:   cfg.APIHostEnv,
 		PortEnv:   cfg.APIPortEnv,
@@ -247,6 +281,13 @@ func (d *Discoverer) Discover(ctx context.Context) ([]discovery.Found, error) {
 	return d.collect(ctx)
 }
 
+// NodeScoped reports whether this instance scopes its objects to one writer's
+// node — the config's own opt-in, answered before any listing. It is what
+// makes the run's stable writer identity mandatory: a node-scoped run without
+// one could name a peer's object but never be recognised as the owner of its
+// own.
+func (d *Discoverer) NodeScoped() bool { return d.state.nodeScope }
+
 // RuleSources is the pure compiled hook this plugin type registers beside its
 // factory: it reads every rule's source out of one raw config value — its type,
 // the nested config exactly as written and the routing — so defaults merge and
@@ -277,6 +318,7 @@ func (c *Config) ruleSources() []configuration.RuleSource {
 			Pipeline:    r.Pipeline,
 			Importance:  r.Artifact.Importance,
 			Sensitivity: r.Artifact.Sensitivity,
+			RateLimit:   r.RateLimit,
 		}
 		if r.Source.Type != "" {
 			rs.ConfigPath = r.Path + "/source/config"
@@ -309,6 +351,13 @@ func (d *Discoverer) collect(ctx context.Context) ([]discovery.Found, error) {
 	client := st.client
 	st.ctx = ctx
 	st.forgetVolumes()
+	st.forgetNode()
+	// A node-scoped discovery proves its own node before it lists anything: an
+	// unreadable node or an undeclared writer is the whole discovery's refusal,
+	// never a per-object accident.
+	if err := d.bindNode(ctx); err != nil {
+		return nil, err
+	}
 
 	rules := st.rules
 	listings := make([][]object, len(rules))
@@ -332,7 +381,11 @@ func (d *Discoverer) collect(ctx context.Context) ([]discovery.Found, error) {
 	}
 
 	byRule := make([][]discovery.Found, len(rules))
-	acct := &accounting{marks: map[string]claimMark{}, mounting: map[string]string{}}
+	acct := &accounting{
+		marks:      map[string]claimMark{},
+		mounting:   map[string]string{},
+		mountNodes: map[string][]string{},
+	}
 	for i := range rules {
 		pr := &rules[i]
 		if pr.rule.Resource != "pods" {
@@ -367,6 +420,9 @@ func (d *Discoverer) collect(ctx context.Context) ([]discovery.Found, error) {
 	// and the accounting rule — last of every rule of both lists — reports only
 	// what no rule of the config accounted for.
 	acct.book = claimBook{renderedBy: map[string]string{}, reported: map[string]bool{}}
+	// The claim verdicts read the node evidence the pod pass collected; a render
+	// that asks volumePath sees the same books.
+	st.acct = acct
 	for i := range rules {
 		pr := &rules[i]
 		if pr.rule.Resource != "persistentvolumeclaims" {
@@ -412,6 +468,8 @@ type claimMark struct {
 	kind   model.ExclusionKind
 	group  string
 	reason string
+	// node is the declared peer writer's node an elsewhere mark delegates to.
+	node string
 }
 
 // podMark is the verdict a rendered pod carries for the claims it mounts; only
@@ -424,6 +482,9 @@ func podMark(pr *preparedRule, o object, f discovery.Found, markerReason string)
 	case f.Excluded == model.ExclusionIgnored:
 		return claimMark{kind: model.ExclusionIgnored,
 			reason: fmt.Sprintf("the pod that mounts it, %s/%s, %s", o.namespace, o.name, markerReason)}, true
+	case f.Excluded == model.ExclusionElsewhere:
+		return claimMark{kind: model.ExclusionElsewhere, node: f.ExcludedNode,
+			reason: fmt.Sprintf("the pod that mounts it, %s/%s, is a declared peer writer's on node %q", o.namespace, o.name, f.ExcludedNode)}, true
 	case f.Problem != "" && f.ProblemRetryable:
 		return claimMark{reason: fmt.Sprintf("the pod that mounts it, %s/%s, could not be read in this pass: %s",
 			o.namespace, o.name, f.Problem)}, true
@@ -443,6 +504,9 @@ type accounting struct {
 	marks    map[string]claimMark
 	mounting map[string]string
 	book     claimBook
+	// mountNodes is every node a Running pod that mounts the claim stands on:
+	// the only proof an unpinned hostPath volume has a node at all.
+	mountNodes map[string][]string
 }
 
 // mark records a pod's verdict for one claim; the first pod in config order
@@ -455,12 +519,16 @@ func (a *accounting) mark(key string, mark claimMark) {
 
 // rememberMounts records which pod mounts a claim, for the message an
 // unaccounted claim carries: a claim nobody declared is best explained by the
-// pod that mounts it and the phase that pod is in.
+// pod that mounts it and the phase that pod is in. A Running pod also carries
+// its node: the only proof an unpinned hostPath volume has one.
 func (a *accounting) rememberMounts(o object) {
 	for _, claim := range o.claims {
 		key := o.namespace + "/" + claim
 		if _, known := a.mounting[key]; !known {
 			a.mounting[key] = fmt.Sprintf("%s/%s (%s)", o.namespace, o.name, o.phase)
+		}
+		if o.phase == "Running" && o.nodeName != "" && !slices.Contains(a.mountNodes[key], o.nodeName) {
+			a.mountNodes[key] = append(a.mountNodes[key], o.nodeName)
 		}
 	}
 }
@@ -538,6 +606,18 @@ func claimFound(pr *preparedRule, o object, st *state, acct *accounting) (discov
 			// earlier pass reached.
 			return pr.problemFound(st, o, pluginerrors.Transient(errors.New(mark.reason))), true
 		}
+		if mark.kind == model.ExclusionElsewhere {
+			// The pod that mounts it is a declared peer's, so the claim is
+			// delegated — unless the claim's own volume cannot be placed
+			// consistently with that pod, which is a conflict no writer can
+			// resolve by guessing.
+			if o.phase == "Bound" {
+				if _, err := st.claimPlacement(o); err != nil {
+					return pr.problemFound(st, o, err), true
+				}
+			}
+			return pr.elsewhereFound(st, o, mark.node, mark.reason), true
+		}
 		group := mark.group
 		if mark.kind == model.ExclusionIgnored {
 			// The pod's marker keeps the claim out; the group is the one the
@@ -546,6 +626,21 @@ func claimFound(pr *preparedRule, o object, st *state, acct *accounting) (discov
 			group = pr.wouldRenderGroup(st, o)
 		}
 		return pr.excludedFound(st, o, mark.kind, group, mark.reason), true
+	}
+	// A Bound claim's data lives on exactly one node, and node scope decides
+	// whose it is before any rule renders a source for it: a peer's claim is a
+	// delegation, anything unproven is a failed artifact — never a copy read
+	// from the wrong directory. A claim that is not Bound has no volume yet.
+	if o.phase == "Bound" && (pr.rule.Undeclared || o.phase == pr.rule.Phase) {
+		p, err := st.claimPlacement(o)
+		switch {
+		case err != nil:
+			acct.book.reported[key] = true
+			return pr.problemFound(st, o, err), true
+		case p.peer != "":
+			acct.book.reported[key] = true
+			return pr.elsewhereFound(st, o, p.peer, fmt.Sprintf("its volume stores the data on node %q, a declared peer writer's node", p.peer)), true
+		}
 	}
 	if pr.rule.Undeclared {
 		if o.phase != "Bound" {
@@ -661,6 +756,7 @@ func podObjects(pods []kubeapi.Pod) []object {
 			name:       p.Metadata.Name,
 			labels:     p.Metadata.Labels,
 			phase:      p.Status.Phase,
+			nodeName:   p.Spec.NodeName,
 			containers: p.Spec.Containers,
 			claims:     claimNames(p.Spec.Volumes),
 		})
@@ -759,7 +855,8 @@ func (r *preparedRule) envelope(st *state, o object) (discovery.Found, []error) 
 			Importance:  r.rule.Artifact.Importance,
 			Sensitivity: r.rule.Artifact.Sensitivity,
 		},
-		Pipeline: r.rule.Pipeline,
+		Pipeline:  r.rule.Pipeline,
+		RateLimit: r.rule.RateLimit,
 	}
 	if r.rule.Undeclared {
 		// The accounting names its artifacts itself: undeclared_volumes is the
@@ -829,12 +926,28 @@ func (r *preparedRule) wouldRenderGroup(st *state, o object) string {
 }
 
 // podFound renders one pod, unless the pod carries the exclusion marker: then
-// the pod is a decision, and the volumes it mounts inherit it.
+// the pod is a decision, and the volumes it mounts inherit it. Under node scope
+// the pod's own node decides first: this writer's renders, a declared peer's is
+// an elsewhere delegation, and anything unproven is one failed artifact.
 func (d *Discoverer) podFound(pr *preparedRule, o object) discovery.Found {
-	if d.state.exclude.matches(o.labels) {
-		return pr.excludedFound(d.state, o, model.ExclusionIgnored, pr.wouldRenderGroup(d.state, o), d.state.exclude.reason())
+	st := d.state
+	if st.exclude.matches(o.labels) {
+		return pr.excludedFound(st, o, model.ExclusionIgnored, pr.wouldRenderGroup(st, o), st.exclude.reason())
 	}
-	return pr.render(d.state, o)
+	if st.nodeScope {
+		own := st.node.info.name
+		switch {
+		case o.nodeName == "":
+			return pr.problemFound(st, o, pluginerrors.Permanent(fmt.Errorf("%s is not scheduled on a node, so node_scope cannot prove whose data it is; this writer backs up only objects on node %q", o.id(), own)))
+		case o.nodeName == own:
+			// This writer's pod: the ordinary render.
+		case slices.Contains(st.writerNodes, o.nodeName):
+			return pr.elsewhereFound(st, o, o.nodeName, fmt.Sprintf("it runs on node %q, a declared peer writer's node", o.nodeName))
+		default:
+			return pr.problemFound(st, o, pluginerrors.Permanent(fmt.Errorf("%s runs on node %q, which is not in writer_nodes (%s): add the node there, or set node_scope: false", o.id(), o.nodeName, strings.Join(st.writerNodes, ", "))))
+		}
+	}
+	return pr.render(st, o)
 }
 
 // Validate runs inside configuration.Decode: structure and enums offline, and every
@@ -868,6 +981,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("/pods and /volumes are both empty: a discovery with no rule finds nothing"))
 	}
 	errs = append(errs, validateUndeclared(c.UndeclaredVolumes)...)
+	errs = append(errs, validateNodeScope(c.NodeEnv, c.NodeScope, c.WriterNodes)...)
 	funcs := st.funcs()
 	seen := make(map[string]bool, len(c.Pods)+len(c.Volumes))
 	rules := make([]preparedRule, 0, len(c.Pods)+len(c.Volumes)+1)
@@ -877,7 +991,7 @@ func (c *Config) Validate() error {
 		pr, ruleErrs := c.prepareRule(rule{
 			Name: r.Name, Resource: "pods", Path: path, Selector: r.Selector, Phase: r.Phase,
 			Artifact: r.Artifact, Pipeline: r.Pipeline, Source: r.Source,
-			CoversVolumes: r.CoversVolumes, MinMatches: r.MinMatches,
+			CoversVolumes: r.CoversVolumes, MinMatches: r.MinMatches, RateLimit: r.RateLimit,
 		}, path, seen, funcs)
 		errs = append(errs, ruleErrs...)
 		if pr != nil {
@@ -890,6 +1004,7 @@ func (c *Config) Validate() error {
 		pr, ruleErrs := c.prepareRule(rule{
 			Name: r.Name, Resource: "persistentvolumeclaims", Path: path, Selector: r.Selector, Phase: r.Phase,
 			Artifact: r.Artifact, Pipeline: r.Pipeline, Source: r.Source, MinMatches: r.MinMatches,
+			RateLimit: r.RateLimit,
 		}, path, seen, funcs)
 		errs = append(errs, ruleErrs...)
 		if pr != nil {
@@ -953,6 +1068,9 @@ func (c *Config) prepareRule(r rule, path string, seen map[string]bool, funcs te
 	if r.MinMatches < 0 {
 		errs = append(errs, fmt.Errorf("%s/min_matches must not be negative, got %d", path, r.MinMatches))
 	}
+	if r.RateLimit < 0 {
+		errs = append(errs, fmt.Errorf("%s/rate_limit must not be negative, got %d", path, r.RateLimit))
+	}
 	if r.Artifact.Group.Text() == "" {
 		errs = append(errs, fmt.Errorf("%s/artifact/group is empty", path))
 	}
@@ -987,6 +1105,35 @@ func validateUndeclared(u UndeclaredVolumes) []error {
 	return errs
 }
 
+// validateNodeScope checks the node settings against each other. node_scope is
+// the opt-in, and it means nothing without the environment that names this
+// pod's node or without the set of nodes that may own data; writer_nodes
+// without node_scope names a delegation that never happens.
+func validateNodeScope(env string, scope bool, nodes []string) []error {
+	var errs []error
+	if scope && env == "" {
+		errs = append(errs, errors.New("/node_scope is true but /node_env is empty: node scope needs the environment variable that names this pod's node"))
+	}
+	if scope && len(nodes) == 0 {
+		errs = append(errs, errors.New("/writer_nodes is empty: node_scope delegates objects only to the nodes it names"))
+	}
+	if !scope && len(nodes) > 0 {
+		errs = append(errs, errors.New("/writer_nodes is set but /node_scope is false: writer_nodes names the nodes a delegating scope trusts"))
+	}
+	seen := make(map[string]bool, len(nodes))
+	for i, node := range nodes {
+		switch {
+		case node == "":
+			errs = append(errs, fmt.Errorf("/writer_nodes/%d is empty", i))
+		case seen[node]:
+			errs = append(errs, fmt.Errorf("/writer_nodes/%d %q repeats", i, node))
+		default:
+			seen[node] = true
+		}
+	}
+	return errs
+}
+
 // example is the reference rule set of an opt-out deployment: two pod rules
 // declare their engine on their pod templates — the database dump covers the
 // volumes its pod mounts — one volume rule declares a claim as a file volume, and
@@ -1002,6 +1149,9 @@ const example = `{
   "list_page_size": 500,
   "exclude": {"label": "backup.example/ignore", "value": "true"},
   "undeclared_volumes": {"name": "undeclared", "importance": "required"},
+  "node_env": "BACKUP_NODE_NAME",
+  "node_scope": false,
+  "writer_nodes": [],
   "pods": [
     {
       "name": "postgres",
@@ -1009,6 +1159,7 @@ const example = `{
       "phase": "Running",
       "covers_volumes": true,
       "min_matches": 0,
+      "rate_limit": 0,
       "artifact": {"group": "databases", "name": "{{ .Namespace }}/{{ label \"backup.example/instance\" }}", "importance": "required", "sensitivity": "plain"},
       "pipeline": ["compress"],
       "source": {
@@ -1033,6 +1184,7 @@ const example = `{
       "phase": "Running",
       "covers_volumes": true,
       "min_matches": 0,
+      "rate_limit": 0,
       "artifact": {"group": "caches", "name": "{{ .Namespace }}/{{ label \"backup.example/instance\" }}", "importance": "best_effort", "sensitivity": "plain"},
       "pipeline": ["compress"],
       "source": {
@@ -1052,6 +1204,7 @@ const example = `{
       "selector": "backup.example/engine=files",
       "phase": "Bound",
       "min_matches": 0,
+      "rate_limit": 0,
       "artifact": {"group": "volumes", "name": "{{ .Namespace }}/{{ .Name }}", "importance": "required", "sensitivity": "plain"},
       "pipeline": ["compress"],
       "source": {

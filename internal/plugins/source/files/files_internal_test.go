@@ -338,6 +338,9 @@ func TestDumpRefusesWhatChangedUnderTheWalk(t *testing.T) {
 			if stats.SkippedEntries != 1 {
 				t.Errorf("skipped = %d, want the changed entry left out and counted", stats.SkippedEntries)
 			}
+			if stats.ChangedFiles != 1 {
+				t.Errorf("changed = %d, want the replaced entry counted as a mutation", stats.ChangedFiles)
+			}
 			if bytes.Contains(buf, []byte("FOREIGN-BYTES")) {
 				t.Errorf("the artifact carries bytes from outside the volume, so the open followed the swap")
 			}
@@ -483,6 +486,215 @@ func TestDumpReportsAPadWriteFailure(t *testing.T) {
 	s := &Source{cfg: Config{Root: root, IgnoreVanished: true}, log: slog.New(slog.DiscardHandler)}
 	if err := s.Dump(t.Context(), &failAfterWriter{ok: 1, path: target}); err == nil {
 		t.Fatal("Dump reported success when the padding could not be written")
+	}
+}
+
+// writeTreeFile makes a file of the source's own bytes under root.
+func writeTreeFile(t *testing.T, root, name string, body []byte) string {
+	t.Helper()
+	path := filepath.Join(root, name)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// newPolicySource is a Source under one on_change policy, with the log kept
+// where a test can read it.
+func newPolicySource(t *testing.T, root, policy string) *Source {
+	t.Helper()
+	return &Source{cfg: Config{Root: root, IgnoreVanished: true, OnChange: policy}, log: slog.New(slog.DiscardHandler)}
+}
+
+// TestDumpCountsAFileChangedAfterItsCopy: a file appended to or rewritten while
+// its bytes were copied leaves a structurally valid entry, and record mode is
+// honest about it: the mutation is counted — not as a skipped entry, because
+// the entry was written — and the artifact stays ok.
+func TestDumpCountsAFileChangedAfterItsCopy(t *testing.T) {
+	cases := map[string]func(t *testing.T, path string){
+		"appended to": func(t *testing.T, path string) {
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = f.Close() }()
+			if _, err := f.Write([]byte("late bytes")); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"rewritten in place at the same size": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("the rewrite"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			target := writeTreeFile(t, root, "payload", []byte("the payload"))
+			s := newPolicySource(t, root, "record")
+			s.testAfterCopy = func(path string) {
+				if path == target {
+					mutate(t, path)
+				}
+			}
+			var buf []byte
+			if err := s.Dump(t.Context(), writeTo(&buf)); err != nil {
+				t.Fatalf("Dump = %v, want record mode to keep the artifact", err)
+			}
+			stats, err := s.DumpStats(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.ChangedFiles != 1 {
+				t.Errorf("changed = %d, want the post-copy mutation counted", stats.ChangedFiles)
+			}
+			if stats.SkippedEntries != 0 || stats.PaddedFiles != 0 {
+				t.Errorf("stats = %+v, want neither a skipped nor a padded entry", stats)
+			}
+		})
+	}
+}
+
+// TestDumpFailsEveryDetectedMutationUnderTheFailPolicy: the fail policy fails
+// the artifact on the three detected mutations — a replacement before the open,
+// a short read while copying, a post-copy metadata mismatch — and never on a
+// static refusal or a tolerated delete.
+func TestDumpFailsEveryDetectedMutationUnderTheFailPolicy(t *testing.T) {
+	cases := map[string]struct {
+		setup func(t *testing.T, s *Source, path string)
+	}{
+		"replaced before the open": {
+			setup: func(t *testing.T, s *Source, path string) {
+				s.testBeforeOpen = func(p string) {
+					if p != path {
+						return
+					}
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("another file"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
+		"rewritten while its bytes were copied": {
+			setup: func(t *testing.T, s *Source, path string) {
+				s.testAfterCopy = func(p string) {
+					if p != path {
+						return
+					}
+					if err := os.WriteFile(path, []byte("changed payload"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
+		"appended after the copy": {
+			setup: func(t *testing.T, s *Source, path string) {
+				s.testAfterCopy = func(p string) {
+					if p != path {
+						return
+					}
+					f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = f.Close() }()
+					if _, err := f.Write([]byte("late bytes")); err != nil {
+						t.Fatal(err)
+					}
+				}
+			},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			target := writeTreeFile(t, root, "payload", []byte("the payload"))
+			s := newPolicySource(t, root, "fail")
+			tc.setup(t, s, target)
+			err := s.Dump(t.Context(), io.Discard)
+			if err == nil || !errors.Is(err, errChanged) {
+				t.Fatalf("Dump = %v, want the mutation refused", err)
+			}
+			if s.stats.ChangedFiles != 0 {
+				t.Errorf("changed = %d, want a failed dump to count nothing", s.stats.ChangedFiles)
+			}
+		})
+	}
+
+	t.Run("shrunk while copying", func(t *testing.T) {
+		root := t.TempDir()
+		target := writeTreeFile(t, root, "payload", bytes.Repeat([]byte("a"), 4<<10))
+		s := newPolicySource(t, root, "fail")
+		// The header write is what truncates the file: the body then reads
+		// zero bytes against the size the walk declared.
+		err := s.Dump(t.Context(), &failAfterWriter{ok: 100, path: target})
+		if err == nil || !errors.Is(err, errChanged) {
+			t.Fatalf("Dump = %v, want the short read refused", err)
+		}
+		if s.stats.PaddedFiles != 0 {
+			t.Fatalf("padded = %d, want the fail policy to publish no padded entry", s.stats.PaddedFiles)
+		}
+	})
+
+	t.Run("a static fifo is left out, not a mutation", func(t *testing.T) {
+		root := t.TempDir()
+		writeTreeFile(t, root, "payload", []byte("the payload"))
+		if err := syscall.Mkfifo(filepath.Join(root, "pipe"), 0o644); err != nil {
+			t.Skipf("fifo not creatable here: %v", err)
+		}
+		s := newPolicySource(t, root, "fail")
+		if err := s.Dump(t.Context(), io.Discard); err != nil {
+			t.Fatalf("Dump = %v, want the socket-shaped entry left out", err)
+		}
+		if s.stats.SkippedEntries != 1 || s.stats.ChangedFiles != 0 {
+			t.Fatalf("stats = %+v, want the fifo skipped and no mutation counted", s.stats)
+		}
+	})
+
+	t.Run("a tolerated delete is not a mutation", func(t *testing.T) {
+		root := t.TempDir()
+		target := writeTreeFile(t, root, "payload", []byte("the payload"))
+		s := newPolicySource(t, root, "fail")
+		s.testBeforeOpen = func(p string) {
+			if p == target {
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := s.Dump(t.Context(), io.Discard); err != nil {
+			t.Fatalf("Dump = %v, want the vanished file tolerated", err)
+		}
+		if s.stats.SkippedEntries != 1 || s.stats.ChangedFiles != 0 {
+			t.Fatalf("stats = %+v, want the delete skipped and no mutation counted", s.stats)
+		}
+	})
+}
+
+// TestDumpReportsAPostCopyStatFailure: the archival stat after the copy is how
+// a mutation is seen, and a handle that cannot be asked fails the artifact
+// instead of counting the entry as unchanged.
+func TestDumpReportsAPostCopyStatFailure(t *testing.T) {
+	root := t.TempDir()
+	writeTreeFile(t, root, "payload", []byte("the payload"))
+	s := newPolicySource(t, root, "record")
+	original := statOpenFile
+	t.Cleanup(func() { statOpenFile = original })
+	calls := 0
+	statOpenFile = func(f *os.File) (fs.FileInfo, error) {
+		calls++
+		if calls == 2 {
+			return nil, errors.New("injected stat failure")
+		}
+		return f.Stat()
+	}
+	err := s.Dump(t.Context(), io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "reading what was copied") {
+		t.Fatalf("Dump = %v, want the post-copy stat failure named", err)
 	}
 }
 

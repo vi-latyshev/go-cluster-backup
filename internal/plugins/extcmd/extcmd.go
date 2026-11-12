@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -170,9 +171,52 @@ func WaitTCP(ctx context.Context, host, port string, attempts int, interval time
 // a missing file is a preflight failure, not a reason the whole config cannot
 // even be built. A trailing newline (docker secrets style) is not part of it.
 func ReadPassword(file string) (string, error) {
-	b, err := os.ReadFile(file)
+	v, err := readMounted(file, 0)
 	if err != nil {
 		return "", pluginerrors.Permanent(fmt.Errorf("reading password file: %w", err))
+	}
+	return v, nil
+}
+
+// ReadSecretFile reads one mounted secret file at use time with a byte ceiling:
+// a limit above zero refuses a file larger than it, and limit zero reads the
+// whole file, which is the password reader's own behaviour. A trailing CR/LF is
+// not part of the value, exactly as in ReadPassword. Opening follows symlinks,
+// so a projected Secret's link is read like the file it names; whatever the file
+// holds, an error names only its path and never a byte of the value.
+func ReadSecretFile(file string, limit int) (string, error) {
+	v, err := readMounted(file, limit)
+	if err != nil {
+		return "", pluginerrors.Permanent(fmt.Errorf("reading secret file %s: %w", file, err))
+	}
+	return v, nil
+}
+
+// readAll is io.ReadAll behind a seam: no regular file fails a read on demand,
+// and the bounded reader's own error path still has to be run by a test.
+var readAll = io.ReadAll
+
+// readMounted is the one reader behind ReadPassword and ReadSecretFile: it trims
+// the trailing CR/LF of a mounted secret and bounds the read when a limit is
+// given, reading one byte past the limit so an oversized file is refused rather
+// than silently truncated.
+func readMounted(file string, limit int) (string, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	var b []byte
+	if limit > 0 {
+		b, err = readAll(io.LimitReader(f, int64(limit)+1))
+		if err == nil && len(b) > limit {
+			return "", fmt.Errorf("the file is %d bytes, above the %d-byte limit", len(b), limit)
+		}
+	} else {
+		b, err = readAll(f)
+	}
+	if err != nil {
+		return "", err
 	}
 	return strings.TrimRight(string(b), "\r\n"), nil
 }

@@ -17,7 +17,12 @@ and `docs/restore.md`. This guide governs work; `CONTRIBUTING.md` covers plugins
   standard-library-only.
 - **Image:** `docker.io/library/golang:1.27.4-alpine` cross-compiles from the
   build platform into `docker.io/library/alpine:3.24.4`, with
-  `postgresql18-client`, `redis`, `sqlite`, `tzdata`, `ca-certificates`.
+  `postgresql16-client` through `postgresql18-client`, `redis`, `sqlite`,
+  `tzdata`, `ca-certificates`. The PostgreSQL 15 client comes from the
+  digest-pinned `docker.io/library/postgres:15.19-alpine3.24` with its own libpq
+  in `/usr/libexec/postgresql15`; Renovate keeps that stage below 16. The
+  `client_dirs` defaults name `/usr/libexec/postgresql18` down to `15`. The build
+  prints every suite's versions and `ldd`, then
   `/usr/local/bin/go-cluster-backup` runs `doctor` as the last build step.
 - **Runtime:** one-shot Kubernetes CronJobs from `charts/go-cluster-backup/`.
 
@@ -31,10 +36,10 @@ internal/plugins/all/  internal/plugins/all/components/  generated full and host
 internal/plugins/cli/                         flat Floor command host
 internal/plugins/assembly/                    construction and typed option projection
 internal/plugins/workflow/{backup,stage,restore}/  application workflows
-internal/plugins/{instances,configuration,errors,io}/  factory mechanics, config, errors, streams
+internal/plugins/{instances,configuration,errors,io}/  factory mechanics, config, errors, streams, deterministic tar
 internal/plugins/<kind>/                      seven kind contracts, factories and <kind>test/ kits
 internal/plugins/<kind>/<name>/                first-party backend implementations
-internal/plugins/{model,human,must,spool,extcmd,kubeapi,sqlitecopy}/  shared libraries
+internal/plugins/{model,human,must,spool,extcmd,kubeapi,sqlitecopy,pgclient,treewalk}/  shared libraries
 charts/go-cluster-backup/                      chart, values and generated README
 examples/  docs/  test/chart/                  examples, long-form docs and real Helm tests
 tools/  .github/                              pinned tooling and automation
@@ -63,7 +68,9 @@ there. Plugins own application work:
 - `execution` owns retries, panic boundaries and budgets.
 - `layout` builds keys; `inventory` owns surveys and StoredRuns.
 - `planning` owns discovery, units and preflight.
-- `pipeline` owns production, processor chains and Dump.
+- `pipeline` owns production, processor chains and Dump. A source envelope's
+  `rate_limit` limits raw source writes before the first processor; it is never
+  a processor or chain entry.
 - `transfer` owns whole/multipart uploads, full-inventory Sweep and AbortOwn.
 - `protection` owns the lease and cap/retention ledger, the sole deleter.
 - `storage/guard` supplies read ports, guarded writes and ledger-only removal.
@@ -118,6 +125,11 @@ there. Plugins own application work:
   token. Keep sibling caller contexts, worker-local panic recovery, joins, one
   classified cause, deterministic pages and root/prefix-confined strict cursors.
   No checkpoint or separate concurrency/page-size knob.
+- **Manifests stay hot.** The workflow puts every manifest with
+  `storage.PurposeMetadata`; artifacts use the zero `PurposePayload`. A backend
+  with storage classes reads `PutRequest.Purpose` on whole and multipart
+  uploads: metadata always gets its hot class (s3: `STANDARD`), and only
+  payloads get the configured class. A backend without classes ignores it.
 - **Current data boundaries are strict.** Restore uses `storage.Reader`, with
   no Put/Delete methods. A manifest needs a valid `kind` matching its run ID;
   missing/wrong kinds are problem runs, never deleted or credited as protection.
@@ -206,7 +218,12 @@ packages the chart and publishes release notes.
   `helm.sh/resource-policy: keep`; `catalog.create: false` manages it externally.
   Consumers bind to these names.
 - Every container sets `terminationMessagePolicy: FallbackToLogsOnError` so
-  pre-run failures carry their last log lines into the previous-run report.
+  pre-run failures carry their last log lines into the previous-run report. The
+  chart merges it into each `writer.initContainers` entry and fails the render
+  on a conflicting value.
+- `BACKUP_NODE_NAME` comes from `spec.nodeName` in writer and restore containers
+  only, never the stage initContainer, and equals the `node_env` default. The
+  ClusterRole grants `nodes` `get` for the node proof.
 - Node hostPaths reach only the intended pod: `writer.volumes` and
   `writer.volumeMounts` for writers and their stage initContainer;
   `restore.volumes` and `restore.volumeMounts` for restore. `extraVolumes` and
@@ -254,12 +271,36 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   as a run would, reports each instance/problem and exits non-zero on failure.
   Config errors, missing binaries and unavailable required plugins refuse before
   operational I/O. Implement `Checker` for credentials, reachability and mounts.
+- **PostgreSQL clients match the server's exact major.** `pgclient` owns the
+  shared connection fields, suite resolution (`client_dirs`, then a complete
+  `PATH` suite) and command execution for `postgres` and `postgres_globals`.
+  Only the read-only server-version query may run before selection; every other
+  call uses the selected suite, and a missing major refuses by name. These
+  factories list no `Binaries`: doctor and preflight prove suites through the
+  optional `instances.CheckBinaries` capability. `postgres_globals` emits raw
+  `pg_dumpall --globals-only` and has no `Restorer`; its restore is the operator
+  procedure in `docs/restore.md`, never SQL rewriting.
 - **Temporary files belong in configured `scratch_dir`.** Never use process temp
   space, a small cluster `emptyDir`. Remove files on every exit path.
 - **Artifact files are 0600 unless config explicitly chooses otherwise.** Spool
   and `restore fetch` outputs are 0600 regardless of sensitivity. Staged bytes
   and their chain record are 0644 to cross containers to uid 1000. Restore modes
   such as sqlite's `file_mode` use the configured value.
+- **Credential bytes need sealing.** A source whose traits report `Credentials`
+  is refused before the first byte unless a processor seals it; `k3s_etcd` and
+  `postgres_globals` always report them. One decision,
+  `source.DecideCredentials`, covers declared, discovered and enumerated
+  sources: assembly's `credentialDecision` applies it in validate and preflight,
+  `Resolve` in stage and run. Only `k3s_state` answers `source.CredentialWarn`:
+  its plaintext configs stay valid in 2.x with the `source.credentials.unsealed`
+  warning, which travels in stage and run reports, CLI summaries, preflight
+  lines and notifications. Add no other exception or config bypass.
+- **Collector and secret files are bounded and never echoed.** `collected` data
+  and markers and `k3s_etcd` snapshots open with `O_NOFOLLOW|O_NONBLOCK`, regular
+  files only; `collected` reads through `os.OpenRoot`, and its digest-only marker
+  is at most 4096 bytes. Endpoint secrets use `extcmd.ReadSecretFile` with a
+  limit and follow projected-Secret symlinks. Errors name the stage and path,
+  never bytes.
 - **A kind grows only through an optional interface.** Kind packages own contracts
   and factories, not all consumers. Discover capabilities by call and
   `errors.ErrUnsupported`; never widen an existing kind interface.
@@ -268,10 +309,29 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   builds each child, names the artifact `<envelope>/<unit>` and instance
   `<instance>/<unit>`, and decides enumeration failures in
   `internal/plugins/planning/units.go`.
+- **Node-local reads need a placement proof.** With `node_env` set (the chart
+  default), one `kuberneteslabels` resolver decides every claim verdict and
+  `volumePath`, a Pending claim with a bound volume included. A required
+  affinity places the volume only when every term is an identity pin naming one
+  node: this node, or under `node_scope` one in `writer_nodes`. An identity pin
+  is `In` with one non-empty value, on `metadata.name` only in `matchFields` or
+  on `kubernetes.io/hostname` only in `matchExpressions`; a `metadata.name`
+  label in `matchExpressions` is an ordinary label. Otherwise the single
+  Running pod mounting the claim decides: this node reads, another node fails
+  by name, and no or several mounting pods fail; for an ambiguous affinity the
+  error says to narrow it to one such node. Under `node_scope`, a volume proven
+  on a declared peer is `elsewhere`, and an own node that cannot be proven
+  refuses the discovery; without it, an unreadable own node warns and fails the
+  affected artifact. Anything unproven fails, never reads. An unset or empty
+  `node_env` without `node_scope` keeps the old read.
 - **Restore follows the recorded chain, never the current pipeline.** Keep
   manifest JSON keys explicit so Go renames do not silently alter stored data.
-  A disabled required decoder gives an explicit refusal. Only the current format
-  is supported; compatibility-only pins are not binding.
+  A disabled required decoder gives an explicit refusal. The strict manifest
+  reader refuses a missing member unless it is `omitempty` or `omitzero`, so a
+  field added to a manifest-reachable type takes one of them; runs written
+  before it then stay readable without an old-format decoder. The reader also
+  refuses unknown members, so a run that carries the new field needs a binary
+  that knows it.
 - **Run kind is identity.** `run --kind` has no default. ID and manifest kinds
   must agree. The inventory/protection owner partitions runs before handing a
   homogeneous list to `retention.Decide`; policies remain kind-blind.
@@ -281,7 +341,10 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   While producing, reserve `run.max_artifact_bytes`. Multipart may overlap
   production; `CompleteMultipart` requires producer exit 0 and every accepted
   part. Unknown occupancy is never zero. The protection ledger credits the
-  current run's verified copies before policy/cap decisions. `MarkUncertain`
+  current run's verified copies before policy/cap decisions, then projects its
+  held copies into `StoredRun.Artifacts` and every manifest-named identity into
+  `ObservedArtifacts` for policies such as `keep_versions`. Inventory and
+  workflows never derive holders. `MarkUncertain`
   protects the uncertain run's prefix, marks occupancy unknown and closes cap
   eviction.
 - **A catalog lease serialises writes.** Discover `catalog.Leaser` by call,
@@ -293,8 +356,17 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   checks count as alive. A bounded scheduled wait that expires and a manual live
   holder refusal both reach common finish: failed report, lease reason, finished
   notification. Retention cannot delete another run's incomplete objects before
-  `deadline + finish_allowance`. Inherited uncertainty follows the full-survey
-  digest rule above, never elapsed time.
+  `deadline + finish_allowance`.
+- **Writer identity separates owners; only the lease serialises writers.**
+  `run.writer_identity` is stored in each manifest; empty is the single-writer
+  default, under which every run is the writer's own. With an identity,
+  protection credits, counts, floors and deletes only runs whose manifest names
+  it: foreign, unreadable and manifestless runs are never deleted, yet their
+  bytes count in occupancy, and Sweep aborts only uploads of own runs. Writers
+  sharing a prefix must share one catalog; the run-ID collision check covers the
+  full survey before authority. A discovery answering `discovery.NodeScoped`
+  true (`node_scope: true`) with an empty `run.writer_identity` is a config
+  error in assembly, so validate and run both refuse.
 - **Surface failures before the tool starts.** From the exact caller pod, named
   by `plugins.config.reporting.namespace_env`/`pod_env`, follow owner Job, owner
   CronJob, then its newest other Job. The own Job's failed earlier pods, each with
@@ -312,8 +384,13 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
 - **Process hygiene:** `log/slog` only. `signal.NotifyContext`, `os.Exit` and
   `log.Fatal` exist only in `cmd/go-cluster-backup/main.go`. Domain operations
   never exit the process and remain repeatable within it.
-- **Templates are a SemVer API.** Report fields and the fixed function set
-  (`configuration.CoreFuncs`, notifier `TemplateFuncs`) are deployment-visible.
+- **Templates are a SemVer API.** Report fields and the fixed function sets
+  (`configuration.CoreFuncs`, the webhook's `TemplateFuncs` and `EndpointFuncs`,
+  `kubernetes_labels` `TemplateFuncs`) are deployment-visible. `EndpointFuncs`
+  (`secret`) renders only `url` and header values under
+  `endpoint_templates: true`; payload and message templates never get it. Its
+  one argument is a string-literal absolute path: offline validation refuses a
+  computed, nested or piped argument, so secret bytes never reach diagnostics.
   Test the current surface in
   `internal/plugins/configuration/template_surface_test.go`. Adding a field is a
   minor change; renaming or removing one is a major change.
@@ -360,10 +437,14 @@ For buildkit-cache-dance, `ci.yml`'s `cache-map` must match the Dockerfile's
 `E2E_IMAGE` from the local daemon. It requires `docker`, `k3d`, `kubectl` and
 creates/deletes a cluster with k3d v5.9.0 and `rancher/k3s:v1.37.1-k3s1`.
 `E2E_CLUSTER` defaults to `gcb-e2e`; concurrent runs need distinct names because
-each run deletes that name first. Seven scenarios cover install/validate hook,
-manual run, restore round-trip, previous-run failure, writer lease, rejected
-upgrade and k3s_state. Counters in `coverage-e2e/` become `coverage-e2e.out` for
-the 100% union gate. Details: `test/e2e/README.md`.
+each run deletes that name first. Three top-level tests run nine scenarios.
+`TestSuite` covers install/validate hook, manual run, restore round-trip,
+previous-run failure, writer lease and rejected upgrade. `TestK3sState` stages
+and uploads the node's k3s datastore. `TestPostgresMajors` runs PostgreSQL 15
+and 17 in turn, with at most one extra server pod: dump, probed verify of the
+database and globals, side-by-side restore, and the operator globals restore
+on a throwaway matching-major target. Counters in `coverage-e2e/` become
+`coverage-e2e.out` for the 100% union gate. Details: `test/e2e/README.md`.
 
 Narrow a fix cycle to the affected package, then run `make check` once before
 handover. In a shared task, only the named wave runner runs aggregate gates on

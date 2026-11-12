@@ -62,7 +62,7 @@ func checkDiscover(_ *testing.T, d discovery.Discoverer) error {
 		// is a fault: one object cannot be both.
 		case f.Problem != "" && f.Excluded != "":
 			return fmt.Errorf("found[%d] (%s): exclusion %q is set beside a Problem", i, f.Name, f.Excluded)
-		case f.Excluded != "" && f.Excluded != model.ExclusionIgnored && f.Excluded != model.ExclusionCovered:
+		case f.Excluded != "" && !f.Excluded.Known():
 			return fmt.Errorf("found[%d] (%s): exclusion %q", i, f.Name, f.Excluded)
 		// The reason is what an operator reads: an exclusion without one is a
 		// silent skip, and a reason without an exclusion explains nothing.
@@ -70,6 +70,16 @@ func checkDiscover(_ *testing.T, d discovery.Discoverer) error {
 			return fmt.Errorf("found[%d] (%s): Excluded is set without an ExcludedReason", i, f.Name)
 		case f.Excluded == "" && f.ExcludedReason != "":
 			return fmt.Errorf("found[%d] (%s): ExcludedReason is set without an Excluded", i, f.Name)
+		// An elsewhere exclusion is a delegation to a named peer writer, and a
+		// node on any other verdict is a claim the record cannot carry.
+		case f.Excluded == model.ExclusionElsewhere && f.ExcludedNode == "":
+			return fmt.Errorf("found[%d] (%s): an elsewhere exclusion names no peer node", i, f.Name)
+		case f.Excluded != model.ExclusionElsewhere && f.ExcludedNode != "":
+			return fmt.Errorf("found[%d] (%s): ExcludedNode %q is set beside exclusion %q", i, f.Name, f.ExcludedNode, f.Excluded)
+		// The rate limit is a count of bytes per second: a negative one multiplies
+		// every wait by less than nothing and is refused here, before a run.
+		case f.RateLimit < 0:
+			return fmt.Errorf("found[%d] (%s): RateLimit is negative: %d", i, f.Name, f.RateLimit)
 		// An excluded Found builds no source, so Type, Config and Pipeline are
 		// not required of it. A Found carrying a Problem is an identity plus an
 		// envelope too: Type and Config may be empty for it, but its Pipeline

@@ -110,6 +110,7 @@ its name.
 | `writer_lease` | with a claim left behind by a killed holder, a second manual run is refused, never a second writer |
 | `upgrade_rejected` | an invalid config fails at the hook and the installed release is untouched |
 | `TestK3sState` | the `stage` initContainer snapshots the node's k3s datastore and the run uploads it |
+| `TestPostgresMajors` | one PostgreSQL 15 and one 17 server, sequentially: dump, probed verify, side-by-side restore, and the raw globals artifact fetched and applied by the operator procedure to a throwaway matching-major target (roles, membership, setting, tablespace, login) |
 
 ## Coverage
 

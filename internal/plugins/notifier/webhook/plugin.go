@@ -24,7 +24,7 @@ func Apply(lr *loader.Registry, factories *instances.Registry) error {
 		Type:      "webhook",
 		Summary:   Spec.Summary,
 		Stability: instances.Stable,
-		Example: []byte(`{"url": "https://notify.example.com/backup", ` +
+		Example: []byte(`{"url": "https://notify.example.com/backup", "endpoint_templates": false, ` +
 			`"method": "POST", "headers": {"Content-Type": "application/json"}, "body_format": "yaml", ` +
 			`"timeout": "10s", "success_status": [200, 202], "max_response_bytes": 512, ` +
 			`"events": {"run_finished": "{{ pick .Run.Outcome \"delivered\" \"Backup completed\" \"degraded\" \"Backup DEGRADED\" \"failed\" \"Backup FAILED\" }}\n` +
@@ -58,7 +58,7 @@ func Apply(lr *loader.Registry, factories *instances.Registry) error {
 					return http.ErrUseLastResponse
 				},
 			}
-			return &Notifier{cfg: cfg, accepted: accepted, events: events, client: client, log: deps.Log}, nil
+			return &Notifier{cfg: cfg, accepted: accepted, events: events, endpoint: newEndpoint(cfg), client: client, log: deps.Log}, nil
 		},
 	})
 }

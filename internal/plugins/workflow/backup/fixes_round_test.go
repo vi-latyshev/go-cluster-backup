@@ -254,6 +254,8 @@ func TestC7_TheSettlementObservationFailureKeepsTheRecord(t *testing.T) {
 	w := newWorld(t)
 	cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
 	cfg["catalog"] = instance("failing")
+	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+	w.Notifiers["ops"] = &fakeNotifier{}
 	record := &observeSecondFailingLease{Leaser: catalogtest.NewLeaser()}
 	registerCatalogType(t, w, "failing", record)
 	record.SetUncertainty(&catalog.Uncertainty{RunIDs: []string{"dead"}, Since: time.Now().UTC()})
@@ -265,6 +267,23 @@ func TestC7_TheSettlementObservationFailureKeepsTheRecord(t *testing.T) {
 	}
 	if rep.Outcome != model.OutcomeDelivered {
 		t.Fatalf("a failed settlement observation lowered the outcome to %q: %+v", rep.Outcome, rep.Storages)
+	}
+	if !slices.ContainsFunc(rep.Warnings, func(w model.Warning) bool {
+		return w.Code == "catalog.uncertainty.settle.failed" &&
+			strings.Contains(w.Message, "occupancy stays unknown")
+	}) {
+		t.Fatalf("the failed settlement is not a coded warning: %+v", rep.Warnings)
+	}
+	// The finished message is composed from the same report: the warning reaches
+	// the notifier, not only the log.
+	ev, ok := w.Notifiers["ops"].Finished()
+	if !ok {
+		t.Fatal("the finished event was not delivered")
+	}
+	if !slices.ContainsFunc(ev.Run.Warnings, func(w model.Warning) bool {
+		return w.Code == "catalog.uncertainty.settle.failed"
+	}) {
+		t.Fatalf("the finished message lost the catalog warning: %+v", ev.Run.Warnings)
 	}
 	if record.Uncertainty() == nil {
 		t.Fatal("a failed settlement observation cleared the record")

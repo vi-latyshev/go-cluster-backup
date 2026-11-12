@@ -58,7 +58,7 @@ func (s *Storage) BeginMultipart(ctx context.Context, req storage.PutRequest) (s
 	created, err := c.CreateMultipartUpload(rctx, &s3.CreateMultipartUploadInput{
 		Bucket:       aws.String(s.cfg.Bucket),
 		Key:          aws.String(full),
-		StorageClass: types.StorageClass(s.cfg.StorageClass),
+		StorageClass: s.storageClass(req.Purpose),
 	})
 	if err != nil {
 		return storage.MultipartSession{}, s.classify(ctx, err, "create multipart upload "+full)

@@ -21,8 +21,9 @@ func unitsConfigPath(t *testing.T, addr, passwordPath string, exclude ...string)
 	}
 	raw, err := json.Marshal(map[string]any{
 		"address": addr, "database": "app", "username": "app",
-		"password": map[string]any{"file": passwordPath},
-		"format":   "custom", "compression": "none",
+		"password":    map[string]any{"file": passwordPath},
+		"client_dirs": []string{noSuiteDir(t)},
+		"format":      "custom", "compression": "none",
 		"connect_attempts": 2, "connect_interval": "20ms",
 		"all_databases": true, "exclude_databases": exclude,
 	})
@@ -60,7 +61,7 @@ func databaseOf(t *testing.T, u source.Unit) map[string]any {
 // TestUnitsEnumeratesEveryDatabase: one artifact per database the server lists,
 // each built from a config of this same type that dumps exactly that one.
 func TestUnitsEnumeratesEveryDatabase(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "out.psql", "app\nanalytics\nshows\n")
 	s, err := build(t, unitsConfig(t, listener(t), "postgres"))
 	if err != nil {
@@ -119,7 +120,7 @@ func TestUnitsEnumeratesEveryDatabase(t *testing.T) {
 // TestUnitsLeavesOutTheExcluded: the exclusion list is exact names, applied to
 // the server's own answer rather than woven into the query.
 func TestUnitsLeavesOutTheExcluded(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "out.psql", "app\nanalytics\npostgres\n")
 	s, err := build(t, unitsConfig(t, listener(t), "postgres", "analytics"))
 	if err != nil {
@@ -137,7 +138,7 @@ func TestUnitsLeavesOutTheExcluded(t *testing.T) {
 // TestUnitsSingleDatabaseIsOneArtifact: with all_databases false the instance is
 // what it always was — one artifact — and the planning layer reads exactly that.
 func TestUnitsSingleDatabaseIsOneArtifact(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +218,7 @@ func TestUnitsRefusals(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stubs(t, "pg_dump", "psql", "pg_restore")
+			stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 			tc.setup(t)
 			s, err := build(t, tc.config(t))
 			if err != nil {
@@ -249,10 +250,37 @@ func TestUnitsRefusals(t *testing.T) {
 	}
 }
 
+// TestUnitsReportsAFailedQuery: the enumeration query's own failure is the
+// call's error, classified from its stderr.
+func TestUnitsReportsAFailedQuery(t *testing.T) {
+	t.Setenv("STUB_LOG", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	dir := suiteWithPsql(t, "printf 'connection refused\\n' >&2\nexit 1")
+	raw := map[string]any{
+		"address": listener(t), "database": "app", "username": "app",
+		"password":    map[string]any{"file": passwordFile(t)},
+		"client_dirs": []string{dir},
+		"format":      "custom", "compression": "none",
+		"connect_attempts": 2, "connect_interval": "20ms",
+		"all_databases": true, "exclude_databases": []string{},
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := build(t, string(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := enumerator(t, s).Units(context.Background()); err == nil {
+		t.Fatal("a failing enumeration query was reported as success")
+	}
+}
+
 // TestUnitsReturnsOnCancellation: the enumeration is a plugin call, and a
 // cancelled context is an error like everywhere else.
 func TestUnitsReturnsOnCancellation(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, unitsConfig(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)

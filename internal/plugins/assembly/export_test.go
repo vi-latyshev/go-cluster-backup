@@ -12,21 +12,29 @@ import (
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
 
 type (
-	World         = world
-	FakeSource    = fakeSource
-	FakeProcessor = fakeProcessor
-	FakeDiscovery = fakeDiscovery
-	FakeNotifier  = fakeNotifier
-	FakeCatalog   = fakeCatalog
-	ChainSource   = chainSource
+	World            = world
+	FakeSource       = fakeSource
+	FakeProcessor    = fakeProcessor
+	FakeDiscovery    = fakeDiscovery
+	FakeNotifier     = fakeNotifier
+	FakeCatalog      = fakeCatalog
+	ChainSource      = chainSource
+	CredentialSource = credentialSource
 )
 
 // NewWorld builds one harness world with the distribution's fakes registered.
 func NewWorld(t *testing.T) *World { return newWorld(t) }
+
+// NewCredentialSource builds a source whose bytes carry credentials, with the
+// verdict its optional policy answers and an optional policy failure.
+func NewCredentialSource(data []byte, verdict source.CredentialVerdict, policyErr error) *credentialSource {
+	return &credentialSource{Source: fakeSource{Data: data}, Verdict: verdict, PolicyErr: policyErr}
+}
 
 // NewAssembly builds the assembly from one configuration, failing the test on
 // a construction error.

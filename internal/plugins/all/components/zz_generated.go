@@ -28,6 +28,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier/webhook"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/pgclient"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/pipeline"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/planning"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/processor"
@@ -38,10 +39,14 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/gfs"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keeplast"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keepversions"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/collected"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/files"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/k3setcd"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/k3sstate"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/postgres"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/postgresglobals"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/redis"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/sqlite"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source/staged"
@@ -70,7 +75,7 @@ func Compose(r *loader.Registry, factories *instances.Registry) error {
 		"cli":                          {"assembly", "configuration", "errors", "human", "instances", "inventory", "lifecycle", "model", "must", "planning", "source", "storage", "storage-guard", "workflow-backup", "workflow-restore"},
 		"configuration":                {"errors", "human", "model"},
 		"discovery":                    {"instances", "model"},
-		"discovery/kubernetes_labels":  {"configuration", "discovery", "errors", "instances", "kubeapi", "model", "must"},
+		"discovery/kubernetes_labels":  {"configuration", "discovery", "errors", "human", "instances", "kubeapi", "model", "must"},
 		"execution":                    {"errors", "human"},
 		"extcmd":                       {"errors"},
 		"instances":                    {"configuration"},
@@ -79,7 +84,8 @@ func Compose(r *loader.Registry, factories *instances.Registry) error {
 		"layout":                       {"configuration", "model"},
 		"lifecycle":                    {"instances", "model"},
 		"notifier":                     {"errors", "instances", "model"},
-		"notifier/webhook":             {"configuration", "errors", "instances", "model", "must", "notifier"},
+		"notifier/webhook":             {"configuration", "errors", "extcmd", "instances", "model", "must", "notifier"},
+		"pgclient":                     {"configuration", "errors", "extcmd", "io", "model"},
 		"pipeline":                     {"errors", "execution", "human", "model", "processor", "source", "spool"},
 		"planning":                     {"discovery", "errors", "execution", "instances", "model", "processor", "source"},
 		"processor":                    {"instances"},
@@ -90,10 +96,14 @@ func Compose(r *loader.Registry, factories *instances.Registry) error {
 		"retention":                    {"instances", "model"},
 		"retention/gfs":                {"instances", "model", "retention"},
 		"retention/keep_last":          {"instances", "retention"},
+		"retention/keep_versions":      {"instances", "retention"},
 		"source":                       {"instances", "model"},
+		"source/collected":             {"configuration", "errors", "instances", "io", "model", "source"},
 		"source/files":                 {"configuration", "errors", "human", "instances", "io", "model", "must", "source"},
+		"source/k3s_etcd":              {"configuration", "errors", "instances", "io", "model", "source"},
 		"source/k3s_state":             {"configuration", "errors", "extcmd", "instances", "io", "model", "source", "sqlitecopy"},
-		"source/postgres":              {"configuration", "errors", "extcmd", "instances", "io", "model", "must", "source"},
+		"source/postgres":              {"configuration", "errors", "extcmd", "instances", "model", "must", "pgclient", "source"},
+		"source/postgres_globals":      {"configuration", "errors", "extcmd", "instances", "io", "model", "pgclient", "source"},
 		"source/redis":                 {"configuration", "errors", "extcmd", "instances", "io", "model", "source"},
 		"source/sqlite":                {"configuration", "errors", "extcmd", "instances", "io", "model", "source", "sqlitecopy"},
 		"source/staged":                {"errors", "instances", "io", "model", "source"},
@@ -134,6 +144,7 @@ func Compose(r *loader.Registry, factories *instances.Registry) error {
 		{must.Spec, nil},
 		{notifier.Spec, nil},
 		{webhook.Spec, func(lr *loader.Registry) error { return webhook.Apply(lr, factories) }},
+		{pgclient.Spec, nil},
 		{pipeline.Spec, nil},
 		{planning.Spec, nil},
 		{processor.Spec, nil},
@@ -144,10 +155,14 @@ func Compose(r *loader.Registry, factories *instances.Registry) error {
 		{retention.Spec, nil},
 		{gfs.Spec, func(lr *loader.Registry) error { return gfs.Apply(lr, factories) }},
 		{keeplast.Spec, func(lr *loader.Registry) error { return keeplast.Apply(lr, factories) }},
+		{keepversions.Spec, func(lr *loader.Registry) error { return keepversions.Apply(lr, factories) }},
 		{source.Spec, nil},
+		{collected.Spec, func(lr *loader.Registry) error { return collected.Apply(lr, factories) }},
 		{files.Spec, func(lr *loader.Registry) error { return files.Apply(lr, factories) }},
+		{k3setcd.Spec, func(lr *loader.Registry) error { return k3setcd.Apply(lr, factories) }},
 		{k3sstate.Spec, func(lr *loader.Registry) error { return k3sstate.Apply(lr, factories) }},
 		{postgres.Spec, func(lr *loader.Registry) error { return postgres.Apply(lr, factories) }},
+		{postgresglobals.Spec, func(lr *loader.Registry) error { return postgresglobals.Apply(lr, factories) }},
 		{redis.Spec, func(lr *loader.Registry) error { return redis.Apply(lr, factories) }},
 		{sqlite.Spec, func(lr *loader.Registry) error { return sqlite.Apply(lr, factories) }},
 		{staged.Spec, func(lr *loader.Registry) error { return staged.Apply(lr, factories) }},

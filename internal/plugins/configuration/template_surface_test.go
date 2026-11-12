@@ -27,14 +27,15 @@ var modelPkg = reflect.TypeOf(model.Event{}).PkgPath()
 // a new reachable type fails until it is added here.
 var pinnedFields = map[string][]string{
 	"Event":                {"At", "Name", "Run"},
-	"RunReport":            {"Artifacts", "Duration", "Excluded", "ExitCode", "Kind", "Lease", "Outcome", "Previous", "RunID", "Schema", "StartedAt", "Storages"},
-	"ArtifactResult":       {"Artifact", "Bytes", "Chain", "Duration", "Error", "Hint", "Key", "Outcome", "Pipeline", "RawBytes", "SHA256", "Source", "Stats"},
+	"RunReport":            {"Artifacts", "Duration", "Excluded", "ExitCode", "Kind", "Lease", "Outcome", "Previous", "RunID", "Schema", "StartedAt", "Storages", "Warnings", "WriterIdentity"},
+	"ArtifactResult":       {"Artifact", "Bytes", "Chain", "Duration", "Error", "Hint", "Key", "Outcome", "Pipeline", "RawBytes", "SHA256", "Source", "Stats", "Warnings"},
 	"Artifact":             {"Ext", "Group", "Importance", "Name", "Sealed", "Sensitivity"},
 	"SourceRef":            {"Instance", "Origin", "Type"},
 	"ProcessorStep":        {"Ext", "Instance", "Seals", "Type"},
-	"DumpStats":            {"PaddedFiles", "SkippedEntries"},
-	"StorageResult":        {"Attempts", "Bytes", "CapExceeded", "CapLimitBytes", "CapUsedBytes", "Deleted", "Duration", "Error", "Freed", "Kept", "Objects", "Outcome", "Storage", "Type"},
-	"Exclusion":            {"Group", "Kind", "Name", "Reason"},
+	"DumpStats":            {"ChangedFiles", "PaddedFiles", "SkippedEntries"},
+	"StorageResult":        {"Attempts", "Bytes", "CapEvicted", "CapExceeded", "CapLimitBytes", "CapOverflowBytes", "CapUsedBytes", "Deleted", "Duration", "Error", "Freed", "Kept", "Objects", "OccupancyUnknown", "Outcome", "RetentionError", "Storage", "Type"},
+	"Exclusion":            {"Group", "Kind", "Name", "Node", "Reason"},
+	"Warning":              {"Code", "Message"},
 	"PreviousRun":          {"Attempts", "Failure", "LastGoodAt", "RunID", "Unavailable", "Unfinished"},
 	"PreviousFailure":      {"Consecutive", "Containers", "Events", "Job", "Message", "Reason"},
 	"AttemptFailure":       {"Deleted", "Failed", "Job", "Pods"},
@@ -56,7 +57,7 @@ func pinnedType(name string) (reflect.Type, bool) {
 		reflect.TypeOf(model.FailedPod{}),
 		reflect.TypeOf(model.ContainerFailure{}),
 		reflect.TypeOf(model.ContainerTermination{}), reflect.TypeOf(model.EventFailure{}),
-		reflect.TypeOf(model.LeaseState{}),
+		reflect.TypeOf(model.LeaseState{}), reflect.TypeOf(model.Warning{}),
 	} {
 		if t.Name() == name {
 			return t, true
@@ -153,6 +154,11 @@ func TestTemplateFuncsArePinned(t *testing.T) {
 			[]string{"bytes", "date", "duration", "json", "pick", "sibytes"}},
 		"webhook": {slices.Sorted(maps.Keys(webhook.Config{}.TemplateFuncs())),
 			[]string{"blank", "byGroup", "clip", "failed", "pickdef", "sumBytes"}},
+		// The endpoint-only function set: what endpoint_templates: true renders
+		// url and header values with, and the one function payload and message
+		// templates never see.
+		"webhook-endpoint": {slices.Sorted(maps.Keys(webhook.EndpointFuncs())),
+			[]string{"secret"}},
 		"kubernetes_labels": {slices.Sorted(maps.Keys((&kuberneteslabels.Config{}).TemplateFuncs())),
 			[]string{"envFile", "envValue", "label", "port", "volumePath"}},
 	}

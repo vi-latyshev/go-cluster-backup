@@ -1,7 +1,9 @@
-// Package postgres dumps one PostgreSQL database with pg_dump, the binary the
-// image already carries (postgresql18-client). The dump streams out of
-// pg_dump's stdout; the call returns after pg_dump has exited, and a non-zero
-// exit is an error of this call, never a short dump reported as success.
+// Package postgres dumps one PostgreSQL database with pg_dump. The dump
+// streams out of pg_dump's stdout; the call returns after pg_dump has exited,
+// and a non-zero exit is an error of this call, never a short dump reported as
+// success. The client suite is selected by the server's exact major: the image
+// carries PostgreSQL 15 through 18, and a server is dumped only by the client
+// of its own major.
 //
 // The instance is also the restorer and the prober of such an artifact:
 // side-by-side restores into a database labelled with the run id, in-place
@@ -14,34 +16,34 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	json "encoding/json/v2"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/extcmd"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/io"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/pgclient"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 )
 
-// Config is the plugin config. Every field is required: no value in code can
-// stand in for what the file omits.
+// Config is the plugin config. Every field is required of the merged config:
+// no value in code stands in for what the file or the distribution's defaults
+// document omits. client_dirs and the connect settings are defaulted, so a
+// deployment may leave them out, but the plugin receives them complete.
 type Config struct {
 	Address         string               `json:"address" required:"true" doc:"host:port of the PostgreSQL server"`
 	Database        string               `json:"database" required:"true" doc:"database to dump; with all_databases true, the database the enumeration connects to"`
 	Username        string               `json:"username" required:"true" doc:"role pg_dump and psql connect as"`
 	Password        configuration.Secret `json:"password" doc:"file holding the role's password; never passed on a command line"`
+	ClientDirs      []string             `json:"client_dirs" doc:"directories holding a PostgreSQL client suite — pg_dump, pg_dumpall, pg_restore and psql of one major; a directory that does not exist is skipped, and PATH is the last candidate"`
 	Format          string               `json:"format" doc:"pg_dump output format: custom, tar or plain"`
-	Compression     string               `json:"compression" doc:"pg_dump --compress argument, e.g. none or zstd:3"`
+	Compression     string               `json:"compression" doc:"pg_dump --compress argument, e.g. none or zstd:3; a PostgreSQL 15 server, whose pg_dump takes only a numeric level, is mapped when the dump runs"`
 	ConnectAttempts int                  `json:"connect_attempts" doc:"TCP connect attempts before a dump gives up"`
 	ConnectInterval model.Duration       `json:"connect_interval" doc:"wait between connect attempts; also the per-attempt dial timeout"`
 	// AllDatabases makes this instance enumerate the server's databases instead
@@ -59,9 +61,6 @@ type Config struct {
 // that refuses connections (datallowconn false) is one nobody can read.
 const unitsQuery = "select datname from pg_database where datallowconn and not datistemplate order by datname"
 
-// binaries every capability of this plugin may invoke.
-var binaries = []string{"pg_dump", "psql", "pg_restore"}
-
 var (
 	formatExt  = map[string]string{"custom": ".dump", "tar": ".tar", "plain": ".sql"}
 	formatFlag = map[string]string{"custom": "c", "tar": "t", "plain": "p"}
@@ -73,8 +72,7 @@ var (
 
 type Source struct {
 	cfg  Config
-	host string
-	port string
+	conn *pgclient.Conn
 }
 
 func (s *Source) Describe(ctx context.Context) (source.SourceTraits, error) {
@@ -87,44 +85,36 @@ func (s *Source) Describe(ctx context.Context) (source.SourceTraits, error) {
 	}, nil
 }
 
-// Check runs at preflight: the binaries are present, the target is reachable,
-// and pg_dump's major version equals the server's — a dump from a client of the
-// wrong major is refused by the server, and it must be refused here, not at 04:20.
+// Check runs at preflight: the configured client suites are complete and of
+// one major, the target is reachable, and a suite of the server's exact major
+// exists — a dump from a client of the wrong major is refused by the server,
+// and it must be refused here, not at 04:20.
 func (s *Source) Check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var errs []error
-	for _, bin := range binaries {
-		if _, err := extcmd.FindBinary(bin); err != nil {
-			errs = append(errs, err)
-		}
+	if err := s.conn.CheckBinaries(ctx); err != nil {
+		return err
 	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
-	if err := extcmd.WaitTCP(ctx, s.host, s.port, s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
+	if err := extcmd.WaitTCP(ctx, s.conn.Host(), s.conn.Port(), s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return pluginerrors.Transient(err)
 	}
-	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
+	pass, err := s.conn.ReadPassword()
 	if err != nil {
 		return err
 	}
-	client, err := s.pgDumpMajor(ctx)
-	if err != nil {
-		return err
-	}
-	server, err := s.serverMajor(ctx, pass)
-	if err != nil {
-		return err
-	}
-	if client != server {
-		return pluginerrors.Permanent(fmt.Errorf("pg_dump major %d does not equal server major %d: the image's postgresql client must match the server", client, server))
-	}
-	return nil
+	_, err = s.conn.Select(ctx, pass, s.cfg.Database)
+	return err
+}
+
+// CheckBinaries is the optional local health capability: the configured
+// client suites are complete and internally consistent, proved without a
+// server and without touching the deployment's files beyond the suites.
+func (s *Source) CheckBinaries(ctx context.Context) error {
+	return s.conn.CheckBinaries(ctx)
 }
 
 // Dump streams the dump into dst. The bytes never pass through a buffer: read
@@ -133,85 +123,65 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
+	pass, err := s.conn.ReadPassword()
 	if err != nil {
 		return err
 	}
-	if err := extcmd.WaitTCP(ctx, s.host, s.port, s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
+	if err := extcmd.WaitTCP(ctx, s.conn.Host(), s.conn.Port(), s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return pluginerrors.Transient(err)
 	}
-	cmd := exec.CommandContext(ctx, "pg_dump", s.dumpArgs()...)
-	cmd.Env = s.pgEnv(pass)
-	_, err = streamCommand(ctx, cmd, dst)
+	suite, err := s.conn.Select(ctx, pass, s.cfg.Database)
+	if err != nil {
+		return err
+	}
+	compress, err := compressionValue(suite.Major, s.cfg.Compression)
+	if err != nil {
+		return err
+	}
+	cmd := s.conn.Command(ctx, suite, "pg_dump", pass, s.dumpArgs(compress)...)
+	_, err = s.conn.Stream(ctx, cmd, dst)
 	return err
 }
 
-func (s *Source) dumpArgs() []string {
-	return append(s.connArgs(),
-		"--no-password",
-		"-F"+formatFlag[s.cfg.Format],
-		"--compress="+s.cfg.Compression,
-		dbnameArg(s.cfg.Database),
-	)
+func (s *Source) dumpArgs(compress string) []string {
+	return []string{
+		"-F" + formatFlag[s.cfg.Format],
+		"--compress=" + compress,
+		pgclient.DBNameArg(s.cfg.Database),
+	}
 }
 
-// connArgs is the shared connection prefix; the password is never here.
-func (s *Source) connArgs() []string {
-	return []string{"-h", s.host, "-p", s.port, "-U", s.cfg.Username}
-}
-
-func (s *Source) pgEnv(pass string) []string {
-	return extcmd.ReplaceEnv(os.Environ(),
-		"PGPASSWORD="+pass,
-		"PGCONNECT_TIMEOUT="+strconv.Itoa(connectTimeoutSeconds(s.cfg.ConnectInterval.Std())),
-	)
-}
-
-// pgDumpMajor reads the client's major version from pg_dump --version.
-func (s *Source) pgDumpMajor(ctx context.Context) (int, error) {
-	out, err := extcmd.Output(ctx, exec.CommandContext(ctx, "pg_dump", "--version"), classifyExit)
-	if err != nil {
-		return 0, err
+// compressionValue is the value pg_dump --compress takes on the selected
+// client's major. PostgreSQL 16 introduced METHOD[:LEVEL]; PostgreSQL 15's
+// pg_dump takes only a numeric level, so every configured value is mapped
+// there — none is 0 and gzip:N is N — and a method it cannot express, or a
+// gzip level it does not state, is refused by name instead of being handed to
+// pg_dump as a value it reads as a number or rejects at 04:20.
+func compressionValue(major int, compression string) (string, error) {
+	if major >= 16 {
+		return compression, nil
 	}
-	m := versionRe().FindStringSubmatch(out)
-	if m == nil {
-		return 0, pluginerrors.Permanent(fmt.Errorf("cannot read a version from pg_dump --version output %q", strings.TrimSpace(out)))
+	switch {
+	case compression == "none":
+		return "0", nil
+	case len(compression) == 1 && compression[0] >= '0' && compression[0] <= '9':
+		return compression, nil
+	case strings.HasPrefix(compression, "gzip:"):
+		level := strings.TrimPrefix(compression, "gzip:")
+		if len(level) > 2 {
+			break
+		}
+		n, err := strconv.Atoi(level)
+		if err == nil && n >= 0 && n <= 9 {
+			return level, nil
+		}
 	}
-	major, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0, pluginerrors.Permanent(fmt.Errorf("pg_dump version %q is not a number", m[1]))
-	}
-	return major, nil
-}
-
-// serverMajor asks the server itself; server_version_num packs the major into
-// its leading digits (180006 is 18.6).
-func (s *Source) serverMajor(ctx context.Context, pass string) (int, error) {
-	out, err := s.psqlQuery(ctx, s.cfg.Database, pass, "select current_setting('server_version_num')")
-	if err != nil {
-		return 0, err
-	}
-	num, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil {
-		return 0, pluginerrors.Permanent(fmt.Errorf("server version %q is not a number: %w", strings.TrimSpace(out), err))
-	}
-	return num / 10000, nil
-}
-
-// psqlQuery runs one -At query as this instance's role and returns what it
-// answered. The password reaches psql through the environment, never a command
-// line, and the caller has already read it — a unit enumeration and a version
-// check both ask the server, and both classify a refusal the same way.
-func (s *Source) psqlQuery(ctx context.Context, database, pass, query string) (string, error) {
-	cmd := exec.CommandContext(ctx, "psql", append(s.connArgs(),
-		"--no-password", dbnameArg(database), "-At",
-		"-c", query,
-	)...)
-	cmd.Env = s.pgEnv(pass)
-	return extcmd.Output(ctx, cmd, classifyExit)
+	return "", pluginerrors.Permanent(fmt.Errorf(
+		"compression %q cannot be expressed to a PostgreSQL %d server's pg_dump: its --compress takes a numeric level 0-9, so use none, a level or gzip:LEVEL; the METHOD[:LEVEL] syntax needs a PostgreSQL 16 or newer client",
+		compression, major))
 }
 
 // Units enumerates the server's databases as one artifact each: with
@@ -227,19 +197,23 @@ func (s *Source) Units(ctx context.Context) ([]source.Unit, error) {
 	if !s.cfg.AllDatabases {
 		return nil, errors.ErrUnsupported
 	}
-	pass, err := extcmd.ReadPassword(s.cfg.Password.File)
+	pass, err := s.conn.ReadPassword()
 	if err != nil {
 		return nil, err
 	}
 	// A server that is not answering yet is the same transient fault a dump
 	// waits out; enumerating is the first thing the run does with it.
-	if err := extcmd.WaitTCP(ctx, s.host, s.port, s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
+	if err := extcmd.WaitTCP(ctx, s.conn.Host(), s.conn.Port(), s.cfg.ConnectAttempts, s.cfg.ConnectInterval.Std()); err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		return nil, pluginerrors.Transient(err)
 	}
-	out, err := s.psqlQuery(ctx, s.cfg.Database, pass, unitsQuery)
+	suite, err := s.conn.Select(ctx, pass, s.cfg.Database)
+	if err != nil {
+		return nil, err
+	}
+	out, err := s.query(ctx, suite, pass, s.cfg.Database, unitsQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +242,14 @@ func (s *Source) Units(ctx context.Context) ([]source.Unit, error) {
 	return units, nil
 }
 
+// query runs one -At query as this instance's role and returns what the
+// server answered. The password reaches psql through the environment, never a
+// command line.
+func (s *Source) query(ctx context.Context, suite pgclient.Suite, pass, database, query string) (string, error) {
+	cmd := s.conn.Command(ctx, suite, "psql", pass, pgclient.DBNameArg(database), "-At", "-c", query)
+	return s.conn.Output(ctx, cmd)
+}
+
 // unitConfig is the config one unit is dumped with: the instance's own with the
 // database substituted and the enumeration off. It exists so the round trip
 // through JSON — a Secret field, a duration — is one function a test can pin.
@@ -276,97 +258,4 @@ func unitConfig(cfg Config, database string) Config {
 	cfg.AllDatabases = false
 	cfg.ExcludeDatabases = []string{}
 	return cfg
-}
-
-var versionRe = sync.OnceValue(func() *regexp.Regexp { return regexp.MustCompile(`(\d+)\.`) })
-
-func connectTimeoutSeconds(d time.Duration) int {
-	return max(int((d+time.Second-1)/time.Second), 1)
-}
-
-// stdoutPipe is the pipe a command's output streams through. It is a variable
-// because os.Pipe can fail on a host out of descriptors, which no test can make
-// it do on demand.
-var stdoutPipe = func(cmd *exec.Cmd) (io.ReadCloser, error) { return cmd.StdoutPipe() }
-
-// streamCommand starts cmd, copies its stdout into dst, and returns only after
-// the command has exited. A dst failure kills the command; a non-zero exit is
-// classified from the command's stderr.
-func streamCommand(ctx context.Context, cmd *exec.Cmd, dst io.Writer) (int64, error) {
-	stdout, err := stdoutPipe(cmd)
-	if err != nil {
-		// A host out of descriptors is worth another attempt, never a panic.
-		return 0, pluginerrors.Transient(fmt.Errorf("taking the command's stdout: %w", err))
-	}
-	stderr := extcmd.NewBoundedBuffer()
-	cmd.Stderr = stderr
-	if err := cmd.Start(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, ctxErr
-		}
-		return 0, pluginerrors.Transient(err)
-	}
-	n, copyErr := pluginio.CopyContext(ctx, dst, stdout)
-	if copyErr != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return n, ctxErr
-		}
-		return n, copyErr
-	}
-	if err := cmd.Wait(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return n, ctxErr
-		}
-		return n, classifyExit(cmd.Path, err, stderr.String())
-	}
-	return n, nil
-}
-
-// runCommand runs cmd with src as its stdin (nil leaves stdin empty) and
-// returns the bytes fed to it.
-func runCommand(ctx context.Context, cmd *exec.Cmd, src io.Reader) (int64, error) {
-	stderr := extcmd.NewBoundedBuffer()
-	cmd.Stderr = stderr
-	counted := &countingReader{r: src}
-	if src != nil {
-		cmd.Stdin = counted
-	}
-	if err := cmd.Run(); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return counted.n, ctxErr
-		}
-		return counted.n, classifyExit(cmd.Path, err, stderr.String())
-	}
-	return counted.n, nil
-}
-
-var (
-	// A connection the server never answered is worth another attempt; a
-	// credential the server refused is not.
-	transientRe = sync.OnceValue(func() *regexp.Regexp {
-		return regexp.MustCompile(`(?i)connection refused|connection timed out|could not connect|connection reset|no route to host|i/o timeout|the database system is starting up|is in recovery|terminating connection due to|server closed the connection unexpectedly`)
-	})
-	permanentRe = sync.OnceValue(func() *regexp.Regexp {
-		return regexp.MustCompile(`(?i)password authentication failed|authentication failed|no pg_hba.conf entry|does not exist|permission denied|too many connections|server version mismatch`)
-	})
-)
-
-// classifyExit turns a failed command into a framework-marked error with this
-// plugin's patterns; text that matches neither stays unclassified, and the
-// execution config then decides what an unclassified error means.
-func classifyExit(bin string, err error, detail string) error {
-	return extcmd.ClassifyExit(bin, err, detail, permanentRe(), transientRe())
-}
-
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
 }

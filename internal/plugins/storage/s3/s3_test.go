@@ -175,6 +175,123 @@ func TestSinglePutSequence(t *testing.T) {
 	}
 }
 
+// TestPayloadStorageClassIsExactAndMayBeOmitted: a payload gets the configured
+// token exactly as the deployment wrote it — the endpoint's own class names
+// (ICE, COLD, SINGLE) are not the AWS enum — and an empty token sends no class
+// header at all, which leaves the bucket's default in force.
+func TestPayloadStorageClassIsExactAndMayBeOmitted(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		class string
+		want  string
+	}{
+		{"a provider class keeps its exact case", "ice", "ice"},
+		{"a known class passes through", "STANDARD", "STANDARD"},
+		{"empty sends no header", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, f := newStorage(t, func(raw map[string]any) { raw["storage_class"] = tc.class })
+			body := []byte("payload")
+			if _, err := s.Put(context.Background(),
+				storage.PutRequest{Key: "a.bin", Size: int64(len(body))}, bytes.NewReader(body)); err != nil {
+				t.Fatal(err)
+			}
+			if f.sawStorage != tc.want {
+				t.Errorf("payload Put declared class %q, want %q", f.sawStorage, tc.want)
+			}
+		})
+	}
+}
+
+// TestMetadataPutIsAlwaysStandard: the run manifest is metadata. Whatever class
+// the artifacts use, the manifest goes STANDARD, so a cold payload class never
+// turns the survey's first read of every run into a retrieval or an
+// InvalidObjectState. Empty payload class means metadata is STANDARD anyway.
+func TestMetadataPutIsAlwaysStandard(t *testing.T) {
+	for _, class := range []string{"ICE", ""} {
+		t.Run("payload class "+class, func(t *testing.T) {
+			s, f := newStorage(t, func(raw map[string]any) { raw["storage_class"] = class })
+			body := []byte("manifest")
+			if _, err := s.Put(context.Background(), storage.PutRequest{
+				Key: "runs/20261012T042000Z/manifest.json", Size: int64(len(body)), Purpose: storage.PurposeMetadata,
+			}, bytes.NewReader(body)); err != nil {
+				t.Fatal(err)
+			}
+			if f.sawStorage != "STANDARD" {
+				t.Errorf("metadata Put declared class %q, want STANDARD", f.sawStorage)
+			}
+		})
+	}
+}
+
+// TestMultipartClassFollowsPurpose: the class is decided on the request that
+// creates the upload, per purpose, exactly as on the single-request path.
+func TestMultipartClassFollowsPurpose(t *testing.T) {
+	cases := []struct {
+		name    string
+		class   string
+		purpose storage.Purpose
+		want    string
+	}{
+		{"a payload takes the configured class", "ICE", storage.PurposePayload, "ICE"},
+		{"a metadata object is STANDARD", "ICE", storage.PurposeMetadata, "STANDARD"},
+		{"an empty payload class sends no header", "", storage.PurposePayload, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeS3(t, testBucket)
+			s := newStorageFrom(t, baseConfig(t, f, func(raw map[string]any) {
+				raw["part_bytes"] = testPartBytes
+				raw["storage_class"] = tc.class
+			}))
+			mu := capabilityOf(t, s)
+			if _, err := mu.BeginMultipart(context.Background(), storage.PutRequest{
+				Key: "big.bin", Size: 2 * testPartBytes, Purpose: tc.purpose,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if f.createStorage != tc.want {
+				t.Errorf("CreateMultipartUpload declared class %q, want %q", f.createStorage, tc.want)
+			}
+		})
+	}
+}
+
+// TestStorageClassTokenIsRefusedBeforeTheSDK: the class is the endpoint's own
+// token, so it is checked for shape and nothing else — a class the AWS enum
+// never knew is accepted, while a token carrying a space, a CR/LF or more than
+// 64 bytes is a config error, refused before any request.
+func TestStorageClassTokenIsRefusedBeforeTheSDK(t *testing.T) {
+	f := newFakeS3(t, testBucket)
+	build := func(class string) error {
+		body, err := json.Marshal(baseConfig(t, f, func(raw map[string]any) { raw["storage_class"] = class }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = storage.Build(context.Background(), testRegistry(t), "s3", body,
+			storage.BuildInput{CallParallelism: 1}, instances.Deps{Instance: "offsite", Log: slog.New(slog.DiscardHandler)})
+		return err
+	}
+	for _, class := range []string{"ICE", "COLD", "ice-cold_1", ""} {
+		if err := build(class); err != nil {
+			t.Errorf("storage_class %q was refused: %v", class, err)
+		}
+	}
+	for _, class := range []string{"ice cold", "STANDARD\r\n", strings.Repeat("A", 65)} {
+		err := build(class)
+		if err == nil {
+			t.Errorf("storage_class %q was accepted", class)
+			continue
+		}
+		if !strings.Contains(err.Error(), "storage_class") {
+			t.Errorf("the refusal of %q does not name the field: %v", class, err)
+		}
+	}
+	if f.Count("put")+f.Count("create") != 0 {
+		t.Error("a construction attempt reached the endpoint")
+	}
+}
+
 func TestNoSdkRetryOnPut(t *testing.T) {
 	ctx := context.Background()
 	s, f := newStorage(t, nil)
@@ -427,22 +544,22 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		` "storage_class": "STANDARD", "request_checksum": "when_required", "part_bytes": 16777216,` +
 		` "max_request_bytes": 5368709120, "max_object_bytes": 5497558138880, "request_timeout": "5m"}`
 	bad := map[string]string{
-		"bad addressing":         strings.Replace(good, `"path"`, `"banana"`, 1),
-		"bad checksum mode":      strings.Replace(good, `"when_required"`, `"always"`, 1),
-		"bad storage class":      strings.Replace(good, `"STANDARD"`, `"GOLD"`, 1),
-		"part below the minimum": strings.Replace(good, `"part_bytes": 16777216`, `"part_bytes": 1048576`, 1),
-		"part above request cap": strings.Replace(good, `"part_bytes": 16777216`, `"part_bytes": 8589934592`, 1),
-		"empty bucket":           strings.Replace(good, `"bucket": "b"`, `"bucket": ""`, 1),
-		"empty region":           strings.Replace(good, `"region": "ru-central-1"`, `"region": ""`, 1),
-		"empty storage class":    strings.Replace(good, `"STANDARD"`, `""`, 1),
-		"empty key file":         strings.Replace(good, `{"file": "/k"}`, `{"file": ""}`, 1),
-		"empty secret file":      strings.Replace(good, `{"file": "/s"}`, `{"file": ""}`, 1),
-		"prefix with slash":      strings.Replace(good, `"prefix": "root"`, `"prefix": "/root"`, 1),
-		"not a URL":              strings.Replace(good, `"https://s3.example.com"`, `"s3.example.com"`, 1),
-		"zero request timeout":   strings.Replace(good, `"5m"`, `"0s"`, 1),
-		"zero max request":       strings.Replace(good, `"max_request_bytes": 5368709120`, `"max_request_bytes": 0`, 1),
-		"object below request":   strings.Replace(good, `"max_object_bytes": 5497558138880`, `"max_object_bytes": 1`, 1),
-		"unknown member":         strings.Replace(good, `{`, `{"zzz": 1,`, 1),
+		"bad addressing":             strings.Replace(good, `"path"`, `"banana"`, 1),
+		"bad checksum mode":          strings.Replace(good, `"when_required"`, `"always"`, 1),
+		"storage class with a space": strings.Replace(good, `"STANDARD"`, `"STANDARD CLASS"`, 1),
+		"storage class with CRLF":    strings.Replace(good, `"STANDARD"`, `"STANDARD\r\n"`, 1),
+		"part below the minimum":     strings.Replace(good, `"part_bytes": 16777216`, `"part_bytes": 1048576`, 1),
+		"part above request cap":     strings.Replace(good, `"part_bytes": 16777216`, `"part_bytes": 8589934592`, 1),
+		"empty bucket":               strings.Replace(good, `"bucket": "b"`, `"bucket": ""`, 1),
+		"empty region":               strings.Replace(good, `"region": "ru-central-1"`, `"region": ""`, 1),
+		"empty key file":             strings.Replace(good, `{"file": "/k"}`, `{"file": ""}`, 1),
+		"empty secret file":          strings.Replace(good, `{"file": "/s"}`, `{"file": ""}`, 1),
+		"prefix with slash":          strings.Replace(good, `"prefix": "root"`, `"prefix": "/root"`, 1),
+		"not a URL":                  strings.Replace(good, `"https://s3.example.com"`, `"s3.example.com"`, 1),
+		"zero request timeout":       strings.Replace(good, `"5m"`, `"0s"`, 1),
+		"zero max request":           strings.Replace(good, `"max_request_bytes": 5368709120`, `"max_request_bytes": 0`, 1),
+		"object below request":       strings.Replace(good, `"max_object_bytes": 5497558138880`, `"max_object_bytes": 1`, 1),
+		"unknown member":             strings.Replace(good, `{`, `{"zzz": 1,`, 1),
 	}
 	build := func(raw string) error {
 		t.Helper()
@@ -461,6 +578,14 @@ func TestNewRejectsBadConfig(t *testing.T) {
 	supported := strings.Replace(good, `"when_required"`, `"when_supported"`, 1)
 	if err := build(supported); err != nil {
 		t.Errorf("a when_supported config was rejected: %v", err)
+	}
+	// The class is the endpoint's own token, not the AWS enum, and it may be
+	// empty; both are what an S3-compatible deployment writes.
+	for _, class := range []string{"ICE", "COLD", "SINGLE", "ice", ""} {
+		raw := strings.Replace(good, `"STANDARD"`, `"`+class+`"`, 1)
+		if err := build(raw); err != nil {
+			t.Errorf("storage_class %q was rejected: %v", class, err)
+		}
 	}
 }
 

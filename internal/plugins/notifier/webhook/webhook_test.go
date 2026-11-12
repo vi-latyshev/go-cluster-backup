@@ -64,7 +64,7 @@ const modelPayload = "title: {{ json .Title }}\nlines:\n{{ range .Lines }}\n" +
 // mechanics a deployment states once.
 func baseConfig(url string) map[string]any {
 	return map[string]any{
-		"url": url, "method": "POST",
+		"url": url, "endpoint_templates": false, "method": "POST",
 		"headers":     map[string]string{"Content-Type": "application/json", "X-Instance": "backup"},
 		"body_format": "yaml", "timeout": "5s",
 		"success_status": []int{200, 202}, "max_response_bytes": 64,
@@ -327,7 +327,7 @@ func TestTimeoutIsTransient(t *testing.T) {
 func TestMessageThatRendersForOneRunOnlyIsRefused(t *testing.T) {
 	r := testRegistry(t)
 	raw, err := json.Marshal(map[string]any{
-		"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+		"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": map[string]string{},
 		"body_format": "text", "timeout": "1s", "success_status": []int{200}, "max_response_bytes": 16,
 		"events": map[string]string{
 			"run_finished": "{{ if .Run.Previous.Unfinished }}The previous run never reported{{ end }}",
@@ -361,7 +361,7 @@ func TestMissingFieldAndKeyFailOffline(t *testing.T) {
 	for name, message := range cases {
 		t.Run(name, func(t *testing.T) {
 			raw, err := json.Marshal(map[string]any{
-				"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+				"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": map[string]string{},
 				"body_format": "text", "timeout": "1s", "success_status": []int{200}, "max_response_bytes": 16,
 				"events": map[string]string{"run_finished": message}, "payload": "{{ .Text }}",
 			})
@@ -382,7 +382,7 @@ func TestMissingFieldAndKeyFailOffline(t *testing.T) {
 // TestBadTemplateIsRejectedAtDecodeTime: syntax is checked by the framework at
 // decode time, so `validate` never lets a broken template reach the network.
 func TestBadTemplateIsRejectedAtDecodeTime(t *testing.T) {
-	raw := jsontext.Value(`{"url": "http://127.0.0.1:1/x", "method": "POST", "headers": {}, "body_format": "text", ` +
+	raw := jsontext.Value(`{"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", ` +
 		`"timeout": "1s", "success_status": [200], "max_response_bytes": 16, ` +
 		`"events": {"run_finished": "{{ .Run"}, "payload": "x"}`)
 	if err := testRegistry(t).Check("notifier", "webhook", raw); err == nil {
@@ -546,7 +546,7 @@ func TestSpanRuleIsRefusedOffline(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			raw, err := json.Marshal(map[string]any{
-				"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+				"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": map[string]string{},
 				"body_format": "text", "timeout": "1s", "success_status": []int{200}, "max_response_bytes": 16,
 				"events":  map[string]string{"run_finished": tc.message},
 				"payload": "{{ .Text }}",
@@ -806,7 +806,7 @@ func TestYAMLBodyDropsEmptyLinesAndSendsJSON(t *testing.T) {
 // call at the request timeout, response body included.
 func TestAttemptTimeoutIsTheConfiguredTimeout(t *testing.T) {
 	n := build(t, map[string]any{
-		"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+		"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": map[string]string{},
 		"body_format": "text", "timeout": "7s", "success_status": []int{200}, "max_response_bytes": 16,
 		"events": map[string]string{"run_started": "started"}, "payload": "{{ .Text }}",
 	})
@@ -880,7 +880,7 @@ func TestValidateRendersEveryEventOffline(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			raw, err := json.Marshal(map[string]any{
-				"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+				"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": map[string]string{},
 				"body_format": "text", "timeout": "1s", "success_status": []int{200}, "max_response_bytes": 16,
 				"events": tc.events, "payload": "{{ .Text }}",
 			})
@@ -928,7 +928,7 @@ func TestValidateRefusesABodyThatIsNotItsFormat(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			raw, err := json.Marshal(map[string]any{
-				"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+				"url": "http://127.0.0.1:1/x", "endpoint_templates": false, "method": "POST", "headers": map[string]string{},
 				"body_format": tc.format, "timeout": "1s", "success_status": []int{200}, "max_response_bytes": 16,
 				"events": map[string]string{"run_finished": "Backup {{ .Run.Outcome }}"}, "payload": tc.payload,
 			})
@@ -957,21 +957,21 @@ func TestConfigValidation(t *testing.T) {
 		}
 		return string(raw)
 	}
-	const rest = `"method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", ` +
+	const rest = `"endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", ` +
 		`"success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}"`
 	cases := map[string]string{
 		"no url":                  `{` + rest + `, "events": {}}`,
 		"non-http url":            `{"url": "ftp://x/", ` + rest + `, "events": {}}`,
-		"bad method":              `{"url": "http://x/", "method": "TRACE", ` + `"headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
-		"bad body format":         `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "json", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
-		"no timeout":              `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
-		"empty success_status":    `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
-		"success status not http": `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [999], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
-		"success status twice":    `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200, 200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
-		"zero max response":       `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 0, "payload": "{{ .Text }}", "events": {}}`,
-		"max response too large":  `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": "2MiB", "payload": "{{ .Text }}", "events": {}}`,
-		"no events":               `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}"}`,
-		"an empty message":        `{"url": "http://x/", "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {"run_started": ""}}`,
+		"bad method":              `{"url": "http://x/", "endpoint_templates": false, "method": "TRACE", ` + `"headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
+		"bad body format":         `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "json", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
+		"no timeout":              `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
+		"empty success_status":    `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
+		"success status not http": `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [999], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
+		"success status twice":    `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200, 200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {}}`,
+		"zero max response":       `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 0, "payload": "{{ .Text }}", "events": {}}`,
+		"max response too large":  `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": "2MiB", "payload": "{{ .Text }}", "events": {}}`,
+		"no events":               `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}"}`,
+		"an empty message":        `{"url": "http://x/", "endpoint_templates": false, "method": "POST", "headers": {}, "body_format": "text", "timeout": "1s", "success_status": [200], "max_response_bytes": 16, "payload": "{{ .Text }}", "events": {"run_started": ""}}`,
 	}
 	r := testRegistry(t)
 	for name, raw := range cases {

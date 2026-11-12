@@ -39,6 +39,11 @@ func StagedChainFile(dir, name string) string {
 type StagedRecord struct {
 	Ext   string                `json:"ext"`
 	Chain []model.ProcessorStep `json:"chain"`
+	// Warnings are the stage's own coded, non-fatal findings about these bytes
+	// — a credential exception the source type published. The run side carries
+	// them into the artifact and the report; a record without them decodes, so
+	// an older stage's record keeps working.
+	Warnings []model.Warning `json:"warnings,omitempty"`
 }
 
 // StagedArtifactName is the exact file name of the artifact one record
@@ -83,6 +88,76 @@ type SourceTraits struct {
 	// in the run manifest and compared against a restore target; it must carry
 	// no credentials.
 	Origin string
+	// Credentials is true when the bytes carry credential content — a cluster
+	// token, role settings that can hold secrets — and must therefore be sealed
+	// before they leave the process. A deployment cannot declare it: only the
+	// source's own code knows what its bytes are.
+	Credentials bool
+	// Warnings are coded, non-fatal facts the source already knows about its
+	// bytes — a staged record's carried-forward credential warning. They reach
+	// the artifact and the run report; they never fail the artifact.
+	Warnings []model.Warning
+}
+
+// CredentialWarningCode is the code of the one non-fatal warning a plaintext
+// credential artifact carries: bytes that carry credentials and no sealing step
+// in front of them.
+const CredentialWarningCode = "source.credentials.unsealed"
+
+// CredentialVerdict says how a run treats artifact bytes that carry credentials
+// while nothing in the pipeline seals them.
+type CredentialVerdict string
+
+const (
+	// CredentialRefuse is the zero verdict and the rule for every source: bytes
+	// that carry credentials are refused before the first one is read. Leaking a
+	// token or a role setting is not a degraded backup.
+	CredentialRefuse CredentialVerdict = ""
+	// CredentialWarn is a published exception a source type may answer for
+	// configs it already shipped: the run proceeds and records a coded warning
+	// on the artifact. A deployment cannot select it — only the plugin's own
+	// code answers it — and it never softens the secret-sensitivity rule.
+	CredentialWarn CredentialVerdict = "warn"
+)
+
+// CredentialPolicy is an optional capability of a Source instance: the verdict
+// on its own credential bytes when the artifact is not sealed. A source without
+// it — or answering errors.ErrUnsupported — is refused. One attempt per call:
+// retries are execution's.
+type CredentialPolicy interface {
+	CredentialPolicy(ctx context.Context) (CredentialVerdict, error)
+}
+
+// CredentialDecision is the pure decision about one artifact's credential
+// bytes: the warning a run records, or the reason it refuses before the first
+// byte. Both the offline assembly and the runtime producer call this one
+// function, so a configuration validate accepts is one a run does not refuse.
+type CredentialDecision struct {
+	Warning model.Warning
+	Refused string
+}
+
+// DecideCredentials decides one artifact's credential bytes from facts only:
+// what the source said its bytes are, whether anything seals them, and the
+// source type's own verdict. The secret-sensitivity rule is the producer's and
+// is not repeated here; this decides only what an artifact's credential content
+// adds. A source that reports no credential content, or bytes that are sealed,
+// has nothing to decide.
+func DecideCredentials(artifact model.Artifact, traits SourceTraits, sealed bool, verdict CredentialVerdict) CredentialDecision {
+	if !traits.Credentials || sealed {
+		return CredentialDecision{}
+	}
+	if verdict == CredentialWarn {
+		return CredentialDecision{Warning: model.Warning{
+			Code: CredentialWarningCode,
+			Message: fmt.Sprintf("artifact %s carries credentials and its pipeline has no sealing processor: "+
+				"the source type keeps its published plaintext configuration working, and anyone who can read the storage can read the credentials",
+				artifact.Name),
+		}}
+	}
+	return CredentialDecision{Refused: fmt.Sprintf(
+		"artifact %s carries credentials and its pipeline has no sealing processor: refusing before the first byte",
+		artifact.Name)}
 }
 
 // Source produces one artifact. Name, group, importance and sensitivity of the

@@ -20,12 +20,13 @@ import (
 )
 
 type (
-	fakeSource    = assemblytest.Source
-	fakeProcessor = assemblytest.Processor
-	fakeDiscovery = assemblytest.Discovery
-	fakeNotifier  = assemblytest.Notifier
-	fakeCatalog   = assemblytest.Catalog
-	chainSource   = assemblytest.ChainSource
+	fakeSource       = assemblytest.Source
+	fakeProcessor    = assemblytest.Processor
+	fakeDiscovery    = assemblytest.Discovery
+	fakeNotifier     = assemblytest.Notifier
+	fakeCatalog      = assemblytest.Catalog
+	chainSource      = assemblytest.ChainSource
+	credentialSource = assemblytest.CredentialSource
 )
 
 // world is the kit world plus this package's construction entry points.

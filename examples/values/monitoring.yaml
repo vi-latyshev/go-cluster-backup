@@ -1,0 +1,29 @@
+# Values for examples/config/monitoring.yaml — minimal backup plus a webhook
+# notifier that pushes run metrics to a Prometheus Pushgateway.
+#
+#   helm install backup oci://ghcr.io/vi-latyshev/charts/go-cluster-backup \
+#     --namespace backup --create-namespace \
+#     -f examples/values/monitoring.yaml \
+#     --set-file config=examples/config/monitoring.yaml
+#
+# The rules over the pushed series and the cluster's Job/pod signals are in
+# examples/monitoring/.
+
+# The config's run.lease_hard_bound is 4200s.
+activeDeadlineSeconds: 4200
+
+catalog:
+  # Matches catalog.config.name in examples/config/monitoring.yaml.
+  name: go-cluster-backup-catalog
+
+secretMounts:
+  # The storage credentials the configuration references. The Pushgateway
+  # grouping label is literal in this writer's config; a receiver that needs a
+  # credential in the URL or a header uses `endpoint_templates: true` and gets
+  # its own mount here.
+  - secretName: cluster-backup-s3
+    mountPath: /run/secrets/s3
+
+rbac:
+  secretNames:
+    - cluster-backup-s3

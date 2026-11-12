@@ -41,17 +41,20 @@ type fakeS3 struct {
 	dropInitiated map[string]bool
 	// stuckUploads makes ListMultipartUploads answer truncated with the markers
 	// it was asked for, echoing them: a page that never moves forward.
-	stuckUploads    bool
-	head403         bool // HEAD answers 403 instead of 404 — a proxy hiding existence
-	listForeign     bool // a listing answer carries a key outside the storage root
-	createNoID      bool // CreateMultipartUpload answers without an upload id
-	partNoETag      bool // UploadPart answers 200 without an ETag
-	uploadsForeign  bool // ListMultipartUploads answers with a foreign upload
-	getStall        bool // GetObject sends half the body, then waits for the client to go
-	hang            map[string]bool
-	completeDrop    bool // CompleteMultipartUpload answers 200 and commits nothing
-	sawChunked      bool
-	sawStorage      string
+	stuckUploads   bool
+	head403        bool // HEAD answers 403 instead of 404 — a proxy hiding existence
+	listForeign    bool // a listing answer carries a key outside the storage root
+	createNoID     bool // CreateMultipartUpload answers without an upload id
+	partNoETag     bool // UploadPart answers 200 without an ETag
+	uploadsForeign bool // ListMultipartUploads answers with a foreign upload
+	getStall       bool // GetObject sends half the body, then waits for the client to go
+	hang           map[string]bool
+	completeDrop   bool // CompleteMultipartUpload answers 200 and commits nothing
+	sawChunked     bool
+	sawStorage     string
+	// createStorage is the class CreateMultipartUpload declared, exactly as the
+	// request carried it: empty means no header was sent.
+	createStorage   string
 	sawUnsigned     int
 	sawUploadPrefix string          // the prefix ListMultipartUploads was asked for
 	addrs           map[string]bool // one entry per client connection the server saw
@@ -172,7 +175,7 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	case "delete":
 		f.delete(w, key)
 	case "create":
-		f.create(w, key)
+		f.create(w, r, key)
 	case "part":
 		f.part(w, r, idOf(q))
 	case "complete":
@@ -359,11 +362,12 @@ func (f *fakeS3) delete(w http.ResponseWriter, key string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (f *fakeS3) create(w http.ResponseWriter, key string) {
+func (f *fakeS3) create(w http.ResponseWriter, r *http.Request, key string) {
 	f.mu.Lock()
 	f.nextID++
 	id := fmt.Sprintf("upload-%d", f.nextID)
 	noID := f.createNoID
+	f.createStorage = r.Header.Get("X-Amz-Storage-Class")
 	f.uploads[id] = &fakeUpload{key: key, parts: map[int32][]byte{}, etags: map[int32]string{}, initiated: time.Now().UTC()}
 	f.mu.Unlock()
 	answer := id

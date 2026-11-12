@@ -53,3 +53,45 @@ func TestPrintRunReportOfAStage(t *testing.T) {
 		t.Errorf("stage summary = %q", got)
 	}
 }
+
+// TestReviewRunSummaryShowsCredentialWarning is the review's counterexample:
+// the closing block names the run's coded warnings and each artifact's own, so
+// a plaintext credential backup never reads as a clean summary.
+func TestReviewRunSummaryShowsCredentialWarning(t *testing.T) {
+	rep := model.RunReport{
+		RunID: "r1", Kind: model.RunKindScheduled, Outcome: model.OutcomeDelivered,
+		Warnings: []model.Warning{{Code: "catalog.settle.failed", Message: "the catalog write failed"}},
+		Artifacts: []model.ArtifactResult{{
+			Artifact: model.Artifact{Group: "g", Name: "plain"}, Outcome: model.ArtifactOK,
+			Warnings: []model.Warning{{Code: "source.credentials.unsealed", Message: "plaintext credentials"}},
+		}},
+	}
+	var out strings.Builder
+	printRunReport(&out, rep, false)
+	text := out.String()
+	for _, want := range []string{
+		"catalog.settle.failed", "the catalog write failed",
+		"source.credentials.unsealed", "plaintext credentials", "g/plain",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the summary does not carry %q:\n%s", want, text)
+		}
+	}
+}
+
+// TestReviewStageSummaryShowsCredentialWarning: the stage summary (no run id)
+// renders the same artifact warning.
+func TestReviewStageSummaryShowsCredentialWarning(t *testing.T) {
+	rep := model.RunReport{
+		Outcome: model.OutcomeDelivered,
+		Artifacts: []model.ArtifactResult{{
+			Artifact: model.Artifact{Group: "control-plane", Name: "state"}, Outcome: model.ArtifactOK,
+			Warnings: []model.Warning{{Code: "source.credentials.unsealed", Message: "plaintext credentials"}},
+		}},
+	}
+	var out strings.Builder
+	printRunReport(&out, rep, false)
+	if text := out.String(); !strings.Contains(text, "source.credentials.unsealed") {
+		t.Errorf("the stage summary does not carry the warning:\n%s", text)
+	}
+}
