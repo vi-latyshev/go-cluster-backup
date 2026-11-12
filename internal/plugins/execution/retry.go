@@ -43,6 +43,22 @@ func (o Options) backoff(attempt int) time.Duration {
 // Attempt runs fn until it succeeds, the error is permanent, or attempts run
 // out. Cancellation is terminal: nothing is retried after the context ends.
 func Attempt[T any](ctx context.Context, o Options, what string, fn func(ctx context.Context, attempt int) (T, error)) (T, error) {
+	return attempt(ctx, o, what, -1, fn)
+}
+
+// AttemptWithin is Attempt for a caller with a deadline it must not run past,
+// such as the finished notification's window: a retry starts only while its
+// wait plus bound — the upper bound of one call — still ends before the
+// context's deadline. When the next retry no longer fits, the wait is skipped
+// and the last attempt's error is returned at once. A bound of 0 fits any call
+// that starts before the deadline; a negative bound is no check at all.
+func AttemptWithin[T any](ctx context.Context, o Options, what string, bound time.Duration, fn func(ctx context.Context, attempt int) (T, error)) (T, error) {
+	return attempt(ctx, o, what, bound, fn)
+}
+
+// attempt is the one retry loop both entry points share: bound < 0 skips the
+// fit check, a bound of zero checks the wait alone.
+func attempt[T any](ctx context.Context, o Options, what string, bound time.Duration, fn func(ctx context.Context, attempt int) (T, error)) (T, error) {
 	var zero T
 	for n := 1; ; n++ {
 		v, err := fn(ctx, n)
@@ -72,6 +88,21 @@ func Attempt[T any](ctx context.Context, o Options, what string, fn func(ctx con
 			}
 		} else {
 			after = o.backoff(n)
+		}
+		// The fit check comes before the wait is announced or slept: a retry
+		// whose wait plus its own bound would cross the caller's deadline is
+		// not started, and the deadline never cuts a call the caller budgeted
+		// for.
+		if dl, ok := ctx.Deadline(); ok && bound >= 0 && time.Until(dl) < after+bound {
+			if o.Log != nil {
+				// The stop is part of the story, for the same reason the retry
+				// is: an attempt count short of run.retry.attempts must have a
+				// reason in the log.
+				o.Log.Info("retry.skipped", slog.Any("event", human.Warning("retry.skipped",
+					human.Text("what", what), human.Count("attempt", int64(n)),
+					human.Duration("wait", after), human.Duration("left", time.Until(dl)))))
+			}
+			return zero, err
 		}
 		if o.Log != nil {
 			// A retry is part of the story the log tells, not a debug detail:

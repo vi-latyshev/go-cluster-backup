@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog"
@@ -83,10 +84,59 @@ func TestLeaserRefusesAHeldClaimAndTakesOverOnItsExactToken(t *testing.T) {
 	}
 }
 
-// TestLeaserKeepsTheRecordsUncertainty: the record's uncertainty outlives every
-// holder — the caller hands it the pending set it wants recorded, a release
-// keeps it, an acquisition inherits it, and only the claim's own holder can
-// rewrite or clear it.
+// TestLeaserBoundsOneRecordWrite: the fake reports its configured write bound
+// and holds a mark or a clear for WriteHold, released by the caller's
+// cancellation. A hold has no socket behind it, so the waits run on virtual
+// time, and synctest.Wait proves the clear entered the hold before it is
+// cancelled.
+func TestLeaserBoundsOneRecordWrite(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		l := NewLeaser()
+		l.WriteBound = 30 * time.Second
+		if got := l.WriteTimeout(); got != 30*time.Second {
+			t.Fatalf("WriteTimeout() = %s, want the configured 30s", got)
+		}
+		ctx := context.Background()
+		first, err := l.Acquire(ctx, catalog.LeaseRequest{Holder: "run-a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := first
+		pending.Uncertainty = &catalog.Uncertainty{RunIDs: []string{"run-a"}, Since: leaseBase}
+		l.WriteHold = 20 * time.Millisecond
+		start := time.Now()
+		if err := l.MarkUncertainty(ctx, pending); err != nil {
+			t.Fatal(err)
+		}
+		if took := time.Since(start); took < 20*time.Millisecond {
+			t.Fatalf("MarkUncertainty returned in %s, want it held for WriteHold", took)
+		}
+
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		if err := l.ClearUncertainty(cancelled, first); err == nil {
+			t.Fatal("a cancelled context did not stop the held clear")
+		}
+		if unc := l.Uncertainty(); unc == nil {
+			t.Fatal("the cancelled clear removed the uncertainty")
+		}
+
+		// A cancellation while the hold is in flight releases it.
+		l.WriteHold = time.Hour
+		inflight, stop := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- l.ClearUncertainty(inflight, first) }()
+		synctest.Wait() // the clear is blocked in the hold
+		stop()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("the in-flight clear = %v, want the cancellation", err)
+		}
+		if unc := l.Uncertainty(); unc == nil {
+			t.Fatal("the cancelled in-flight clear removed the uncertainty")
+		}
+	})
+}
+
 func TestLeaserKeepsTheRecordsUncertainty(t *testing.T) {
 	l := NewLeaser()
 	ctx := context.Background()

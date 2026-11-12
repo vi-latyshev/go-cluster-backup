@@ -14,7 +14,7 @@ func TestBuildReporterInstallsAValidReporter(t *testing.T) {
 			"api_host_env": "KUBERNETES_SERVICE_HOST", "api_port_env": "KUBERNETES_SERVICE_PORT",
 			"token_file":      "/var/run/secrets/kubernetes.io/serviceaccount/token",
 			"ca_file":         "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-			"request_timeout": "30s", "namespace_env": "POD_NAMESPACE", "pod_env": "POD_NAME",
+			"request_timeout": "30s", "walk_timeout": "30s", "namespace_env": "POD_NAMESPACE", "pod_env": "POD_NAME",
 		},
 	}}
 	e := w.newAssembly(t, cfg)

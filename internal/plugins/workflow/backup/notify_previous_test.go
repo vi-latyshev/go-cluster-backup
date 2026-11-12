@@ -56,20 +56,12 @@ func TestNotifySkipsANotifierWhoseCheckFailed(t *testing.T) {
 }
 
 // TestPreviousSkipsAFailedSurveyAndRendersTheRecord: a storage whose survey
-// failed answers for no run, and the run log names the unavailable and failed
-// previous Job exactly as the record carries them.
+// failed answers for no run, and the run log names the unavailable status, the
+// previous Job's failure and the own Job's failed earlier attempts exactly as
+// the record carries them.
 func TestPreviousSkipsAFailedSurveyAndRendersTheRecord(t *testing.T) {
-	reporter, err := reporting.New(context.Background(), reporting.Config{
-		APIHostEnv: "GCB_PREV_HOST", APIPortEnv: "GCB_PREV_PORT",
-		TokenFile: "/var/run/secrets/token", CAFile: "/var/run/secrets/ca.crt",
-		RequestTimeout: model.Duration(time.Second),
-		NamespaceEnv:   "GCB_PREV_NAMESPACE", PodEnv: "GCB_PREV_POD",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var buf bytes.Buffer
-	w := &Workflow{reporter: reporter, log: slog.New(human.NewHandler(&buf, slog.LevelInfo))}
+	w := &Workflow{log: slog.New(human.NewHandler(&buf, slog.LevelInfo))}
 	at := time.Now().UTC()
 	order := []*storageBinding{{name: "broken"}, {name: "alpha"}}
 	surveys := map[string]inventory.Survey{
@@ -81,17 +73,25 @@ func TestPreviousSkipsAFailedSurveyAndRendersTheRecord(t *testing.T) {
 			},
 		}},
 	}
-	prev := reporter.Previous(context.Background(), surveyedRuns(order, surveys))
+	job := model.PreviousRun{
+		Unavailable: "the status grant is missing",
+		Failure:     &model.PreviousFailure{Job: "backup-20261009", Reason: "OOMKilled"},
+		Attempts:    &model.AttemptFailure{Job: "backup-20261010", Failed: 2, Deleted: 1},
+	}
+	prev := reporting.Previous(job, surveyedRuns(order, surveys))
 	if prev.RunID != "20261010T042000Z" || prev.Unfinished {
 		t.Fatalf("previous %+v, want the delivered run of the readable storage", prev)
 	}
-	w.reportPrevious(model.PreviousRun{
-		RunID: "20261010T042000Z", Unfinished: true,
-		Unavailable: "the status grant is missing",
-		Failure:     &model.PreviousFailure{Job: "backup-20261009", Reason: "OOMKilled"},
-	})
+	if prev.Failure == nil || prev.Failure.Job != "backup-20261009" {
+		t.Fatalf("the cluster half is not in the answer: %+v", prev)
+	}
+	w.reportPrevious(prev)
+	w.reportPreviousJob(job)
 	log := buf.String()
-	for _, want := range []string{"the status grant is missing", "backup-20261009", "OOMKilled"} {
+	for _, want := range []string{
+		"20261010T042000Z", "the status grant is missing", "backup-20261009", "OOMKilled",
+		"backup-20261010",
+	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("the run log lacks %q:\n%s", want, log)
 		}

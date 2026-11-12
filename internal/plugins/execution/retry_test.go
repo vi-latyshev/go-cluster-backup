@@ -253,6 +253,7 @@ func TestSafeCallRecoversAPanic(t *testing.T) {
 	}
 }
 
+// TestSafeValueRecoversAPanic: a panicking value call is a permanent error.
 func TestSafeValueRecoversAPanic(t *testing.T) {
 	_, err := SafeValue(func() (int, error) { panic("value boom") })
 	if err == nil || !strings.Contains(err.Error(), "value boom") {
@@ -260,5 +261,139 @@ func TestSafeValueRecoversAPanic(t *testing.T) {
 	}
 	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
 		t.Fatalf("a recovered panic must be permanent, got %q", class)
+	}
+}
+
+// slowTransient is a call that takes ten seconds and fails transiently.
+func slowTransient(context.Context, int) (struct{}, error) {
+	time.Sleep(10 * time.Second)
+	return struct{}{}, pluginerrors.Transient(errors.New("slow down"))
+}
+
+// TestAttemptWithinStopsBeforeTheDeadline: a retry whose wait plus one call's
+// bound would cross the caller's deadline is not started — the last error comes
+// back at once — while Attempt keeps the ladder and is cut by the deadline
+// itself. With attempts at t=0, 15s and 35s (each call taking 10s), the bounded
+// ladder returns the transient error at t=45s and the unbounded one sleeps into
+// t=60s and returns the deadline.
+func TestAttemptWithinStopsBeforeTheDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		o := Options{Attempts: 4, Initial: 5 * time.Second, Max: 40 * time.Second,
+			Unclassified: pluginerrors.ClassTransient}
+		run := func(within bool) (calls int, took time.Duration, err error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			start := time.Now()
+			fn := func(ctx context.Context, _ int) (struct{}, error) {
+				calls++
+				return slowTransient(ctx, 0)
+			}
+			if within {
+				_, err = AttemptWithin(ctx, o, "t", 10*time.Second, fn)
+			} else {
+				_, err = Attempt(ctx, o, "t", fn)
+			}
+			return calls, time.Since(start), err
+		}
+
+		calls, took, err := run(true)
+		if calls != 3 || took != 45*time.Second {
+			t.Fatalf("AttemptWithin made %d calls and returned at %s, want 3 calls at 45s", calls, took)
+		}
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
+			t.Fatalf("AttemptWithin returned %v (%q), want the last transient error", err, class)
+		}
+
+		calls, took, err = run(false)
+		if calls != 3 || took != 60*time.Second {
+			t.Fatalf("Attempt made %d calls and returned at %s, want 3 calls cut at 60s", calls, took)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Attempt returned %v, want the deadline", err)
+		}
+	})
+}
+
+// TestAttemptWithinWithABoundOfZeroChecksTheWaitAlone: without a per-call bound
+// the retry stops once the wait itself no longer fits, so a fast-failing call
+// ends at t=15s instead of sleeping into the 30s deadline.
+func TestAttemptWithinWithABoundOfZeroChecksTheWaitAlone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		o := Options{Attempts: 4, Initial: 5 * time.Second, Max: 40 * time.Second,
+			Unclassified: pluginerrors.ClassTransient}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		start := time.Now()
+		calls := 0
+		_, err := AttemptWithin(ctx, o, "t", 0, func(context.Context, int) (struct{}, error) {
+			calls++
+			return struct{}{}, pluginerrors.Transient(errors.New("fast failure"))
+		})
+		if calls != 3 || time.Since(start) != 15*time.Second {
+			t.Fatalf("%d calls after %s, want 3 calls at 15s", calls, time.Since(start))
+		}
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
+			t.Fatalf("err = %v (%q), want the last transient error", err, class)
+		}
+	})
+}
+
+// TestAttemptWithinWithoutADeadlineRetriesEveryAttempt: no deadline means
+// nothing to fit against, so the ladder is Attempt's.
+func TestAttemptWithinWithoutADeadlineRetriesEveryAttempt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		o := Options{Attempts: 4, Initial: time.Second, Max: 2 * time.Second,
+			Unclassified: pluginerrors.ClassTransient}
+		calls := 0
+		_, err := AttemptWithin(context.Background(), o, "t", time.Hour, func(context.Context, int) (struct{}, error) {
+			calls++
+			return struct{}{}, pluginerrors.Transient(errors.New("later"))
+		})
+		if calls != 4 || err == nil {
+			t.Fatalf("%d calls, err %v; want all four", calls, err)
+		}
+	})
+}
+
+// TestAttemptWithinDoesNotWaitOutAHintThatCannotFit: a RetryAfter hint above the
+// remaining window returns at once, never sleeping into the deadline.
+func TestAttemptWithinDoesNotWaitOutAHintThatCannotFit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		o := Options{Attempts: 4, Initial: time.Second, Max: 2 * time.Second,
+			Unclassified: pluginerrors.ClassTransient}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		calls := 0
+		_, err := AttemptWithin(ctx, o, "t", 0, func(context.Context, int) (struct{}, error) {
+			calls++
+			return struct{}{}, pluginerrors.RetryAfter(errors.New("slow down"), time.Minute)
+		})
+		if calls != 1 || err == nil {
+			t.Fatalf("%d calls, err %v; want the one attempt's error", calls, err)
+		}
+	})
+}
+
+// TestAttemptWithinLogsTheSkippedRetry: the ladder stopped short of
+// run.retry.attempts has a reason in the log, like every retry it made.
+func TestAttemptWithinLogsTheSkippedRetry(t *testing.T) {
+	var logged bytes.Buffer
+	o := Options{Attempts: 2, Initial: time.Minute, Max: time.Minute,
+		Unclassified: pluginerrors.ClassTransient,
+		Log:          slog.New(slog.NewTextHandler(&logged, nil))}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	calls := 0
+	_, err := AttemptWithin(ctx, o, "notify ops", 0, func(context.Context, int) (struct{}, error) {
+		calls++
+		return struct{}{}, pluginerrors.Transient(errors.New("receiver down"))
+	})
+	if calls != 1 || err == nil {
+		t.Fatalf("%d calls, err %v; want the one attempt's error", calls, err)
+	}
+	for _, want := range []string{"retry.skipped", "notify ops"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Fatalf("log %q does not carry %q", logged.String(), want)
+		}
 	}
 }

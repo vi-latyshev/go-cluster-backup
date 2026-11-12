@@ -19,6 +19,7 @@ func validConfig() reporting.Config {
 		APIHostEnv: "GCB_TEST_HOST", APIPortEnv: "GCB_TEST_PORT",
 		TokenFile: "/var/run/secrets/token", CAFile: "/var/run/secrets/ca.crt",
 		RequestTimeout: model.Duration(30 * time.Second),
+		WalkTimeout:    model.Duration(30 * time.Second),
 		NamespaceEnv:   "GCB_TEST_NAMESPACE", PodEnv: "GCB_TEST_POD",
 	}
 }
@@ -42,6 +43,7 @@ func TestConfigValidate(t *testing.T) {
 		{name: "empty CA file", mutate: func(c *reporting.Config) { c.CAFile = "" }, want: "/ca_file is empty"},
 		{name: "relative CA file", mutate: func(c *reporting.Config) { c.CAFile = "ca.crt" }, want: "/ca_file \"ca.crt\" must be absolute"},
 		{name: "timeout", mutate: func(c *reporting.Config) { c.RequestTimeout = 0 }, want: "/request_timeout must be positive"},
+		{name: "walk timeout", mutate: func(c *reporting.Config) { c.WalkTimeout = 0 }, want: "/walk_timeout must be positive"},
 		{name: "namespace env", mutate: func(c *reporting.Config) { c.NamespaceEnv = "" }, want: "/namespace_env is empty"},
 		{name: "pod env", mutate: func(c *reporting.Config) { c.PodEnv = "" }, want: "/pod_env is empty"},
 	} {

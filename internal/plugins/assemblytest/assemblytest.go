@@ -576,16 +576,48 @@ type Notifier struct {
 	Fails    int    // fail this many calls, then succeed
 	FailOn   string // fail every call for this event name, whatever Fails says
 	CheckErr error
+	// Hold makes every call wait this long, or the call's cancellation,
+	// before its answer: a receiver that takes the whole attempt bound.
+	Hold time.Duration
+	// Bound is what AttemptTimeout reports: the upper bound of one call.
+	Bound time.Duration
+	// calls counts the calls per event name, rejected ones included: what
+	// proves how many attempts the run's retry ladder made.
+	calls map[string]int
 }
 
 func (n *Notifier) Check(context.Context) error { return n.CheckErr }
 
-func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
+// AttemptTimeout is the optional notifier.Bounded capability.
+func (n *Notifier) AttemptTimeout() time.Duration { return n.Bound }
+
+// Calls answers how many calls this notifier saw for one event name.
+func (n *Notifier) Calls(name string) int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if Err := ctx.Err(); Err != nil {
-		return Err
+	return n.calls[name]
+}
+
+func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
+	n.mu.Lock()
+	if n.calls == nil {
+		n.calls = map[string]int{}
 	}
+	n.calls[ev.Name]++
+	hold := n.Hold
+	n.mu.Unlock()
+	if hold > 0 {
+		select {
+		case <-time.After(hold):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.FailOn == ev.Name {
 		return errors.New("test notifier failure")
 	}

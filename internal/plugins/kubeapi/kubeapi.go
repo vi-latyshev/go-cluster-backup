@@ -208,11 +208,15 @@ type ContainerWaiting struct {
 }
 
 // Job is a batch/v1 Job, as far as reading why a previous run failed needs it:
-// its owner (the CronJob) and its conditions.
+// its owner (the CronJob), its conditions and its failed-pod count. Failed
+// still counts a pod that was deleted afterwards — the tracking finalizer is
+// removed only after the pod is accounted in the status — which is what makes a
+// drained attempt visible.
 type Job struct {
 	Metadata ObjectMeta `json:"metadata"`
 	Status   struct {
 		Conditions []JobCondition `json:"conditions"`
+		Failed     int            `json:"failed"`
 	} `json:"status"`
 }
 

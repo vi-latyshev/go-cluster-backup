@@ -251,10 +251,12 @@ found" while some storage answers.
 
 When a night fails before the tool even starts (a rejected init container, an
 `ImagePullBackOff`, a deadline, an OOMKill), there is no run to list at all: the
-next run's notification reports that failure from the cluster, via
-`.Run.Previous.Failure`.
+next run reports that failure from the cluster — in its `run_started` and its
+`run_finished` — via `.Run.Previous.Failure`, and the failed earlier attempts of
+its own retried Job via `.Run.Previous.Attempts`.
 
 Reports are `run_started` and `run_finished`; no heartbeat or periodic self-check
-runs. Only the finished event carries `.Run.Previous`, from storage manifests and
-previous Job status via `reporting`. The catalog holds only the lease. Monitor
-Jobs independently.
+runs. Both events carry the cluster half of `.Run.Previous` — read once right
+after the writer-lease decision — while the storage half (the previous run id,
+unfinished and last-good, from storage manifests) exists only for
+`run_finished`. The catalog holds only the lease. Monitor Jobs independently.

@@ -871,6 +871,29 @@ func TestM7_BeginWithoutObserverRefuses(t *testing.T) {
 	}
 }
 
+// TestR2_PendingRemovalBoundIsTheCatalogsWriteTimeout: the finish window reserves
+// the catalog's own upper bound for one record write, and nothing without the
+// capability.
+func TestR2_PendingRemovalBoundIsTheCatalogsWriteTimeout(t *testing.T) {
+	bounded := &scripted{}
+	bounded.WriteBound = 30 * time.Second
+	if got := testLease(bounded, nil).PendingRemovalBound(); got != 30*time.Second {
+		t.Fatalf("PendingRemovalBound() = %s, want the catalog's 30s write bound", got)
+	}
+	plain := plainCatalog{inner: catalogtest.NewLeaser()}
+	if _, ok := any(plain).(catalog.WriteBounded); ok {
+		t.Fatal("the plain catalog reports a write bound")
+	}
+	if got := testLease(plain, nil).PendingRemovalBound(); got != 0 {
+		t.Fatalf("PendingRemovalBound() = %s, want 0 without the capability", got)
+	}
+	// A free lease over a bounded catalog still answers the bound: the reserve is
+	// the catalog's property, not the claim's.
+	if got := testLease(bounded, nil).PendingRemovalBound(); got != 30*time.Second {
+		t.Fatalf("PendingRemovalBound() without a claim = %s, want 30s", got)
+	}
+}
+
 // TestR2_M14_RemoveOwnPendingKeepsInheritedPrefixes: a settled successor durably
 // drops only its own id; the inherited pending prefix and the recorded digest
 // survive.

@@ -481,6 +481,18 @@ func (l *Lease) invalidateBrokenObservation(ctx context.Context) {
 	l.clean, l.completed = true, ""
 }
 
+// PendingRemovalBound is the upper bound of one durable record write — the
+// catalog's own WriteTimeout — or 0 when the catalog cannot bound one. The
+// workflow reserves it out of the finish window before the removal of this
+// run's pending id.
+func (l *Lease) PendingRemovalBound() time.Duration {
+	bounded, ok := l.o.Catalog.(catalog.WriteBounded)
+	if !ok {
+		return 0
+	}
+	return bounded.WriteTimeout()
+}
+
 // RemoveOwnPending durably removes this holder's own id from the record's
 // pending set after its writes have a terminal proof. Inherited ids stay, and
 // the record's digest and Since are kept because the digest covers only the

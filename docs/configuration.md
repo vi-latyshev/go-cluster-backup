@@ -344,14 +344,36 @@ rounded SI reading.
 its keys are the receiver's own. `body_format: yaml` drops the empty rendered
 lines, reads the rest as a YAML document and sends its JSON encoding; `text`
 sends the render as it is. `validate` renders every event and the payload
-against a matrix of built-in sample runs — started without previous-run data;
-finished delivered, degraded and failed, with and without previous-run data,
-exclusions, artifacts and storages, both run kinds, a manual run refused by a cap
-and one refused the writer lease — so a template that only fits one night is
-refused offline. `.Run.Previous` is populated only for `run_finished`; it is
-empty for `run_started`. The `reporting` plugin derives it from storage manifests
-and the previous Job's status, including pre-start failures
-(`.Run.Previous.Failure`). A storage's `CapExceeded`, `CapLimitBytes` and
+against a matrix of built-in sample runs — started and finished, each with a
+previous Job failure, failed earlier attempts and an unreadable cluster status;
+delivered, degraded and failed; with and without the storage half; exclusions,
+artifacts and storages; both run kinds; a manual run refused by a cap and one
+refused the writer lease — so a template that only fits one night is refused
+offline.
+
+`.Run.Previous` has two halves. The cluster half — `Failure` (the previous Job,
+with `Consecutive`: how many Jobs of the CronJob failed in a row, as far as the
+cluster keeps them), `Attempts` (failed earlier attempts of this run's own Job:
+`Failed`, the Job's own count; `Deleted`, attempts that left no pod — a drain or
+a deletion, known only from a complete pod listing; `Pods`, each with the pod's
+own reason (`Evicted`) and its containers) and `Unavailable` — is read once per
+run, right after the writer lease decision, and goes into both `run_started` and
+`run_finished`. A run
+refused before it starts sends no `run_started`; its `run_finished` still carries
+the cluster half. The storage half (`RunID`, `Unfinished`, `LastGoodAt`) comes
+from storage manifests and exists only for `run_finished`.
+
+`plugins.config.reporting.walk_timeout` bounds the whole walk — every request
+and page; `request_timeout` bounds one request, and a request ends at whichever
+comes first. Shipped 30s each, so `run_started` waits at most 30s for the
+cluster. A read that failed is repeated once at finish, in at most half of the
+window part before the reserve.
+
+A Job created by hand (`kubectl create job --from`) is outside
+`concurrencyPolicy`: the previous Job may still be running when it is read, and
+its later failure is reported by the next run.
+
+A storage's `CapExceeded`, `CapLimitBytes` and
 `CapUsedBytes` and a lease refusal (`.Run.Lease`) reach a template too.
 
 ### Run knobs and budgeting
@@ -359,7 +381,7 @@ and the previous Job's status, including pre-start failures
 | Key | What it bounds |
 |---|---|
 | `run.deadline` | the whole run: the context every artifact and storage call runs under |
-| `run.finish_allowance` | the ending beyond that deadline; the manifests take its first half and are written together, so a storage that stalls on its own manifest costs only its own record, while the finished notification keeps the second half |
+| `run.finish_allowance` | the ending beyond that deadline; the manifests take its first half and are written together, so a storage that stalls on its own manifest costs only its own record, while the finished notification keeps the second half, minus the reserve for the catalog write when this run marked the record. Its retries stop once a wait plus one attempt (a webhook's `timeout`) no longer fits before the window ends |
 | `run.max_artifact_bytes` | one artifact: a source that would produce more is stopped and that artifact fails, so one oversized volume cannot fill the spool |
 | `run.spool_reserve_bytes` | free space kept free in the spool; below it an artifact fails rather than filling the filesystem |
 | `restore.spool_reserve_bytes` | free space kept beyond the object being written to the restore spool, checked before the first byte and during every write |
@@ -462,7 +484,9 @@ created by the deployment, never run history. Its settings are:
 - `api_host_env` and `api_port_env`: environment variables naming the API host
   and port.
 - `token_file` and `ca_file`: ServiceAccount token and API CA bundle paths.
-- `request_timeout`: timeout of one API request.
+- `request_timeout`: timeout of one API request, 15s by default. Twice it is the
+  reserve the finish window keeps for removing this run's pending mark (a read
+  and a patch), at most half the window.
 - `lease_key`: ConfigMap data key for the lease; defaults to `lease.json`.
 
 Previous-run information belongs to `reporting` (see [Message](#message)).
@@ -687,8 +711,9 @@ those names, so a rename is a breaking change. It is pinned by tests
 (`internal/plugins/configuration/template_surface_test.go`, `internal/plugins/layout/layout_surface_test.go`).
 
 - **Fields:** `RunReport`, `ArtifactResult`, `Artifact`, `StorageResult`,
-  `DumpStats`, `Exclusion`, `PreviousRun`, `PreviousFailure`, `ContainerFailure`,
-  `ContainerTermination`, `LeaseState`, `Event`; and the layout data
+  `DumpStats`, `Exclusion`, `PreviousRun`, `PreviousFailure`, `AttemptFailure`,
+  `FailedPod`, `ContainerFailure`, `ContainerTermination`, `LeaseState`,
+  `Event`; and the layout data
   (`Run.ID`, `Run.StartedAt`, `Artifact.Group`, `Artifact.Name`, `Artifact.Ext`).
 - **Functions:** the core set — `json`, `date`, `bytes`, `sibytes`, `duration`,
   `pick` — plus the notifier's own (`blank`, `byGroup`, `failed`, `sumBytes`,

@@ -245,7 +245,7 @@ catalog:
     api_port_env: KUBERNETES_SERVICE_PORT
     token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
     ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-    request_timeout: 30s
+    request_timeout: 15s
     namespace: backup
     name: backup-catalog
 

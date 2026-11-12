@@ -10,66 +10,113 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 )
 
-// PreviousJobFailure reads why the previous Job of this run's own CronJob failed
-// before this tool could report. It walks the ownership chain the cluster
-// records — the caller's pod to its Job, that Job to its CronJob, then the newest
-// OTHER Job of the same CronJob — and reads that Job's Failed condition, its
-// pods' container statuses and its own Warning events (the only record when no
-// pod was ever created). An absent chain returns nil; a read it cannot make is
-// returned as an error the caller surfaces and never acts on.
+// walk reads the cluster's half of the previous-run record. It follows the
+// ownership chain the cluster records — the caller's pod to its Job, that Job
+// to its CronJob — and reads two independent facts:
+//
+//   - the failed earlier attempts of the caller's OWN Job: its status.failed
+//     count and its still-listed failed pods, each with the pod status's own
+//     reason and its containers (see earlierAttempts);
+//   - the newest OTHER Job of the same CronJob: its Failed condition, its
+//     pods' container statuses, its own Warning events and how many Jobs of the
+//     CronJob failed in a row before it (see previousFailure and jobsOf).
+//
+// An absent chain returns nil facts; a read it cannot make is returned as an
+// error the caller surfaces and never acts on. The first error stops the walk,
+// and every fact the reads before it established is returned beside the error:
+// a failed pod listing still leaves the Job's failed count, a failed previous
+// pod listing still leaves the Failed condition and its Consecutive count, and
+// a failed event listing still leaves the failure it explains. The caller marks
+// the record Unavailable and repeats the walk at finish, so a transient error
+// never silently degrades the record to "nothing happened".
 //
 // The caller's identity comes from the configured environment variables: an
 // incomplete identity is not a pod, so there is nothing to inspect — the
 // ordinary case outside a Kubernetes CronJob.
-func (r *Reporter) PreviousJobFailure(ctx context.Context) (*model.PreviousFailure, error) {
+func (r *Reporter) walk(ctx context.Context) (attempts *model.AttemptFailure, failure *model.PreviousFailure, err error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	namespace, pod := r.identity()
 	if namespace == "" || pod == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	client, err := r.clientFor()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	own, err := client.GetPod(ctx, namespace, pod)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	jobName := ownerName(own.Metadata.OwnerReferences, "Job")
 	if jobName == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	job, err := client.GetJob(ctx, namespace, jobName)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	// The own Job's attempts are read before the CronJob is even looked for: a
+	// Job created by hand from a CronJob template still holds them, and a
+	// retried night must not lose why its first attempt died. A failed pod
+	// listing keeps the count the Job itself carries, but proves nothing about
+	// which attempts left a pod: Deleted needs the complete listing.
+	pods, err := client.ListPodsIn(ctx, namespace, kubeapi.ListRequest{
+		Selector: "job-name=" + jobName, PageSize: previousJobPageSize,
+	})
+	if err != nil {
+		return knownAttempts(job), nil, err
+	}
+	attempts = earlierAttempts(job, pods, pod)
 	cronName := ownerName(job.Metadata.OwnerReferences, "CronJob")
 	if cronName == "" {
-		return nil, nil
+		return attempts, nil, nil
 	}
 	jobs, err := client.ListJobs(ctx, namespace, kubeapi.ListRequest{PageSize: previousJobPageSize})
 	if err != nil {
-		return nil, err
+		return attempts, nil, err
 	}
-	previous := newestJobOf(jobs, cronName, jobName)
-	if previous == nil || !jobFailed(*previous) {
-		return nil, nil
+	previous := jobsOf(jobs, cronName, jobName)
+	if len(previous) == 0 || !jobFailed(previous[0]) {
+		return attempts, nil, nil
 	}
-	pods, err := client.ListPodsIn(ctx, namespace, kubeapi.ListRequest{
-		Selector: "job-name=" + previous.Metadata.Name, PageSize: previousJobPageSize,
+	// The Failed condition and the consecutive count are facts of the listing
+	// already read: they stand even when the pods cannot be listed.
+	prev := previous[0]
+	failure = previousFailure(prev, nil)
+	// Consecutive counts the leading failed Jobs of the same CronJob, newest
+	// first, from the one listing already read: as far as failedJobsHistoryLimit
+	// keeps them, which is the only history the cluster holds.
+	failure.Consecutive = consecutiveFailures(previous)
+	// The previous Job's own pods explain it per container; the Job's Warning
+	// events are the only record when no pod was ever created (a Pod Security
+	// admission refusal leaves nothing else), so both are read.
+	prevPods, err := client.ListPodsIn(ctx, namespace, kubeapi.ListRequest{
+		Selector: "job-name=" + prev.Metadata.Name, PageSize: previousJobPageSize,
 	})
 	if err != nil {
-		return nil, err
+		return attempts, failure, err
 	}
-	failure := previousFailure(*previous, pods)
-	// The Job's own Warning events, read whether or not any pod exists: a Pod
-	// Security admission refusal (FailedCreate) creates no pod at all, so the
-	// event is the only record of it. A read that fails is not fatal — the
-	// container statuses already read still stand.
-	failure.Events = jobWarningEvents(ctx, client, namespace, previous.Metadata.UID)
-	return failure, nil
+	failure.Containers = previousFailure(prev, prevPods).Containers
+	failure.Events, err = jobWarningEvents(ctx, client, namespace, prev.Metadata.UID)
+	if err != nil {
+		return attempts, failure, err
+	}
+	return attempts, failure, nil
+}
+
+// consecutiveFailures counts the leading failed Jobs of one CronJob's listing,
+// newest first.
+func consecutiveFailures(jobs []kubeapi.Job) int {
+	count := 0
+	for _, j := range jobs {
+		if !jobFailed(j) {
+			break
+		}
+		count++
+	}
+	return count
 }
 
 // identity reads this process's pod identity from the configured environment
@@ -109,18 +156,20 @@ const previousJobEventLimit = 5
 
 // jobWarningEvents reads the Warning events recorded against one Job, newest
 // first and capped. The API server filters by involvedObject, so the listing
-// carries the Job's own events alone. A read that fails returns nil: the events
-// are the least certain part of this report and never worth losing the rest.
-func jobWarningEvents(ctx context.Context, client *kubeapi.Client, namespace, jobUID string) []model.EventFailure {
+// carries the Job's own events alone. A failed read is returned as an error
+// beside whatever the walk already established: the failure the events explain
+// still stands, and the caller repeats the walk at finish rather than letting
+// the events silently read as "none".
+func jobWarningEvents(ctx context.Context, client *kubeapi.Client, namespace, jobUID string) ([]model.EventFailure, error) {
 	if jobUID == "" {
-		return nil
+		return nil, nil
 	}
 	events, err := client.ListEvents(ctx, namespace, kubeapi.ListRequest{
 		FieldSelector: "involvedObject.uid=" + jobUID + ",involvedObject.kind=Job",
 		PageSize:      previousJobPageSize,
 	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	warnings := make([]kubeapi.Event, 0, len(events))
 	for _, e := range events {
@@ -138,7 +187,7 @@ func jobWarningEvents(ctx context.Context, client *kubeapi.Client, namespace, jo
 	for _, e := range warnings {
 		out = append(out, model.EventFailure{Reason: e.Reason, Message: e.Message})
 	}
-	return out
+	return out, nil
 }
 
 // eventTime is when an Event was last seen: its own eventTime, then its
@@ -163,13 +212,16 @@ func ownerName(refs []kubeapi.OwnerReference, kind string) string {
 	return ""
 }
 
-// newestJobOf returns the newest Job of cronName that is not exclude, by creation
-// timestamp, or nil when there is none.
-func newestJobOf(jobs []kubeapi.Job, cronName, exclude string) *kubeapi.Job {
-	var newest *kubeapi.Job
-	var newestAt time.Time
-	for i := range jobs {
-		j := &jobs[i]
+// jobsOf returns the Jobs of cronName that are not exclude, newest first by
+// creation timestamp. A Job whose creation time cannot be read cannot be
+// ordered and is skipped, as the newest-only walk did.
+func jobsOf(jobs []kubeapi.Job, cronName, exclude string) []kubeapi.Job {
+	type datedJob struct {
+		job kubeapi.Job
+		at  time.Time
+	}
+	var dated []datedJob
+	for _, j := range jobs {
 		if j.Metadata.Name == exclude || ownerName(j.Metadata.OwnerReferences, "CronJob") != cronName {
 			continue
 		}
@@ -177,11 +229,55 @@ func newestJobOf(jobs []kubeapi.Job, cronName, exclude string) *kubeapi.Job {
 		if err != nil {
 			continue
 		}
-		if newest == nil || at.After(newestAt) {
-			newest, newestAt = j, at
-		}
+		dated = append(dated, datedJob{job: j, at: at})
 	}
-	return newest
+	sort.SliceStable(dated, func(i, j int) bool { return dated[i].at.After(dated[j].at) })
+	out := make([]kubeapi.Job, 0, len(dated))
+	for _, d := range dated {
+		out = append(out, d.job)
+	}
+	return out
+}
+
+// knownAttempts is the attempt record a failed pod listing still supports: the
+// Job's own failed count, without the deleted count only a complete listing can
+// prove.
+func knownAttempts(job kubeapi.Job) *model.AttemptFailure {
+	if job.Status.Failed == 0 {
+		return nil
+	}
+	return &model.AttemptFailure{Job: job.Metadata.Name, Failed: job.Status.Failed}
+}
+
+// earlierAttempts renders the failed earlier attempts of the run's own Job: one
+// FailedPod per listed pod with phase Failed other than this run's own pod, each
+// carrying the pod status's reason and message (a kubelet Evicted pod has no
+// container status left) and its containers. Deleted is the part of the Job's
+// own status.failed that no listed pod explains — an attempt whose pod a drain
+// or a deletion removed — clamped at zero, because a podFailurePolicy Ignore
+// rule may fail a pod without counting it. Nil when the Job counted no failure
+// and listed none.
+func earlierAttempts(job kubeapi.Job, pods []kubeapi.Pod, self string) *model.AttemptFailure {
+	out := &model.AttemptFailure{Job: job.Metadata.Name, Failed: job.Status.Failed}
+	for _, pod := range pods {
+		if pod.Metadata.Name == self || pod.Status.Phase != "Failed" {
+			continue
+		}
+		if ownerName(pod.Metadata.OwnerReferences, "Job") != job.Metadata.Name {
+			continue
+		}
+		containers := containerFailures(pod, pod.Status.InitContainerStatuses, true)
+		containers = append(containers, containerFailures(pod, pod.Status.ContainerStatuses, false)...)
+		out.Pods = append(out.Pods, model.FailedPod{
+			Name: pod.Metadata.Name, Reason: pod.Status.Reason, Message: pod.Status.Message,
+			Containers: containers,
+		})
+	}
+	out.Deleted = max(0, out.Failed-len(out.Pods))
+	if out.Failed == 0 && len(out.Pods) == 0 {
+		return nil
+	}
+	return out
 }
 
 // jobFailed reports whether the Job carries a Failed condition that is true.

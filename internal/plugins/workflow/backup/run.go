@@ -380,7 +380,21 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 		uncertaintyArmed bool
 		handles          map[string]guard.Handle
 		transfers        map[string]*transfer.Transfer
+		// job is the cluster's half of the previous-run record, read once right
+		// here — after the lease decision and before any refusal branch, spool or
+		// event — and carried by both events.
+		job model.PreviousRun
 	)
+	// The cluster half is read on every non-dry-run path that got past the
+	// Acquire switch, a refused run included: a run refused before it starts
+	// sends no run_started, so its finished event is the only one that can carry
+	// what the cluster knew. The walk has its own budget (walk_timeout) and runs
+	// under the run's context; the finish window below re-reads only a failed
+	// read.
+	if e.reporter != nil {
+		job = e.reporter.PreviousJob(ctx)
+		e.reportPreviousJob(job)
+	}
 	if !refused {
 		// The spool comes before the first event: a run that cannot buffer has not
 		// started, and no notifier hears about a run that never will.
@@ -389,7 +403,11 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 			return model.RunReport{}, err
 		}
 
-		notifierFailed, _ = e.notify(ctx, model.Event{Name: model.EventStarted, At: started, Run: rep}, checks)
+		// The started event carries the cluster half and a zero storage half: the
+		// surveys have not run, and the manifests are the finish's record.
+		startRun := rep
+		startRun.Previous = job
+		notifierFailed, _ = e.notify(ctx, model.Event{Name: model.EventStarted, At: started, Run: startRun}, checks)
 		// The record's uncertainty is decided BEFORE the first survey call and
 		// settled after it. A survey that starts under an uncertainty and
 		// finishes after a later release is still a snapshot taken under it — the
@@ -450,9 +468,11 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 				}
 			}
 		}
-		// The finished event gets the previous-run record; the manifests this run
-		// surveyed are its only storage input, and the Job lookup runs under the
-		// finish window below — never under the run deadline.
+		// The storage half of the previous-run record is the manifests this run
+		// surveyed; the cluster half was read once right after the lease decision
+		// above. The surveys are the finish's input only — nothing of them
+		// reaches the started event, and the bucket checks below refuse before
+		// the first write.
 		if !refused {
 			surveyed = surveyedRuns(order, surveys)
 			if err := e.checkRunIDFree(surveys, rep.RunID); err != nil {
@@ -610,8 +630,28 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 	// still ends the process the way the deployment asked — an in-process
 	// allowance cannot cover a kill, and the next run's "previous run did not
 	// report" stays the signal for that.
-	finish, cancelFinish := context.WithTimeout(outer, run.FinishAllowance.Std()/2)
+	window := run.FinishAllowance.Std() / 2
+	finish, cancelFinish := context.WithTimeout(outer, window)
 	defer cancelFinish()
+
+	// Removing this run's own pending mark is decided once, here, and reused
+	// below: it needs a terminal proof of every write, and it is the one record
+	// write the finish window must still afford after the notification has had
+	// its share. Its bound is reserved out of the notify window, at most half of
+	// it: a catalog whose bound is larger than that cannot keep the whole record
+	// write inside the window, and the clipped reserve is named in the log.
+	removeOwn := uncertaintyArmed && claim != nil && uploadsSettled(order, results)
+	reserve := time.Duration(0)
+	if removeOwn {
+		need := e.lease.PendingRemovalBound()
+		reserve = min(need, window/2)
+		if need > window/2 {
+			e.event(human.Warning("lease.reserve.clipped", human.Text("run", rep.RunID),
+				human.Duration("needed", need), human.Duration("reserve", reserve)))
+		}
+	}
+	end, _ := finish.Deadline()
+	spend, cancelSpend := context.WithDeadline(finish, end.Add(-reserve))
 
 	rep.Artifacts = artifactResults
 	rep.Storages = e.assembleResults(order, results)
@@ -619,10 +659,19 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 	rep.Outcome = e.reportOutcome(&rep, notifierFailed)
 	rep.ExitCode = e.exitCode(rep.Outcome)
 	// Every finished event carries the previous-run record, refused runs
-	// included: their storage input is empty, but the previous Job status is
-	// still available to the finish window.
+	// included: their storage input is empty, but the cluster half read at the
+	// start still answers. A read that failed at the start is repeated exactly
+	// once, inside the part of the window the reserve leaves to the
+	// notification and under the walk's own budget; a successful read is never
+	// repeated.
 	if e.reporter != nil {
-		rep.Previous = e.reporter.Previous(finish, surveyed)
+		if job.Unavailable != "" {
+			rctx, cancel := context.WithTimeout(spend, (window-reserve)/2)
+			job = e.reporter.PreviousJob(rctx)
+			cancel()
+			e.reportPreviousJob(job)
+		}
+		rep.Previous = reporting.Previous(job, surveyed)
 		e.reportPrevious(rep.Previous)
 	}
 
@@ -630,16 +679,20 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 	// is the only notification failure allowed to lower it: a message that did
 	// reach a receiver already names the outcome, so failing the run under it
 	// would contradict what was delivered. With the flag off nothing changes.
-	if failed, delivered := e.notify(finish, model.Event{Name: model.EventFinished, At: time.Now().UTC(), Run: rep}, checks); failed &&
+	// The notification runs under spend: its retries stop once a wait plus one
+	// attempt bound no longer fits before the reserve.
+	if failed, delivered := e.notify(spend, model.Event{Name: model.EventFinished, At: time.Now().UTC(), Run: rep}, checks); failed &&
 		!delivered && run.NotifierFailureIsFatal {
 		rep.Outcome = model.OutcomeFailed
 		rep.ExitCode = e.exitCode(rep.Outcome)
 	}
+	cancelSpend()
 	// Only the run that armed the mark may clear it, and only once every write
 	// has a terminal proof. An inherited uncertainty names an earlier run: its
 	// pending prefix is never dropped here, only by a settlement that proves the
-	// whole set still.
-	if uncertaintyArmed && claim != nil && uploadsSettled(order, results) {
+	// whole set still. The removal runs under finish, after the notification, so
+	// the reserve is exactly the time it has.
+	if removeOwn {
 		// Only this run's own id leaves: inherited ids are never dropped here,
 		// and the two-full-survey settlement remains their only exit. A failed
 		// durable removal keeps the id (conservative) and is a warning: this
@@ -1408,10 +1461,6 @@ func currentOverlay(runID string, kind model.RunKind, started time.Time, artifac
 	return out
 }
 
-// previous flattens the surveys into the reporting input: one record per run
-// per storage, a failed survey contributing nothing. The reporting plugin
-// derives the newest scheduled run and the last-good instant from it, then
-// reads the previous Job's status.
 // surveyedRuns flattens the completed surveys into the reporting input: one
 // record per run per storage, a failed survey contributing nothing.
 func surveyedRuns(order []*storageBinding, surveys map[string]inventory.Survey) []reporting.SurveyedRun {
@@ -1435,8 +1484,28 @@ func surveyedRuns(order []*storageBinding, surveys map[string]inventory.Survey) 
 	return surveyed
 }
 
-// reportPrevious keeps the run log's previous-run lines, now driven by the
-// reporting plugin's answer instead of a catalog history.
+// reportPreviousJob keeps the run log's cluster-half lines, driven by the one
+// previous-Job walk: an unreadable status, why the previous Job failed and what
+// the own Job's failed earlier attempts left behind. The storage half has its
+// own line in reportPrevious.
+func (e *Workflow) reportPreviousJob(job model.PreviousRun) {
+	if job.Unavailable != "" {
+		e.event(human.Warning("run.previous.unavailable", human.Text("reason", job.Unavailable)))
+	}
+	if job.Failure != nil {
+		e.event(human.New("run.previous.failed",
+			human.Text("job", job.Failure.Job), human.Text("reason", job.Failure.Reason)))
+	}
+	if job.Attempts != nil {
+		e.event(human.New("run.attempts.failed",
+			human.Text("job", job.Attempts.Job),
+			human.Count("failed", int64(job.Attempts.Failed)),
+			human.Count("deleted", int64(job.Attempts.Deleted))))
+	}
+}
+
+// reportPrevious keeps the run log's previous-run line: the storage half read
+// from this run's surveys.
 func (e *Workflow) reportPrevious(prev model.PreviousRun) {
 	if prev.RunID != "" {
 		last := "never"
@@ -1448,13 +1517,6 @@ func (e *Workflow) reportPrevious(prev model.PreviousRun) {
 			human.Text("unfinished", strconv.FormatBool(prev.Unfinished)),
 			human.Text("last_good", last)))
 	}
-	if prev.Unavailable != "" {
-		e.event(human.Warning("run.previous.unavailable", human.Text("reason", prev.Unavailable)))
-	}
-	if prev.Failure != nil {
-		e.event(human.New("run.previous.failed",
-			human.Text("job", prev.Failure.Job), human.Text("reason", prev.Failure.Reason)))
-	}
 }
 
 // notify delivers one event to every notifier; failed reports whether any of
@@ -1465,6 +1527,10 @@ func (e *Workflow) reportPrevious(prev model.PreviousRun) {
 // fail a run nor stand in for a notifier that delivered. The caller decides what
 // a failure means: notifier_failure_is_fatal is fatal for a finished event only
 // when no notifier delivered it.
+//
+// A notifier that can bound one call gets its retries only while a wait plus
+// that bound still fits before the caller's deadline, so a finished ladder never
+// sleeps into the reserve the finish window keeps.
 func (e *Workflow) notify(ctx context.Context, ev model.Event, checks failedChecks) (failed, delivered bool) {
 	for _, nb := range e.notifiers {
 		if err := checks.err("notifier", nb.name); err != nil {
@@ -1473,7 +1539,11 @@ func (e *Workflow) notify(ctx context.Context, ev model.Event, checks failedChec
 				human.Text("event", ev.Name), human.Text("reason", err.Error())))
 			continue
 		}
-		_, err := execution.Attempt(ctx, e.retry, "notify "+nb.name, func(ctx context.Context, _ int) (struct{}, error) {
+		bound := time.Duration(0)
+		if b, ok := nb.inst.(notifier.Bounded); ok {
+			bound = b.AttemptTimeout()
+		}
+		_, err := execution.AttemptWithin(ctx, e.retry, "notify "+nb.name, bound, func(ctx context.Context, _ int) (struct{}, error) {
 			return struct{}{}, execution.SafeCall(func() error { return nb.inst.Notify(ctx, ev) })
 		})
 		if errors.Is(err, notifier.ErrSkipped()) {

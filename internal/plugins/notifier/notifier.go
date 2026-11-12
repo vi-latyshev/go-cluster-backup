@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
@@ -19,6 +20,17 @@ import (
 // failures are fatal.
 type Notifier interface {
 	Notify(ctx context.Context, ev model.Event) error
+}
+
+// Bounded is the optional capability a Notifier implements when it can bound
+// one call. The run's retry loop then starts a retry only while its wait plus
+// this bound still ends before the caller's deadline — what keeps the finished
+// notification inside its window instead of sleeping past it. A notifier
+// without the capability is budgeted with a bound of zero, so the check still
+// refuses a wait that cannot fit before the deadline; the Notifier interface is
+// not widened.
+type Bounded interface {
+	AttemptTimeout() time.Duration
 }
 
 // ErrSkipped reports that a notifier deliberately delivers nothing for this
