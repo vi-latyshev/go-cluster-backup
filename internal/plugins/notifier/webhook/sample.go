@@ -30,11 +30,47 @@ type sample struct {
 // samples is the matrix: both events, every run outcome, an artifact that
 // succeeded and one that failed, an artifact that reported what its source left
 // out and one that reported nothing, every storage outcome, an ignored and a
-// covered exclusion, a previous run that never reported and one that did, and
-// the ends of the range — a run with no artifact and no storage at all.
+// covered exclusion, a previous run that never reported and one that did, the
+// cluster half of the previous-run record — a previous Job's failure, failed
+// earlier attempts of the own Job with a containerless pod, and an unreadable
+// status — and the ends of the range: a run with no artifact and no storage at
+// all.
 func samples() []sample {
 	at := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 	lastGood := at.Add(-24 * time.Hour)
+	// failure is why a previous Job failed before the tool ran: its Failed
+	// condition, an init container that stopped with an error, a main container
+	// that never pulled its image, one the kernel killed, the Job's own Warning
+	// event, and the count of the CronJob's failed Jobs in a row.
+	failure := &model.PreviousFailure{
+		Job: "backup-20260101", Reason: "BackoffLimitExceeded", Message: "Job has reached the specified backoff limit",
+		Consecutive: 3,
+		Containers: []model.ContainerFailure{
+			{Pod: "backup-20260101-x", Container: "init", Init: true,
+				Terminated: &model.ContainerTermination{Reason: "Error", ExitCode: 1, Message: "invalid config"}},
+			{Pod: "backup-20260101-x", Container: "backup", Waiting: "ImagePullBackOff"},
+			{Pod: "backup-20260101-y", Container: "backup",
+				Terminated: &model.ContainerTermination{Reason: "OOMKilled", ExitCode: 137, Message: "the log's last lines"}},
+		},
+		Events: []model.EventFailure{{Reason: "FailedCreate", Message: "Error creating: pods is forbidden"}},
+	}
+	// attempts is what failed earlier attempts of this run's own Job left: a pod
+	// the kernel killed, an Evicted pod with no container status left, and one
+	// attempt whose pod is gone.
+	attempts := &model.AttemptFailure{
+		Job: "backup-20260102", Failed: 3, Deleted: 1,
+		Pods: []model.FailedPod{
+			{Name: "backup-20260102-a", Containers: []model.ContainerFailure{
+				{Pod: "backup-20260102-a", Container: "backup",
+					Terminated: &model.ContainerTermination{Reason: "OOMKilled", ExitCode: 137}},
+			}},
+			{Name: "backup-20260102-b", Reason: "Evicted", Message: "The node was low on resource: memory."},
+		},
+	}
+	// attemptsGone is a failed earlier attempt whose pod was deleted: the Job's
+	// own count is the only record.
+	attemptsGone := &model.AttemptFailure{Job: "backup-20260102", Failed: 1, Deleted: 1}
+	unavailable := "previous run status unavailable: previous run status could not be read: pods is forbidden"
 	okArtifact := model.ArtifactResult{
 		Artifact: model.Artifact{
 			Group: "databases", Name: "example/postgres",
@@ -82,23 +118,29 @@ func samples() []sample {
 	finished := func(name string, rep model.RunReport) sample {
 		return sample{name: name, ev: model.Event{Name: model.EventFinished, At: at, Run: rep}}
 	}
-	// started is the start of a run: the previous-run record is filled only for
-	// the finished event, so a started sample carries none.
-	started := func(name string) sample {
-		return sample{name: name, ev: model.Event{Name: model.EventStarted, At: at, Run: report(model.OutcomeRunning, nil, nil, nil, model.PreviousRun{})}}
+	// started is the start of a run: the cluster half of the previous-run record
+	// is filled, the storage half never — the surveys have not run yet.
+	started := func(name string, previous model.PreviousRun) sample {
+		return sample{name: name, ev: model.Event{Name: model.EventStarted, At: at, Run: report(model.OutcomeRunning, nil, nil, nil, previous)}}
 	}
 	// startedManual is the start of a manual run: a template that branches on
 	// the kind renders here, not only on a night that happens to be manual.
-	startedManual := func(name string) sample {
-		rep := report(model.OutcomeRunning, nil, nil, nil, model.PreviousRun{})
+	startedManual := func(name string, previous model.PreviousRun) sample {
+		rep := report(model.OutcomeRunning, nil, nil, nil, previous)
 		rep.RunID = "20260102T030405Z-manual"
 		rep.Kind = model.RunKindManual
 		return sample{name: name, ev: model.Event{Name: model.EventStarted, At: at, Run: rep}}
 	}
 
 	return []sample{
-		started("a run that just started"),
-		startedManual("a manual run that just started"),
+		started("a run that just started", model.PreviousRun{}),
+		startedManual("a manual run that just started", model.PreviousRun{}),
+		// The started event of a night that follows one the tool never reported:
+		// the cluster half is all a receiver gets before this run's own outcome.
+		started("a run that just started after a failed previous Job and failed earlier attempts",
+			model.PreviousRun{Failure: failure, Attempts: attempts}),
+		started("a run that just started without the cluster's status",
+			model.PreviousRun{Unavailable: unavailable, Attempts: attemptsGone}),
 		finished("a delivered run", report(model.OutcomeDelivered,
 			[]model.ArtifactResult{okArtifact}, []model.StorageResult{verified},
 			[]model.Exclusion{{Name: "volumes/example/cache", Group: "volumes", Kind: model.ExclusionIgnored, Reason: "carries the exclusion marker"}},
@@ -117,6 +159,20 @@ func samples() []sample {
 			model.PreviousRun{RunID: "20260101T030405Z", Unfinished: true, LastGoodAt: lastGood})),
 		finished("a failed run with nothing to report", report(model.OutcomeFailed, nil, nil, nil,
 			model.PreviousRun{RunID: "20260101T030405Z", Unfinished: true, LastGoodAt: lastGood})),
+		// The finished event carries both halves: the storage record of earlier
+		// nights and the cluster's answer about the Job that died before it could
+		// report, beside the failed earlier attempts of this run's own Job.
+		finished("a failed run after a failed previous Job and failed earlier attempts",
+			report(model.OutcomeFailed, nil, nil, nil, model.PreviousRun{
+				RunID: "20260101T030405Z", Unfinished: true, LastGoodAt: lastGood,
+				Failure: failure, Attempts: attempts,
+			})),
+		finished("a delivered run without the cluster's status",
+			report(model.OutcomeDelivered, []model.ArtifactResult{okArtifact}, []model.StorageResult{verified}, nil,
+				model.PreviousRun{
+					RunID: "20260101T030405Z", LastGoodAt: lastGood,
+					Unavailable: unavailable, Attempts: attemptsGone,
+				})),
 		// A manual run delivered: its kind and its suffixed id reach every
 		// template, so a message can tell a manual copy from a night's.
 		finished("a manual run that was delivered", manual(model.OutcomeDelivered,

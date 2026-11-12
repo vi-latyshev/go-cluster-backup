@@ -70,7 +70,7 @@ there. Plugins own application work:
 - `lifecycle` supplies invocation scopes and ordered shutdown.
 - `workflow/backup` holds the Floor skeleton with typed Options.
 - `workflow/stage` and `workflow/restore` own their operations.
-- `reporting` derives finished-event previous-run data.
+- `reporting` derives `.Run.Previous` from Job status and storage manifests.
 
 - **Registration is generated.** Put a literal `loader.Spec` in `plugin.go`.
   Library plugins have no `Apply`; contributing plugins use it to register
@@ -124,9 +124,13 @@ there. Plugins own application work:
   Strictly rejected manifests are not artifact-restore candidates, but their
   listed bytes count against occupancy. Keep the stale cutoff for manifestless
   attempts, explicit-key raw fetch, multipart sweep and Yandex folder pruning.
-- **The catalog holds only the CAS lease.** `reporting` fills `.Run.Previous` and
-  last-good from storage manifests and previous Job status only for finished
-  events. Follow the [catalog rollout](docs/configuration.md#catalog) on upgrade.
+- **The catalog holds only the CAS lease.** `reporting` reads the cluster half of
+  `.Run.Previous` (`Failure`, `Attempts`, `Unavailable`) right after the writer
+  lease decision, before any refusal branch. `run_started` and `run_finished`
+  carry it; a run refused before it starts sends no `run_started`. The storage
+  half (`RunID`, `Unfinished`, `LastGoodAt`) comes from storage manifests only for
+  `run_finished`; manifests keep an empty `previous`. Follow the
+  [catalog rollout](docs/configuration.md#catalog) on upgrade.
 - **Inherited uncertainty is not a timer.** Release preserves it and Acquire
   inherits it. The current holder clears it after two equal consecutive full-survey
   digests; a failed survey invalidates the earlier observation. A stale holder,
@@ -142,10 +146,13 @@ service locator.
   skeleton: acquire, deferred release, refusal branch, complete survey and
   collision checks, admitted writes, verified manifests, retention, common finish.
   Keep the run deadline separate from the outer context and the two
-  `finish_allowance / 2` manifest/finish windows. A refused run skips survey,
-  writes, manifests and retention but reaches finish. `After`/`Needs` can order
-  contributions only inside named slots; they cannot replace this skeleton or
-  grant mutation rights.
+  `finish_allowance / 2` manifest/finish windows. When the run will remove its own
+  pending mark, the finish window keeps a reserve for that catalog write: twice
+  the catalog's `request_timeout` (read + patch), at most half the window. The
+  status re-read and the finished notification end before the reserve; the
+  removal runs after them. A refused run skips survey, writes, manifests and
+  retention but reaches finish. `After`/`Needs` can order contributions only
+  inside named slots; they cannot replace this skeleton or grant mutation rights.
 - **Handles enforce mutation rights.** `guard.Port` is read-only.
   `guard.Handle`, `guard.Uploader` and `guard.Inventory` require a live
   `guard.Authority`, issued after acquisition, collision and admission checks.
@@ -188,8 +195,6 @@ packages the chart and publishes release notes.
 - `Release-As: X.Y.Z[-pre]` in a commit trailer forces the next version. A
   docs-only push runs no workflow; carry it on a non-docs change.
 - Breaking configuration, chart or stored-format changes require a major release.
-  The plugin-runtime task ships all existing capabilities in one final major
-  release; no compatibility layer or intermediate release is required.
 
 ## The chart
 
@@ -240,6 +245,9 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   checks without construction; the run checks semantics when building them.
 - **One attempt per backend call.** `execution` owns retries, backoff, budgets
   and timeouts from config. A backend never retries inside that accounting unit.
+  A notification retries only while its wait plus the notifier's attempt timeout
+  fits before the caller's deadline, so the finished notification never runs
+  past its window.
 - **Preflight is scoped.** Failed `Check` affects only its instance. Permanent
   storage failure excludes it for the run; transient failure spends a retry.
   `validate --preflight` builds/checks declared instances and discovered sources
@@ -287,14 +295,19 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
   notification. Retention cannot delete another run's incomplete objects before
   `deadline + finish_allowance`. Inherited uncertainty follows the full-survey
   digest rule above, never elapsed time.
-- **Surface failures before the tool starts.** From the exact caller pod, follow
-  owner Job, owner CronJob, then its newest other Job, using
-  `run.holder_namespace_env`/`holder_pod_env`. Report Job reason/message and each
-  container's terminated reason, exit code, `terminated.message` or waiting reason:
-  rejected initContainers, image pulls, PSA, pending deadlines, OOMKill and SIGKILL
-  must surface. This is read-only; missing RBAC reports
-  "previous run status unavailable" without failing the run. Reporting combines
-  this with storage manifests only for the finished event.
+- **Surface failures before the tool starts.** From the exact caller pod, named
+  by `plugins.config.reporting.namespace_env`/`pod_env`, follow owner Job, owner
+  CronJob, then its newest other Job. The own Job's failed earlier pods, each with
+  its pod reason (`Evicted`) and containers, and its `status.failed`, which still
+  counts an attempt that left no pod, fill `.Run.Previous.Attempts`. When the
+  newest other Job failed, `Failure.Consecutive` counts the CronJob's Jobs that
+  failed in a row, as far as the cluster keeps them. Report Job reason/message and
+  each container's terminated reason, exit code, `terminated.message` or waiting
+  reason: rejected initContainers, image pulls, PSA, pending deadlines, OOMKill
+  and SIGKILL must surface. Reporting's `walk_timeout` bounds the whole walk and
+  its `request_timeout` each request. Finish repeats a failed read once, within
+  half of the window part before the reserve. This is read-only; missing RBAC
+  reports "previous run status unavailable" without failing the run.
 - **Configuration is strict.** Report all errors together with JSON-pointer paths.
 - **Process hygiene:** `log/slog` only. `signal.NotifyContext`, `os.Exit` and
   `log.Fatal` exist only in `cmd/go-cluster-backup/main.go`. Domain operations
@@ -302,8 +315,8 @@ Conventional Commits: `type(scope): description`, single line preferred, subject
 - **Templates are a SemVer API.** Report fields and the fixed function set
   (`configuration.CoreFuncs`, notifier `TemplateFuncs`) are deployment-visible.
   Test the current surface in
-  `internal/plugins/configuration/template_surface_test.go`. This task may break
-  labels and fields; remove superseded callers rather than adding aliases.
+  `internal/plugins/configuration/template_surface_test.go`. Adding a field is a
+  minor change; renaming or removing one is a major change.
 - **Rules 4/5 exception:** the mandatory everything-is-a-plugin architecture
   keeps the `discovery`, `catalog` and `notifier` seams even with one backend each
   (`kubernetes_labels`, `kubernetes_configmap`, `webhook`).

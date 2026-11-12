@@ -71,8 +71,11 @@ Type names are exactly as written in the configuration.
 |---|---|
 | `kubernetes_configmap` | writer lease in one ConfigMap; no run history |
 
-The `reporting` plugin derives previous-run information from storage manifests
-and the previous Job's status only for finished notifications.
+The `reporting` plugin reads the cluster's status of the previous Job and of
+this run's own earlier attempts once per run, right after the writer-lease
+decision, and both `run_started` and `run_finished` carry it; the storage
+manifest half (run id, unfinished, last good) exists only for
+`run_finished`.
 
 ### Notifications
 

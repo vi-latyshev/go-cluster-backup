@@ -1,9 +1,10 @@
 // Package reporting owns the previous-run record a report and every notification
 // carry: what the storages hold of earlier scheduled runs, and why the previous
-// Job of this run's own CronJob failed before this tool could report. The
-// cluster keeps no run history — the catalog holds only the writer lease — so
-// the storages' manifests are the record of what ran, and the cluster is read
-// for the Job status alone.
+// Job of this run's own CronJob failed before this tool could report, together
+// with the failed earlier attempts of this run's own Job. The cluster keeps no
+// run history — the catalog holds only the writer lease — so the storages'
+// manifests are the record of what ran, and the cluster is read for the Job
+// status alone.
 package reporting
 
 import (
@@ -27,8 +28,12 @@ type Config struct {
 	TokenFile      string         `json:"token_file" doc:"path of the ServiceAccount token file, re-read on every request"`
 	CAFile         string         `json:"ca_file" doc:"path of the CA bundle the API server certificate is verified against"`
 	RequestTimeout model.Duration `json:"request_timeout" doc:"timeout of one API request"`
-	NamespaceEnv   string         `json:"namespace_env" doc:"name of the environment variable holding this process's pod namespace"`
-	PodEnv         string         `json:"pod_env" doc:"name of the environment variable holding this process's pod name"`
+	// WalkTimeout bounds the whole previous-Job walk — every request and page
+	// together; each request also ends at request_timeout, so a request ends at
+	// whichever comes first.
+	WalkTimeout  model.Duration `json:"walk_timeout" doc:"timeout of the whole previous-Job walk: every request and page together; each request also ends at request_timeout"`
+	NamespaceEnv string         `json:"namespace_env" doc:"name of the environment variable holding this process's pod namespace"`
+	PodEnv       string         `json:"pod_env" doc:"name of the environment variable holding this process's pod name"`
 }
 
 // Validate reports every setting that cannot work. It performs no I/O: a
@@ -45,6 +50,9 @@ func (c *Config) Validate() error {
 	errs = append(errs, configuration.AbsolutePath(c.CAFile, "/ca_file")...)
 	if c.RequestTimeout.Std() <= 0 {
 		errs = append(errs, fmt.Errorf("/request_timeout must be positive, got %s", c.RequestTimeout))
+	}
+	if c.WalkTimeout.Std() <= 0 {
+		errs = append(errs, fmt.Errorf("/walk_timeout must be positive, got %s", c.WalkTimeout))
 	}
 	if c.NamespaceEnv == "" {
 		errs = append(errs, errors.New("/namespace_env is empty"))

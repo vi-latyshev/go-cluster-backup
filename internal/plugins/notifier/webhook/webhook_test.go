@@ -802,6 +802,23 @@ func TestYAMLBodyDropsEmptyLinesAndSendsJSON(t *testing.T) {
 	}
 }
 
+// TestAttemptTimeoutIsTheConfiguredTimeout: the run's retry ladder budgets one
+// call at the request timeout, response body included.
+func TestAttemptTimeoutIsTheConfiguredTimeout(t *testing.T) {
+	n := build(t, map[string]any{
+		"url": "http://127.0.0.1:1/x", "method": "POST", "headers": map[string]string{},
+		"body_format": "text", "timeout": "7s", "success_status": []int{200}, "max_response_bytes": 16,
+		"events": map[string]string{"run_started": "started"}, "payload": "{{ .Text }}",
+	})
+	bounded, ok := n.(notifier.Bounded)
+	if !ok {
+		t.Fatal("the webhook notifier cannot bound one attempt")
+	}
+	if got := bounded.AttemptTimeout(); got != 7*time.Second {
+		t.Fatalf("AttemptTimeout() = %s, want the configured 7s", got)
+	}
+}
+
 // TestValidateRendersEveryEventOffline is the defect the plain-text model
 // closes: a body that only ever renders at run time is checked here instead,
 // against the built-in sample — an event whose title renders empty, and one
@@ -835,6 +852,29 @@ func TestValidateRendersEveryEventOffline(t *testing.T) {
 				"run_finished": "{{ .Run.Artifact }}",
 			},
 			want: "run_finished",
+		},
+		// The cluster half of the previous-run record reaches both events, so a
+		// template that only fits one of them is refused by the sample it breaks.
+		"a started template that breaks on the previous Job failure": {
+			events: map[string]string{"run_started": "Backup {{ with .Run.Previous.Failure }}{{ .NoSuch }}{{ end }}"},
+			want:   "a run that just started after a failed previous Job",
+		},
+		"a started template that indexes an attempt pod's first container": {
+			events: map[string]string{"run_started": "Backup {{ with .Run.Previous.Attempts }}{{ range .Pods }}{{ index .Containers 0 }}{{ end }}{{ end }}"},
+			// The Evicted pod of the attempts sample has no container status left.
+			want: "a run that just started after a failed previous Job",
+		},
+		"a finished template that breaks on a container's termination": {
+			events: map[string]string{"run_finished": "Backup {{ with .Run.Previous.Failure }}{{ range .Containers }}{{ .Terminated.NoSuch }}{{ end }}{{ end }}"},
+			want:   "a failed run after a failed previous Job",
+		},
+		"a started template that reads the report under an unavailable status": {
+			events: map[string]string{"run_started": "Backup {{ if .Run.Previous.Unavailable }}{{ .Run.NoSuch }}{{ end }}"},
+			want:   "a run that just started without the cluster's status",
+		},
+		"a started template that reads Consecutive as a struct": {
+			events: map[string]string{"run_started": "Backup {{ with .Run.Previous.Failure }}{{ .Consecutive.X }}{{ end }}"},
+			want:   "a run that just started after a failed previous Job",
 		},
 	}
 	for name, tc := range cases {

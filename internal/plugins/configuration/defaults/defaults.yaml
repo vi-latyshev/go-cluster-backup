@@ -97,6 +97,10 @@ plugins:
       token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
       request_timeout: 30s
+      # Bounds the whole previous-Job walk — every request and page together;
+      # request_timeout bounds one request, and a request ends at whichever
+      # comes first.
+      walk_timeout: 30s
       namespace_env: BACKUP_POD_NAMESPACE
       pod_env: BACKUP_POD_NAME
 
@@ -137,7 +141,9 @@ plugins:
       api_port_env: KUBERNETES_SERVICE_PORT
       token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
       ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-      request_timeout: 30s
+      # Twice this is the reserve the finish window keeps for removing this
+      # run's pending mark (a read and a patch), at most half the window.
+      request_timeout: 15s
 
     notifier/webhook:
       method: POST

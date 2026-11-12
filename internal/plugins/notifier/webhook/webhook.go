@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	json "encoding/json/v2"
 
@@ -219,6 +220,13 @@ type Notifier struct {
 	client   *http.Client
 	log      *slog.Logger
 }
+
+// AttemptTimeout is the notifier's one-attempt bound: the configured timeout
+// covers the whole request, response body included, so it is what the run's
+// retry loop budgets a call at.
+func (n *Notifier) AttemptTimeout() time.Duration { return n.cfg.Timeout.Std() }
+
+var _ notifier.Bounded = (*Notifier)(nil)
 
 // Close releases idle connections. It is idempotent and safe after a failed New.
 func (n *Notifier) Close() error {

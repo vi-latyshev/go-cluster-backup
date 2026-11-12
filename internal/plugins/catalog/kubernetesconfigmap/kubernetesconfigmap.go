@@ -80,6 +80,12 @@ type Catalog struct {
 	client *kubeapi.Client
 }
 
+// WriteTimeout is the upper bound of one record write: a read and a patch, so
+// twice request_timeout.
+func (c *Catalog) WriteTimeout() time.Duration { return 2 * c.cfg.RequestTimeout.Std() }
+
+var _ catalog.WriteBounded = (*Catalog)(nil)
+
 // Check proves at preflight that the API answers, that the token and CA are
 // usable and that the ConfigMap is readable. An absent ConfigMap passes: the
 // deployment manifest creates it before the first run.
@@ -364,7 +370,7 @@ const example = `{
   "api_port_env": "KUBERNETES_SERVICE_PORT",
   "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
   "ca_file": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-  "request_timeout": "30s",
+  "request_timeout": "15s",
   "namespace": "backup",
   "name": "cluster-backup-catalog",
   "lease_key": "lease.json"

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/workflow/backup"
 )
@@ -54,10 +55,11 @@ func TestC1_SynchronousPhaseIsNeverACompleteJoin(t *testing.T) {
 }
 
 func TestM8_RefusedFinishedEventCarriesPreviousRecord(t *testing.T) {
-	// A pod identity makes the reporting block attempt the previous-Job lookup;
-	// the API host is unset, so the failure is what the record must carry.
-	t.Setenv("GCB_PREV_NAMESPACE", "backup")
-	t.Setenv("GCB_PREV_POD", "backup-other")
+	// The refused run never surveys or writes, but the cluster half of the
+	// previous-run record is read at the start, on the refused path included —
+	// and the finish window does not repeat it.
+	srv := kubeapitest.New(t)
+	reportingChain(t, srv)
 	w := newWorld(t)
 	n := &fakeNotifier{}
 	w.Notifiers["ops"] = n
@@ -66,11 +68,7 @@ func TestM8_RefusedFinishedEventCarriesPreviousRecord(t *testing.T) {
 	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
 	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{}, "config": map[string]any{
 		"lifecycle": map[string]any{"join": "1m", "abort_total": "2m", "close": "30s", "margin": "30s"},
-		"reporting": map[string]any{
-			"api_host_env": "GCB_PREV_HOST", "api_port_env": "GCB_PREV_PORT",
-			"token_file": "/var/run/secrets/token", "ca_file": "/var/run/secrets/ca.crt",
-			"request_timeout": "30s", "namespace_env": "GCB_PREV_NAMESPACE", "pod_env": "GCB_PREV_POD",
-		},
+		"reporting": reportingConfig(t, srv, nil),
 	}}
 	e := w.newAssembly(t, cfg)
 	w.Catalog.Hold("other-run", model.RunKindScheduled, "infrastructure", "backup-other", "uid-other", time.Now())
@@ -83,17 +81,15 @@ func TestM8_RefusedFinishedEventCarriesPreviousRecord(t *testing.T) {
 	if rep.Lease == nil || !rep.Lease.Refused {
 		t.Fatalf("the manual run was not refused on the live claim: %+v", rep.Lease)
 	}
-	var finished *model.Event
-	for i := range n.Events {
-		if n.Events[i].Name == model.EventFinished {
-			finished = &n.Events[i]
-		}
+	if names := n.EventNames(); len(names) != 1 || names[0] != model.EventFinished {
+		t.Fatalf("a refused-before-start run sent %v, want only the finished event", names)
 	}
-	if finished == nil {
-		t.Fatal("the refused run sent no finished event")
+	finished := finishedEvent(t, n)
+	if finished.Run.Previous.Failure == nil || finished.Run.Previous.Failure.Job != "backup-prev-job" {
+		t.Fatalf("the refused finished event has no previous record: %+v", finished.Run.Previous)
 	}
-	if finished.Run.Previous.Unavailable == "" {
-		t.Fatalf("the refused finished event carries no previous record: %+v", finished.Run.Previous)
+	if calls := srv.Calls("jobs"); calls != 1 {
+		t.Fatalf("the Job listing ran %d times, want the one start read", calls)
 	}
 	if keys := w.storage(t, "alpha").Keys(); len(keys) != 0 {
 		t.Fatalf("a refused run surveyed storage: %v", keys)

@@ -13,23 +13,6 @@ import (
 
 var previousBase = time.Date(2026, 10, 10, 3, 0, 0, 0, time.UTC)
 
-// quietReporter is a reporter outside a pod: the previous-run fields come from
-// the surveyed runs alone, and no API server is ever read.
-func quietReporter(t *testing.T) *reporting.Reporter {
-	t.Helper()
-	t.Setenv(testPodEnv, "")
-	rep, err := reporting.New(context.Background(), reporting.Config{
-		APIHostEnv: testHostEnv, APIPortEnv: testPortEnv,
-		TokenFile: "/token", CAFile: "/ca",
-		RequestTimeout: model.Duration(time.Second),
-		NamespaceEnv:   testNamespaceEnv, PodEnv: testPodEnv,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return rep
-}
-
 func surveyedRun(storage, id string, at time.Time, manifest bool, outcome model.Outcome) reporting.SurveyedRun {
 	return reporting.SurveyedRun{
 		Storage: storage, RunID: id, Kind: model.RunKindScheduled,
@@ -50,7 +33,7 @@ func TestPreviousDerivesTheNewestScheduledRun(t *testing.T) {
 		{Storage: "alpha", RunID: "m-new", Kind: model.RunKindManual,
 			StartedAt: previousBase.Add(2 * time.Hour), Manifest: true, Outcome: model.OutcomeDelivered},
 	}
-	prev := quietReporter(t).Previous(context.Background(), runs)
+	prev := reporting.Previous(model.PreviousRun{}, runs)
 	if prev.RunID != "s-new" || prev.Unfinished {
 		t.Fatalf("previous = %+v, want the newest scheduled run, finished", prev)
 	}
@@ -72,7 +55,7 @@ func TestPreviousMarksAnUnfinishedRun(t *testing.T) {
 		{Storage: "alpha", RunID: "m-lost", Kind: model.RunKindManual,
 			StartedAt: previousBase.Add(2 * time.Hour)},
 	}
-	prev := quietReporter(t).Previous(context.Background(), runs)
+	prev := reporting.Previous(model.PreviousRun{}, runs)
 	if prev.RunID != "s-lost" || !prev.Unfinished {
 		t.Fatalf("previous = %+v, want the unfinished scheduled run", prev)
 	}
@@ -88,7 +71,7 @@ func TestPreviousMarksAnUnfinishedRun(t *testing.T) {
 // answer never depends on map order.
 func TestPreviousMergesEveryStorageOfOneRun(t *testing.T) {
 	started := previousBase.Add(time.Hour)
-	merged := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	merged := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		surveyedRun("alpha", "s-1", previousBase.Add(2*time.Hour), false, ""),
 		surveyedRun("beta", "s-1", started, true, model.OutcomeDelivered),
 	})
@@ -99,7 +82,7 @@ func TestPreviousMergesEveryStorageOfOneRun(t *testing.T) {
 		t.Fatalf("last good = %s, want the manifest's own start %s", merged.LastGoodAt, started)
 	}
 
-	disagreeing := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	disagreeing := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		surveyedRun("beta", "s-1", started, true, model.OutcomeDelivered),
 		surveyedRun("alpha", "s-1", started, true, model.OutcomeFailed),
 	})
@@ -109,14 +92,14 @@ func TestPreviousMergesEveryStorageOfOneRun(t *testing.T) {
 
 	// No manifest anywhere: the newest object's modification time is the run's
 	// only instant, and the newest storage's reading of it wins.
-	manifestless := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	manifestless := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		surveyedRun("beta", "s-1", started.Add(time.Minute), false, ""),
 		surveyedRun("alpha", "s-1", started, false, ""),
 	})
 	if !manifestless.LastGoodAt.IsZero() || manifestless.RunID != "s-1" {
 		t.Fatalf("previous = %+v, want the manifestless run", manifestless)
 	}
-	if prev := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	if prev := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		surveyedRun("alpha", "s-old", previousBase, false, ""),
 		surveyedRun("beta", "s-old", started, false, ""),
 	}); !prev.Unfinished {
@@ -127,7 +110,7 @@ func TestPreviousMergesEveryStorageOfOneRun(t *testing.T) {
 // TestPreviousIsEmptyWithoutRuns: nothing surveyed answers nothing.
 func TestPreviousIsEmptyWithoutRuns(t *testing.T) {
 	for _, runs := range [][]reporting.SurveyedRun{nil, {}} {
-		prev := quietReporter(t).Previous(context.Background(), runs)
+		prev := reporting.Previous(model.PreviousRun{}, runs)
 		if prev.RunID != "" || prev.Unfinished || !prev.LastGoodAt.IsZero() || prev.Failure != nil || prev.Unavailable != "" {
 			t.Fatalf("previous = %+v, want the empty answer", prev)
 		}
@@ -137,7 +120,7 @@ func TestPreviousIsEmptyWithoutRuns(t *testing.T) {
 // TestPreviousBreaksATieByRunID: two runs that started in the same instant are
 // ordered by run id, so every storage's answer names the same previous run.
 func TestPreviousBreaksATieByRunID(t *testing.T) {
-	prev := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	prev := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		surveyedRun("alpha", "s-b", previousBase, true, model.OutcomeDelivered),
 		surveyedRun("alpha", "s-a", previousBase, true, model.OutcomeDelivered),
 	})
@@ -149,12 +132,13 @@ func TestPreviousBreaksATieByRunID(t *testing.T) {
 	}
 }
 
-// TestPreviousIncludesThePreviousJobFailure: the cluster's record of the failed
+// TestPreviousIncludesTheClusterHalf: the cluster's record of the failed
 // previous Job reaches the same answer as the surveyed runs.
-func TestPreviousIncludesThePreviousJobFailure(t *testing.T) {
+func TestPreviousIncludesTheClusterHalf(t *testing.T) {
 	srv := kubeapitest.New(t)
 	previousJobFixtures(t, srv)
-	prev := newReporterIn(t, srv).Previous(context.Background(), []reporting.SurveyedRun{
+	job := newReporterIn(t, srv).PreviousJob(context.Background())
+	prev := reporting.Previous(job, []reporting.SurveyedRun{
 		surveyedRun("alpha", "s-early", previousBase, true, model.OutcomeDelivered),
 	})
 	if prev.RunID != "s-early" || !prev.LastGoodAt.Equal(previousBase) {
@@ -174,7 +158,8 @@ func TestPreviousSurvivesAnUnreadablePreviousJob(t *testing.T) {
 	srv := kubeapitest.New(t)
 	previousJobFixtures(t, srv)
 	srv.Deny("jobs")
-	prev := newReporterIn(t, srv).Previous(context.Background(), []reporting.SurveyedRun{
+	job := newReporterIn(t, srv).PreviousJob(context.Background())
+	prev := reporting.Previous(job, []reporting.SurveyedRun{
 		surveyedRun("alpha", "s-early", previousBase, true, model.OutcomeDelivered),
 	})
 	if !strings.HasPrefix(prev.Unavailable, "previous run status unavailable: ") {
@@ -197,7 +182,7 @@ func TestC4_MissingKindIsNotAPreviousRun(t *testing.T) {
 	goodAt := previousBase
 	brokenAt := previousBase.Add(2 * time.Hour)
 
-	prev := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	prev := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		{Storage: "alpha", RunID: "s-good", Kind: model.RunKindScheduled,
 			StartedAt: goodAt, Manifest: true, Outcome: model.OutcomeDelivered},
 		{Storage: "alpha", RunID: "s-nokind",
@@ -210,7 +195,7 @@ func TestC4_MissingKindIsNotAPreviousRun(t *testing.T) {
 		t.Fatalf("last good = %s, want %s: a kindless manifest is not protection", prev.LastGoodAt, goodAt)
 	}
 
-	if prev := quietReporter(t).Previous(context.Background(), []reporting.SurveyedRun{
+	if prev := reporting.Previous(model.PreviousRun{}, []reporting.SurveyedRun{
 		{Storage: "alpha", RunID: "s-nokind", StartedAt: brokenAt},
 	}); prev.RunID != "" || prev.Unfinished {
 		t.Fatalf("previous = %+v, want none: a kindless run is a problem run", prev)
@@ -223,7 +208,8 @@ func TestC4_MissingKindIsNotAPreviousRun(t *testing.T) {
 func TestM8_PreviousWithoutRunsStillReadsThePreviousJob(t *testing.T) {
 	srv := kubeapitest.New(t)
 	previousJobFixtures(t, srv)
-	prev := newReporterIn(t, srv).Previous(context.Background(), nil)
+	job := newReporterIn(t, srv).PreviousJob(context.Background())
+	prev := reporting.Previous(job, nil)
 	if prev.RunID != "" || prev.Unfinished || !prev.LastGoodAt.IsZero() {
 		t.Fatalf("previous = %+v, want no surveyed run", prev)
 	}

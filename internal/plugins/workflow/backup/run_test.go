@@ -1,6 +1,7 @@
 package backup_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/catalog/catalogtest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/planning"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
@@ -774,20 +776,83 @@ func seedSurveyRun(t *testing.T, f *storagetest.Fake, id string, at time.Time, m
 	f.PutObject("runs/"+id+"/manifest.json", body, at)
 }
 
+// The names the reporting config of the workflow tests uses: the fake API
+// server's address, and this test process's own pod identity.
+const (
+	prevHostEnv      = "GCB_REPORT_HOST"
+	prevPortEnv      = "GCB_REPORT_PORT"
+	prevNamespaceEnv = "GCB_REPORT_NAMESPACE"
+	prevPodEnv       = "GCB_REPORT_POD"
+
+	prevNamespace = "infrastructure"
+)
+
+// reportingConfig points the reporting plugin at the fake API server and gives
+// this process the pod identity the ownership chain starts from.
+func reportingConfig(t *testing.T, srv *kubeapitest.Server, mutate func(map[string]any)) map[string]any {
+	t.Helper()
+	opts := srv.Connection(t, prevHostEnv, prevPortEnv)
+	t.Setenv(prevNamespaceEnv, prevNamespace)
+	t.Setenv(prevPodEnv, "backup-now")
+	cfg := map[string]any{
+		"api_host_env": prevHostEnv, "api_port_env": prevPortEnv,
+		"token_file": opts.TokenFile, "ca_file": opts.CAFile,
+		"request_timeout": "10s", "walk_timeout": "10s",
+		"namespace_env": prevNamespaceEnv, "pod_env": prevPodEnv,
+	}
+	if mutate != nil {
+		mutate(cfg)
+	}
+	return cfg
+}
+
+// reportingChain arranges one run's ownership chain in the fake API: the
+// caller's own pod and Job — the Job counting one failed earlier attempt — a
+// newer failed Job of the same CronJob with its pod and one Warning event, and
+// the failed attempt's pod.
+func reportingChain(t *testing.T, srv *kubeapitest.Server) {
+	t.Helper()
+	srv.AddPod(`{"metadata":{"name":"backup-now","namespace":"` + prevNamespace + `",
+		"ownerReferences":[{"kind":"Job","name":"backup-now-job"}]},"status":{"phase":"Running"}}`)
+	srv.AddJob(`{"metadata":{"name":"backup-now-job","namespace":"` + prevNamespace + `",
+		"ownerReferences":[{"kind":"CronJob","name":"backup"}]},"status":{"failed":1}}`)
+	srv.AddPod(`{"metadata":{"name":"backup-now-failed","namespace":"` + prevNamespace + `","labels":{"job-name":"backup-now-job"},
+		"ownerReferences":[{"kind":"Job","name":"backup-now-job"}]},"status":{"phase":"Failed",
+		"containerStatuses":[{"name":"backup","state":{"terminated":{"exitCode":137,"reason":"OOMKilled"}}}]}}`)
+	srv.AddJob(`{"metadata":{"name":"backup-prev-job","namespace":"` + prevNamespace + `","uid":"job-uid-1","creationTimestamp":"2026-10-14T03:00:00Z",
+		"ownerReferences":[{"kind":"CronJob","name":"backup"}]},
+		"status":{"conditions":[{"type":"Failed","status":"True","reason":"BackoffLimitExceeded","message":"Job has reached the specified backoff limit"}]}}`)
+	srv.AddPod(`{"metadata":{"name":"backup-prev-pod","namespace":"` + prevNamespace + `","labels":{"job-name":"backup-prev-job"},
+		"ownerReferences":[{"kind":"Job","name":"backup-prev-job"}]},"status":{"phase":"Failed",
+		"containerStatuses":[{"name":"backup","state":{"terminated":{"exitCode":7,"reason":"Error"}}}]}}`)
+	srv.AddEvent(`{"metadata":{"name":"backup-prev-job.1","namespace":"` + prevNamespace + `","creationTimestamp":"2026-10-14T03:00:20Z","uid":"ev-1"},
+		"type":"Warning","reason":"FailedCreate","message":"Error creating: pods is forbidden",
+		"involvedObject":{"kind":"Job","name":"backup-prev-job","uid":"job-uid-1"},
+		"lastTimestamp":"2026-10-14T03:00:20Z"}`)
+}
+
+// finishedEvent answers the newest finished event a fake notifier received.
+func finishedEvent(t *testing.T, n *fakeNotifier) model.Event {
+	t.Helper()
+	ev, ok := n.Finished()
+	if !ok {
+		t.Fatal("no finished event was recorded")
+	}
+	return ev
+}
+
 func TestNotificationsCarryPreviousAndOutcome(t *testing.T) {
 	w := newWorld(t)
 	n := &fakeNotifier{}
 	w.Notifiers["ops"] = n
+	srv := kubeapitest.New(t)
+	reportingChain(t, srv)
 	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
 	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
 	cfg["catalog"] = instance("fake")
 	cfg["plugins"] = map[string]any{
 		"bundles": []any{}, "disabled": []any{},
-		"config": map[string]any{"reporting": map[string]any{
-			"api_host_env": "GCB_REPORT_HOST", "api_port_env": "GCB_REPORT_PORT",
-			"token_file": "/var/run/secrets/token", "ca_file": "/var/run/secrets/ca.crt",
-			"request_timeout": "30s", "namespace_env": "GCB_REPORT_NAMESPACE", "pod_env": "GCB_REPORT_POD",
-		}},
+		"config": map[string]any{"reporting": reportingConfig(t, srv, nil)},
 	}
 	e := w.newAssembly(t, cfg)
 	// The previous scheduled night started and never reported; the one before it
@@ -805,9 +870,17 @@ func TestNotificationsCarryPreviousAndOutcome(t *testing.T) {
 	if len(names) != 2 || names[0] != "run_started" || names[1] != "run_finished" {
 		t.Fatalf("events %v", names)
 	}
-	// The started event goes out before the survey: it carries no previous data.
-	if got := n.Events[0].Run.Previous; got != (model.PreviousRun{}) {
-		t.Fatalf("the started event carries previous Data: %+v", got)
+	// The started event goes out before the survey: it carries the cluster half
+	// of the previous-run record and no storage half.
+	started := n.Events[0].Run.Previous
+	if started.RunID != "" || started.Unfinished || !started.LastGoodAt.IsZero() {
+		t.Fatalf("the started event carries storage data: %+v", started)
+	}
+	if started.Failure == nil || started.Failure.Job != "backup-prev-job" {
+		t.Fatalf("the started event misses the previous Job's failure: %+v", started)
+	}
+	if started.Attempts == nil || started.Attempts.Failed != 1 || len(started.Attempts.Pods) != 1 {
+		t.Fatalf("the started event misses the own Job's failed attempt: %+v", started.Attempts)
 	}
 	prev := n.Events[1].Run.Previous
 	if prev.RunID != "20261010T042000Z" || !prev.Unfinished {
@@ -816,11 +889,345 @@ func TestNotificationsCarryPreviousAndOutcome(t *testing.T) {
 	if !prev.LastGoodAt.Equal(lastGood) {
 		t.Fatalf("last good %v, want %v", prev.LastGoodAt, lastGood)
 	}
+	if prev.Failure == nil || prev.Failure.Job != "backup-prev-job" || prev.Failure.Consecutive != 1 {
+		t.Fatalf("the finished event's cluster half = %+v, want the start read's", prev.Failure)
+	}
+	if prev.Attempts == nil || prev.Attempts.Failed != 1 {
+		t.Fatalf("the finished event's attempts = %+v, want the start read's", prev.Attempts)
+	}
 	if n.Events[1].Run.Outcome != model.OutcomeDelivered {
 		t.Fatalf("final event %q", n.Events[1].Run.Outcome)
 	}
 	if rep.Outcome != model.OutcomeDelivered {
 		t.Fatalf("run outcome %q", rep.Outcome)
+	}
+	// One walk at the start, none at the finish: the start read succeeded.
+	if calls := srv.Calls("jobs"); calls != 1 {
+		t.Fatalf("the Job listing ran %d times, want the one start read", calls)
+	}
+	// The manifest is written before the storage half is joined in, and it keeps
+	// a zero previous record.
+	body, ok := f.Bytes("runs/" + rep.RunID + "/manifest.json")
+	if !ok {
+		t.Fatal("manifest missing")
+	}
+	var manifest model.RunReport
+	if err := jsonUnmarshal(body, &manifest); err != nil {
+		t.Fatalf("manifest does not parse: %v", err)
+	}
+	if manifest.Previous != (model.PreviousRun{}) {
+		t.Fatalf("the manifest carries previous-run data: %+v", manifest.Previous)
+	}
+}
+
+// TestA3_TheStartReadFailsOnceAndTheFinishReReads: when the start walk cannot
+// list the Jobs, the started event says so and the finish window repeats the
+// walk exactly once — the finished event carries the failure the start missed.
+func TestA3_TheStartReadFailsOnceAndTheFinishReReads(t *testing.T) {
+	w := newWorld(t)
+	n := &fakeNotifier{}
+	w.Notifiers["ops"] = n
+	srv := kubeapitest.New(t)
+	reportingChain(t, srv)
+	// The first request on the jobs chain is the own-Job read, the second the
+	// listing that fails.
+	srv.FailNth("jobs", 500, 2)
+	cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+	cfg["catalog"] = instance("fake")
+	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{},
+		"config": map[string]any{"reporting": reportingConfig(t, srv, nil)}}
+	e := w.newAssembly(t, cfg)
+
+	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != model.OutcomeDelivered {
+		t.Fatalf("outcome %q: an unreadable previous status must never fail the run", rep.Outcome)
+	}
+	started := n.Events[0].Run.Previous
+	if started.Unavailable == "" {
+		t.Fatalf("the started event misses the failed read: %+v", started)
+	}
+	// The attempts were read before the failing listing: they are kept.
+	if started.Attempts == nil || started.Attempts.Failed != 1 {
+		t.Fatalf("the attempts read before the error were lost: %+v", started.Attempts)
+	}
+	finished := n.Events[1].Run.Previous
+	if finished.Failure == nil || finished.Failure.Job != "backup-prev-job" {
+		t.Fatalf("the finish re-read did not fill the failure: %+v", finished)
+	}
+	if calls := srv.Calls("jobs"); calls != 2 {
+		t.Fatalf("the Job listing ran %d times, want the start read and its one re-read", calls)
+	}
+}
+
+// TestA3_AnEventListErrorAlsoSendsTheFinishToReRead: the event listing is part
+// of the walk, so its failure marks the start record unavailable — keeping the
+// failure the events explain — and the finish repeats the walk exactly once.
+func TestA3_AnEventListErrorAlsoSendsTheFinishToReRead(t *testing.T) {
+	w := newWorld(t)
+	n := &fakeNotifier{}
+	w.Notifiers["ops"] = n
+	srv := kubeapitest.New(t)
+	reportingChain(t, srv)
+	// The first event listing fails the start walk; the re-read's is served.
+	srv.FailNth("events", 500, 1)
+	cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+	cfg["catalog"] = instance("fake")
+	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{},
+		"config": map[string]any{"reporting": reportingConfig(t, srv, nil)}}
+	e := w.newAssembly(t, cfg)
+
+	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != model.OutcomeDelivered {
+		t.Fatalf("outcome %q: an unreadable previous status must never fail the run", rep.Outcome)
+	}
+	started := n.Events[0].Run.Previous
+	if started.Unavailable == "" || started.Failure == nil || started.Failure.Job != "backup-prev-job" {
+		t.Fatalf("the start read = %+v, want the failure kept beside unavailable", started)
+	}
+	if len(started.Failure.Events) != 0 {
+		t.Fatalf("events = %+v, want none from the failed listing", started.Failure.Events)
+	}
+	finished := n.Events[1].Run.Previous
+	if finished.Failure == nil || len(finished.Failure.Events) != 1 {
+		t.Fatalf("the finish re-read did not fill the events: %+v", finished.Failure)
+	}
+	if calls := srv.Calls("jobs"); calls != 2 {
+		t.Fatalf("the Job listing ran %d times, want the start read and its one re-read", calls)
+	}
+}
+
+// TestA2_TheReReadCannotTakeTheFinishWindow: a held API on the re-read is cut by
+// the window part the reserve leaves to it, and the finished event still goes
+// out — with the unavailable status it managed to read.
+func TestA2_TheReReadCannotTakeTheFinishWindow(t *testing.T) {
+	w := newWorld(t)
+	n := &fakeNotifier{}
+	w.Notifiers["ops"] = n
+	srv := kubeapitest.New(t)
+	reportingChain(t, srv)
+	srv.FailNth("jobs", 500, 2)
+	// The start read's listing spends two seconds before it answers its forced
+	// 500; the re-read must be cut well before the same hold ends.
+	srv.Hold = map[string]time.Duration{"jobs": 2 * time.Second}
+	cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+	cfg["catalog"] = instance("fake")
+	cfg["run"].(map[string]any)["finish_allowance"] = "2s"
+	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{},
+		"config": map[string]any{"reporting": reportingConfig(t, srv, func(c map[string]any) {
+			c["walk_timeout"] = "30s"
+		})}}
+	e := w.newAssembly(t, cfg)
+
+	start := time.Now()
+	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != model.OutcomeDelivered {
+		t.Fatalf("outcome %q: an unreadable previous status must never fail the run", rep.Outcome)
+	}
+	if ev, ok := n.Finished(); !ok || ev.Run.Previous.Unavailable == "" {
+		t.Fatalf("the finished event was not recorded with the unavailable status: %+v", ev.Run.Previous)
+	}
+	// The re-read's bound is (W−R)/2 = 500ms here; the held request cannot take
+	// the whole window.
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the re-read took %s, want it cut by the window's bound", took)
+	}
+}
+
+// TestA8_TheFinishedNotificationFitsItsWindow: a hung receiver with no armed
+// mark — no reserve — gets three ten-second attempts (t=0, 15s, 35s) and the
+// fourth is never started, because its wait plus one bound no longer fits the
+// sixty-second window. The old ladder slept into the deadline instead.
+func TestA8_TheFinishedNotificationFitsItsWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		n := &fakeNotifier{FailOn: model.EventFinished, Hold: 10 * time.Second, Bound: 10 * time.Second}
+		w.Notifiers["ops"] = n
+		cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+		cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+		cfg["catalog"] = instance("fake")
+		cfg["run"].(map[string]any)["finish_allowance"] = "2m"
+		// The held receiver and the slow record write spend real budget; the run
+		// deadline must not cut the production they delay.
+		cfg["run"].(map[string]any)["deadline"] = "10m"
+		cfg["run"].(map[string]any)["retry"] = map[string]any{
+			"attempts": 4, "initial_delay": "5s", "max_delay": "40s", "jitter": 0,
+		}
+		e := w.newAssembly(t, cfg)
+
+		start := time.Now()
+		rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Outcome != model.OutcomeDelivered {
+			t.Fatalf("outcome %q: a failed finished notification is not fatal by default", rep.Outcome)
+		}
+		if got := n.Calls(model.EventFinished); got != 3 {
+			t.Fatalf("finished attempts = %d, want 3", got)
+		}
+		if _, ok := n.Finished(); ok {
+			t.Fatal("a failing notifier recorded a finished event")
+		}
+		if got := n.Calls(model.EventStarted); got != 1 {
+			t.Fatalf("started attempts = %d, want 1", got)
+		}
+		// The started event's own attempt spends the ten-second hold, so the
+		// finish window starts at t=10 and a 55s return is exactly the 45s
+		// ladder: three attempts and the skipped fourth wait.
+		if took := time.Since(start); took > 55*time.Second {
+			t.Fatalf("the run returned %s after its start, want the ladder to stop at 45s of the finish window", took)
+		}
+	})
+}
+
+// TestA9_TheOwnPendingMarkIsRemovedInsideTheWindow: a hung receiver and a slow
+// catalog. The reserve keeps 30s of the 60s window for the record write, so the
+// notification gets two attempts and the removal of this run's own pending id
+// still fits — the id is gone after the run.
+func TestA9_TheOwnPendingMarkIsRemovedInsideTheWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		f := storagetest.NewFake()
+		w.ExtraStorages["alpha"] = &asyncOnlyStorage{Fake: f}
+		w.Storages["alpha"] = f
+		record := catalogtest.NewLeaser()
+		record.WriteBound = 30 * time.Second
+		record.WriteHold = 20 * time.Second
+		n := &fakeNotifier{FailOn: model.EventFinished, Hold: 10 * time.Second, Bound: 10 * time.Second}
+		w.Notifiers["ops"] = n
+		cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+		cfg["catalog"] = instance("record")
+		registerCatalogType(t, w, "record", record)
+		cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+		cfg["run"].(map[string]any)["finish_allowance"] = "2m"
+		// The held receiver and the slow record write spend real budget; the run
+		// deadline must not cut the production they delay.
+		cfg["run"].(map[string]any)["deadline"] = "10m"
+		cfg["run"].(map[string]any)["retry"] = map[string]any{
+			"attempts": 4, "initial_delay": "5s", "max_delay": "40s", "jitter": 0,
+		}
+		e := w.newAssembly(t, cfg)
+
+		start := time.Now()
+		rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Outcome != model.OutcomeDelivered {
+			t.Fatalf("outcome %q: %+v", rep.Outcome, rep.Storages)
+		}
+		if got := n.Calls(model.EventFinished); got != 2 {
+			t.Fatalf("finished attempts = %d, want 2: the reserve ends the ladder at 25s", got)
+		}
+		if unc := record.Uncertainty(); unc != nil {
+			t.Fatalf("the run's own pending id stayed in the record: %+v", unc)
+		}
+		// The finish window opens after the started attempt's 10s hold and the
+		// record write's 20s hold, so its end is at t=90: the 75s return is the
+		// 25s notification ladder plus the 20s removal inside it.
+		if took := time.Since(start); took > 90*time.Second {
+			t.Fatalf("the run returned %s after its start, want the removal inside the finish window", took)
+		}
+	})
+}
+
+// TestA10_TheReserveIsClippedToHalfTheWindow: a catalog whose write bound exceeds
+// half the window reserves only half of it and says so; the notification still
+// gets that half, and the pending id is removed.
+func TestA10_TheReserveIsClippedToHalfTheWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWorld(t)
+		f := storagetest.NewFake()
+		w.ExtraStorages["alpha"] = &asyncOnlyStorage{Fake: f}
+		w.Storages["alpha"] = f
+		record := catalogtest.NewLeaser()
+		record.WriteBound = 2 * time.Minute
+		n := &fakeNotifier{FailOn: model.EventFinished, Hold: 10 * time.Second, Bound: 10 * time.Second}
+		w.Notifiers["ops"] = n
+		cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+		cfg["catalog"] = instance("record")
+		registerCatalogType(t, w, "record", record)
+		cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+		cfg["run"].(map[string]any)["finish_allowance"] = "2m"
+		// The held receiver and the slow record write spend real budget; the run
+		// deadline must not cut the production they delay.
+		cfg["run"].(map[string]any)["deadline"] = "10m"
+		cfg["run"].(map[string]any)["retry"] = map[string]any{
+			"attempts": 4, "initial_delay": "5s", "max_delay": "40s", "jitter": 0,
+		}
+		var logBuf bytes.Buffer
+		e := newAssemblyLogged(t, w, cfg, &logBuf)
+
+		rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.Outcome != model.OutcomeDelivered {
+			t.Fatalf("outcome %q: %+v", rep.Outcome, rep.Storages)
+		}
+		if !strings.Contains(logBuf.String(), "lease.reserve.clipped") {
+			t.Fatalf("the clipped reserve was not logged:\n%s", logBuf.String())
+		}
+		if got := n.Calls(model.EventFinished); got != 2 {
+			t.Fatalf("finished attempts = %d, want 2: the clipped reserve leaves half the window", got)
+		}
+		if unc := record.Uncertainty(); unc != nil {
+			t.Fatalf("the run's own pending id stayed in the record: %+v", unc)
+		}
+	})
+}
+
+// TestA1_A3_RefusedAfterStartedStillObeysTheReadRules: a run refused after its
+// started event — an asynchronous storage without a durable record — reads the
+// cluster once at the start, sends the cluster half in both events, and the
+// finish window makes no second request.
+func TestA1_A3_RefusedAfterStartedStillObeysTheReadRules(t *testing.T) {
+	w := newWorld(t)
+	n := &fakeNotifier{}
+	w.Notifiers["ops"] = n
+	f := storagetest.NewFake()
+	w.ExtraStorages["alpha"] = &asyncOnlyStorage{Fake: f}
+	w.Storages["alpha"] = f
+	srv := kubeapitest.New(t)
+	reportingChain(t, srv)
+	cfg := baseConfig(t, map[string]any{"alpha": storageInstance("fake", "keep_last")})
+	cfg["notifiers"] = map[string]any{"ops": instance("fake")}
+	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{},
+		"config": map[string]any{"reporting": reportingConfig(t, srv, nil)}}
+	e := w.newAssembly(t, cfg)
+
+	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != model.OutcomeFailed || rep.Lease == nil {
+		t.Fatalf("the async run was not refused: %+v", rep)
+	}
+	started := n.Events[0].Run.Previous
+	finished, ok := n.Finished()
+	if !ok {
+		t.Fatal("the refused run sent no finished event")
+	}
+	if started.Failure == nil || finished.Run.Previous.Failure == nil {
+		t.Fatalf("the cluster half is missing: started=%+v finished=%+v", started, finished.Run.Previous)
+	}
+	if started.Attempts == nil || finished.Run.Previous.Attempts == nil {
+		t.Fatalf("the attempts are missing: started=%+v finished=%+v", started, finished.Run.Previous)
+	}
+	if calls := srv.Calls("jobs"); calls != 1 {
+		t.Fatalf("the Job listing ran %d times, want the one start read", calls)
 	}
 }
 

@@ -106,7 +106,7 @@ its name.
 | `install` | the chart installs; the pre-install `validate` hook ran; every object exists |
 | `manual_run` | a manual Job completes; the writer lease is released; the catalog carries no run history; the receiver got `run_finished` |
 | `restore` | `restore list` shows the run; `restore apply --mode side-by-side` puts the rows in a database beside the original |
-| `previous_run_failure` | a Job that failed before the tool started (exit 7) is reported by the next run's notification |
+| `previous_run_failure` | a Job that failed before the tool started (exit 7) is reported by the next run's `run_started` and `run_finished` notifications |
 | `writer_lease` | with a claim left behind by a killed holder, a second manual run is refused, never a second writer |
 | `upgrade_rejected` | an invalid config fails at the hook and the installed release is untouched |
 | `TestK3sState` | the `stage` initContainer snapshots the node's k3s datastore and the run uploads it |

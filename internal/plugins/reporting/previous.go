@@ -28,20 +28,33 @@ type SurveyedRun struct {
 	Outcome  model.Outcome
 }
 
-// Previous returns .Run.Previous: the newest scheduled run the storages hold —
-// unfinished when none of them kept its manifest — the newest scheduled run that
-// reported delivered or degraded, and the previous Job's failure read from the
-// cluster. The Job read never fails the run: an unreadable status is reported in
-// Unavailable.
-func (r *Reporter) Previous(ctx context.Context, runs []SurveyedRun) model.PreviousRun {
-	prev := derivePrevious(runs)
-	failure, err := r.PreviousJobFailure(ctx)
-	switch {
-	case err != nil:
+// PreviousJob returns the cluster's half of .Run.Previous, read once per run
+// right after the writer lease decision and carried by both events: the failed
+// earlier attempts of this run's own Job, the previous Job of this run's own
+// CronJob and how many Jobs of it failed in a row. The whole walk runs under
+// the configured walk_timeout; each request additionally ends at
+// request_timeout, so a request ends at whichever comes first. The Job read
+// never fails the run: an unreadable status is reported in Unavailable, beside
+// every fact the reads before the error established.
+func (r *Reporter) PreviousJob(ctx context.Context) model.PreviousRun {
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.WalkTimeout.Std())
+	defer cancel()
+	attempts, failure, err := r.walk(ctx)
+	prev := model.PreviousRun{Attempts: attempts, Failure: failure}
+	if err != nil {
 		prev.Unavailable = "previous run status unavailable: " + err.Error()
-	case failure != nil:
-		prev.Failure = failure
 	}
+	return prev
+}
+
+// Previous combines the cluster's half read at the start with the storage
+// half: the newest scheduled run the storages hold — unfinished when none of
+// them kept its manifest — and the newest scheduled run that reported delivered
+// or degraded. The storage half exists only for a finished event; the cluster
+// half comes from the one start read, or from its one allowed re-read.
+func Previous(job model.PreviousRun, runs []SurveyedRun) model.PreviousRun {
+	prev := derivePrevious(runs)
+	prev.Attempts, prev.Failure, prev.Unavailable = job.Attempts, job.Failure, job.Unavailable
 	return prev
 }
 

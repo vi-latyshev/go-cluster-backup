@@ -109,6 +109,20 @@ notifiers:
         run_started: |
           🚀 Backup started
           📦 {{ .Run.RunID }}
+          {{ with .Run.Previous.Failure }}
+          ⚠️ Previous run failed before it reported: {{ .Reason }}{{ if gt .Consecutive 1 }} ({{ .Consecutive }} in a row){{ end }}
+          {{ range .Containers }}{{ if .Terminated }}✗ {{ .Container }}: {{ .Terminated.Reason }} (exit {{ .Terminated.ExitCode }}) {{ clip 160 .Terminated.Message }}
+          {{ else if .Waiting }}✗ {{ .Container }}: {{ .Waiting }}
+          {{ end }}{{ end }}
+          {{ end }}
+          {{ with .Run.Previous.Attempts }}
+          ⚠️ Earlier attempts of this Job failed: {{ .Failed }} failed, {{ .Deleted }} left no pod
+          {{ range .Pods }}✗ {{ .Name }}{{ with .Reason }}: {{ . }}{{ end }}{{ with .Message }} — {{ clip 160 . }}{{ end }}
+          {{ range .Containers }}  ✗ {{ .Container }}: {{ with .Terminated }}{{ .Reason }} (exit {{ .ExitCode }}) {{ clip 160 .Message }}{{ else }}{{ .Waiting }}{{ end }}
+          {{ end }}{{ end }}
+          {{ end }}
+          {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}
+          {{ end }}
         run_finished: |
           {{ pick .Run.Outcome "delivered" "✅ Backup completed" "degraded" "⚠️ Backup DEGRADED" "failed" "❌ Backup FAILED" }}
           📦 {{ .Run.RunID }}
@@ -116,9 +130,15 @@ notifiers:
           ⚠️ Previous run did not report
           {{ end }}
           {{ with .Run.Previous.Failure }}
-          ⚠️ Previous run failed before it reported: {{ .Reason }}
+          ⚠️ Previous run failed before it reported: {{ .Reason }}{{ if gt .Consecutive 1 }} ({{ .Consecutive }} in a row){{ end }}
           {{ range .Containers }}{{ if .Terminated }}✗ {{ .Container }}: {{ .Terminated.Reason }} (exit {{ .Terminated.ExitCode }}) {{ clip 160 .Terminated.Message }}
           {{ else if .Waiting }}✗ {{ .Container }}: {{ .Waiting }}
+          {{ end }}{{ end }}
+          {{ end }}
+          {{ with .Run.Previous.Attempts }}
+          ⚠️ Earlier attempts of this Job failed: {{ .Failed }} failed, {{ .Deleted }} left no pod
+          {{ range .Pods }}✗ {{ .Name }}{{ with .Reason }}: {{ . }}{{ end }}{{ with .Message }} — {{ clip 160 . }}{{ end }}
+          {{ range .Containers }}  ✗ {{ .Container }}: {{ with .Terminated }}{{ .Reason }} (exit {{ .ExitCode }}) {{ clip 160 .Message }}{{ else }}{{ .Waiting }}{{ end }}
           {{ end }}{{ end }}
           {{ end }}
           {{ if .Run.Previous.Unavailable }}ℹ️ {{ .Run.Previous.Unavailable }}

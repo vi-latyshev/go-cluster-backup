@@ -294,9 +294,41 @@ type PreviousRun struct {
 	// rejected initContainer, ImagePullBackOff, a PSA refusal, a deadline, an
 	// OOMKill). Nil when the previous Job succeeded or there is none.
 	Failure *PreviousFailure `json:"failure,omitempty"`
-	// Unavailable is set when the previous Job's status could not be read — a
-	// missing RBAC grant, no identity. It is visible, and it never fails a run.
+	// Attempts describes the failed earlier attempts of this run's own Job:
+	// a retried night whose first pod died never reaches a report otherwise.
+	// Nil on a first attempt.
+	Attempts *AttemptFailure `json:"attempts,omitempty"`
+	// Unavailable is set when the cluster's status could not be read — a
+	// missing RBAC grant, no identity, the walk's time budget. It is visible,
+	// and it never fails a run.
 	Unavailable string `json:"unavailable,omitempty"`
+}
+
+// AttemptFailure is what earlier attempts of this run's own Job left behind:
+// the Job's own failed count and the failed pods still listed. Failed counts a
+// pod deleted after its failure, so an attempt that left no pod still counts.
+type AttemptFailure struct {
+	Job string `json:"job"`
+	// Failed is the Job's status.failed: every failed attempt it counted.
+	Failed int `json:"failed"`
+	// Deleted is how many failed attempts left no pod to read — a node drain or
+	// a deletion by hand. It is computed only from a complete pod listing; when
+	// that listing failed, Failed is carried without it.
+	Deleted int `json:"deleted,omitempty"`
+	// Pods is one entry per failed pod of the own Job still listed, this run's
+	// own pod excluded.
+	Pods []FailedPod `json:"pods,omitempty"`
+}
+
+// FailedPod is one failed earlier pod of the run's own Job: the pod status's
+// own reason and message (kubelet Evicted, DeadlineExceeded) and its
+// containers. A pod whose containers were already garbage-collected still
+// carries the reason and message, which is the whole explanation there is.
+type FailedPod struct {
+	Name       string             `json:"name"`
+	Reason     string             `json:"reason,omitempty"`
+	Message    string             `json:"message,omitempty"`
+	Containers []ContainerFailure `json:"containers,omitempty"`
 }
 
 // PreviousFailure is why a previous Job failed before the tool ran, read from
@@ -307,9 +339,12 @@ type PreviousFailure struct {
 	Job string `json:"job"`
 	// Reason and Message are the Job's Failed condition — BackoffLimitExceeded,
 	// DeadlineExceeded, FailedCreate and the message the controller wrote.
-	Reason     string             `json:"reason,omitempty"`
-	Message    string             `json:"message,omitempty"`
-	Containers []ContainerFailure `json:"containers,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+	// Consecutive is how many Jobs of the own CronJob failed in a row — this one
+	// and the ones directly before it, as far as the cluster keeps them.
+	Consecutive int                `json:"consecutive"`
+	Containers  []ContainerFailure `json:"containers,omitempty"`
 	// Events are the Job's own Warning events, newest first. They are the only
 	// record when no Pod was ever created — a Pod Security admission refusal
 	// (FailedCreate) leaves an Event and no container status at all.

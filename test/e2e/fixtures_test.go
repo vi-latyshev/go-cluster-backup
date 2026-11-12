@@ -408,6 +408,12 @@ func (e *Env) toolConfig(ns, catalog string) string {
 	).Replace(toolConfigTemplate)
 }
 
+// previousEcho is the notification fragment both events carry: the previous
+// Job's failure and the failed earlier attempts of the run's own Job. A run
+// that dies before its own report still reaches the receiver through the next
+// run's run_started.
+const previousEcho = ` previous={{ with .Run.Previous.Failure }}failed job={{ .Job }} reason={{ .Reason }}{{ range .Containers }} container={{ .Container }}{{ with .Terminated }} exit={{ .ExitCode }} reason={{ .Reason }}{{ end }}{{ end }}{{ else }}none{{ end }} attempts={{ with .Run.Previous.Attempts }}{{ .Failed }}{{ else }}none{{ end }}`
+
 const toolConfigTemplate = `run:
   spool_dir: /spool
   spool_reserve_bytes: 1GiB
@@ -512,9 +518,9 @@ notifiers:
       timeout: 10s
       events:
         run_started: |
-          event=run_started run={{ .Run.RunID }} kind={{ .Run.Kind }}
+          event=run_started run={{ .Run.RunID }} kind={{ .Run.Kind }}` + previousEcho + `
         run_finished: |
-          event=run_finished run={{ .Run.RunID }} kind={{ .Run.Kind }} outcome={{ .Run.Outcome }} previous={{ with .Run.Previous.Failure }}failed job={{ .Job }} reason={{ .Reason }}{{ range .Containers }} container={{ .Container }}{{ with .Terminated }} exit={{ .ExitCode }} reason={{ .Reason }}{{ end }}{{ end }}{{ else }}none{{ end }}
+          event=run_finished run={{ .Run.RunID }} kind={{ .Run.Kind }} outcome={{ .Run.Outcome }}` + previousEcho + `
       payload: |
         {{ .Text }}
 `

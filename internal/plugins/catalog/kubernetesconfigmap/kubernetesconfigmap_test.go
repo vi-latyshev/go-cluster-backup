@@ -120,6 +120,27 @@ func TestApplyContributesCompiledDescriptor(t *testing.T) {
 	}
 }
 
+// TestWriteTimeoutIsTwoRequests: one record write is a read and a patch, so the
+// finish window's reserve for removing this run's pending mark is twice
+// request_timeout.
+func TestWriteTimeoutIsTwoRequests(t *testing.T) {
+	srv := kubeapitest.New(t)
+	opts := srv.Connection(t, testHostEnv, testPortEnv)
+	c := buildCatalog(t, configFixture{
+		APIHostEnv: testHostEnv, APIPortEnv: testPortEnv,
+		TokenFile: opts.TokenFile, CAFile: opts.CAFile,
+		RequestTimeout: "7s",
+		Namespace:      namespace, Name: name, LeaseKey: leaseKey,
+	})
+	bounded, ok := c.(catalog.WriteBounded)
+	if !ok {
+		t.Fatal("the catalog cannot bound one record write")
+	}
+	if got := bounded.WriteTimeout(); got != 14*time.Second {
+		t.Fatalf("WriteTimeout() = %s, want twice the 7s request timeout", got)
+	}
+}
+
 func TestCatalogConformance(t *testing.T) {
 	catalogtest.Run(t, func(t *testing.T) catalog.Catalog {
 		srv := kubeapitest.New(t)

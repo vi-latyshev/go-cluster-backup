@@ -297,7 +297,7 @@ func TestNewRefusesAMalformedReportingBlock(t *testing.T) {
 	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{}, "config": map[string]any{
 		"reporting": map[string]any{
 			"api_host_env": 5, "api_port_env": "PORT", "token_file": "/token", "ca_file": "/ca",
-			"request_timeout": "30s", "namespace_env": "NAMESPACE", "pod_env": "POD",
+			"request_timeout": "30s", "walk_timeout": "30s", "namespace_env": "NAMESPACE", "pod_env": "POD",
 		},
 	}}
 	_, err := w.newAssemblyErr(t, cfg)
@@ -314,7 +314,7 @@ func TestNewRefusesInvalidReportingSettings(t *testing.T) {
 	cfg["plugins"] = map[string]any{"bundles": []any{}, "disabled": []any{}, "config": map[string]any{
 		"reporting": map[string]any{
 			"api_host_env": "", "api_port_env": "PORT", "token_file": "/token", "ca_file": "/ca",
-			"request_timeout": "30s", "namespace_env": "NAMESPACE", "pod_env": "POD",
+			"request_timeout": "30s", "walk_timeout": "30s", "namespace_env": "NAMESPACE", "pod_env": "POD",
 		},
 	}}
 	_, err := w.newAssemblyErr(t, cfg)
@@ -328,7 +328,7 @@ func TestNewRefusesInvalidReportingSettings(t *testing.T) {
 func TestBuildReporterRefusesACancelledStartup(t *testing.T) {
 	e := &Assembly{merged: jsontext.Value(`{"plugins":{"bundles":[],"disabled":[],"config":{"reporting":{` +
 		`"api_host_env":"HOST","api_port_env":"PORT","token_file":"/token","ca_file":"/ca",` +
-		`"request_timeout":"30s","namespace_env":"NAMESPACE","pod_env":"POD"}}}}`)}
+		`"request_timeout":"30s","walk_timeout":"30s","namespace_env":"NAMESPACE","pod_env":"POD"}}}}`)}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := e.buildReporter(ctx); err == nil || !strings.Contains(err.Error(), "context canceled") {

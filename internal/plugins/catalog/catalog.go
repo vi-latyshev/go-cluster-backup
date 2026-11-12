@@ -60,6 +60,17 @@ type Catalog interface {
 
 var Kind = instances.NewKind[Catalog]("catalog")
 
+// WriteBounded is the optional capability a Catalog implements when it can
+// bound one record write — MarkUncertainty or ClearUncertainty, read and patch
+// together. A run that armed the record's uncertainty keeps that bound as the
+// finish window's reserve, so the removal of its own pending id survives a
+// receiver that spends the rest of the window. A catalog without the capability
+// answers no bound, and the reserve is zero. The Catalog interface is not
+// widened.
+type WriteBounded interface {
+	WriteTimeout() time.Duration
+}
+
 // ErrLeaseHeld is the marker a Catalog returns when a live lease is already
 // held. It is a serialisable sentinel discovered by errors.Is, never a private
 // type: a manual run refuses on it at once, a scheduled one waits its bounded

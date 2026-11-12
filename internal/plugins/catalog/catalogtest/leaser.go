@@ -34,6 +34,12 @@ type Leaser struct {
 	// HolderUnsupported makes HolderState answer errors.ErrUnsupported: a leaser
 	// that cannot prove anything at all.
 	HolderUnsupported bool
+	// WriteHold makes MarkUncertainty and ClearUncertainty wait this long (or
+	// the context's end) before acting: one slow record write.
+	WriteHold time.Duration
+	// WriteBound is what WriteTimeout reports: the upper bound of one record
+	// write the workflow reserves out of its finish window.
+	WriteBound time.Duration
 }
 
 // NewLeaser returns a record with no holder, counting its first acquisition as
@@ -67,7 +73,7 @@ func (l *Leaser) Acquire(ctx context.Context, req catalog.LeaseRequest) (catalog
 }
 
 func (l *Leaser) MarkUncertainty(ctx context.Context, lease catalog.Lease) error {
-	if err := ctx.Err(); err != nil {
+	if err := l.holdWrite(ctx); err != nil {
 		return err
 	}
 	l.mu.Lock()
@@ -83,7 +89,7 @@ func (l *Leaser) MarkUncertainty(ctx context.Context, lease catalog.Lease) error
 }
 
 func (l *Leaser) ClearUncertainty(ctx context.Context, lease catalog.Lease) error {
-	if err := ctx.Err(); err != nil {
+	if err := l.holdWrite(ctx); err != nil {
 		return err
 	}
 	l.mu.Lock()
@@ -93,6 +99,29 @@ func (l *Leaser) ClearUncertainty(ctx context.Context, lease catalog.Lease) erro
 	}
 	l.record.Uncertainty = nil
 	return nil
+}
+
+// WriteTimeout is the optional catalog.WriteBounded capability.
+func (l *Leaser) WriteTimeout() time.Duration { return l.WriteBound }
+
+// holdWrite waits one record write's schedule: WriteHold, or the caller's
+// cancellation, whichever comes first.
+func (l *Leaser) holdWrite(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	hold := l.WriteHold
+	l.mu.Unlock()
+	if hold <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(hold):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (l *Leaser) ObserveUncertainty(ctx context.Context, lease catalog.Lease, digest string) error {

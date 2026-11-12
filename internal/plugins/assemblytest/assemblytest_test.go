@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"encoding/json/jsontext"
@@ -422,6 +423,31 @@ func TestNotifierBranches(t *testing.T) {
 	if names := empty.EventNames(); len(names) != 0 {
 		t.Fatalf("EventNames = %v", names)
 	}
+
+	// The optional notifier.Bounded capability and the per-event counter.
+	bounded := &Notifier{Bound: 7 * time.Second}
+	if got := bounded.AttemptTimeout(); got != 7*time.Second {
+		t.Fatalf("AttemptTimeout() = %s, want the configured 7s", got)
+	}
+	// A hold has no socket behind it: both waits run on virtual time.
+	synctest.Test(t, func(t *testing.T) {
+		held := &Notifier{Hold: time.Millisecond}
+		if err := held.Notify(context.Background(), model.Event{Name: "held"}); err != nil {
+			t.Fatalf("a held call = %v", err)
+		}
+		if got := held.Calls("held"); got != 1 {
+			t.Fatalf("Calls(held) = %d, want 1", got)
+		}
+		if got := held.Calls("never"); got != 0 {
+			t.Fatalf("Calls(never) = %d, want 0", got)
+		}
+		// A call whose context ends while the hold is in flight answers at once.
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), time.Millisecond)
+		defer cancelWait()
+		if err := (&Notifier{Hold: time.Hour}).Notify(waitCtx, model.Event{Name: "x"}); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a held call under a deadline = %v, want the deadline", err)
+		}
+	})
 }
 
 // TestAddTestRolesRefusesADuplicate: the compiled set already owns a role or

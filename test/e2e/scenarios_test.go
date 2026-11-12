@@ -116,7 +116,8 @@ func TestSuite(t *testing.T) {
 	})
 
 	// Scenario e: a run that failed before the tool started is reported by the
-	// next run of the same CronJob.
+	// next run of the same CronJob — at its start already, not only when it
+	// finishes.
 	t.Run("previous_run_failure", func(t *testing.T) {
 		broken := "prev-fail-" + timestamp()
 		e.createJobFrom(t, ns, suiteFullname+"-manual", broken, []string{"/bin/sh", "-c", "exit 7"})
@@ -126,6 +127,7 @@ func TestSuite(t *testing.T) {
 		e.createJobFrom(t, ns, suiteFullname+"-manual", after, nil)
 		e.jobSucceeded(t, ns, after, 5*time.Minute)
 
+		e.waitForEcho(t, ns, "event=run_started", "previous=failed", "exit=7", "job="+broken, "attempts=none")
 		e.waitForEcho(t, ns, "event=run_finished", "previous=failed", "exit=7", "job="+broken)
 	})
 
@@ -279,12 +281,19 @@ func (e *Env) createJobFrom(t *testing.T, ns, cronjob, name string, command []st
 	e.apply(t, string(edited))
 }
 
-// jobFailed waits for a Job to have failed.
+// jobFailed waits for a Job's Failed condition to be true. The condition, not
+// status.failed: on Kubernetes 1.31 and later FailureTarget comes first, and a
+// wait on the failed-pod count could observe the Job before the controller
+// recorded the terminal condition the walk reads.
 func (e *Env) jobFailed(t *testing.T, ns, name string, timeout time.Duration) {
 	t.Helper()
 	waitFor(t, "job/"+name+" failed", timeout, func() (bool, string) {
-		succeeded, failed := e.jobCounts(t, ns, name)
-		return failed > 0, fmt.Sprintf("succeeded=%d failed=%d", succeeded, failed)
+		out, err := e.exec("", "kubectl", "get", "job", name, "-n", ns,
+			"-o", `jsonpath={.status.conditions[?(@.type=="Failed")].status}`)
+		if err != nil {
+			return false, out
+		}
+		return strings.TrimSpace(out) == "True", "Failed condition: " + strings.TrimSpace(out)
 	})
 }
 
