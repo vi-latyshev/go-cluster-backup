@@ -874,6 +874,17 @@ func TestProbe(t *testing.T) {
 	if _, err := s.(source.Prober).Probe(context.Background(), strings.NewReader("torn")); err == nil {
 		t.Fatal("a torn archive probed clean")
 	}
+	// No usable suite anywhere: the probe refuses by name before any program
+	// runs. A fresh instance, because a resolved suite is memoized.
+	t.Setenv("PATH", t.TempDir())
+	s, err = build(t, config(t, listener(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.(source.Prober).Probe(context.Background(), strings.NewReader("archive"))
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent || !strings.Contains(err.Error(), "PostgreSQL client suite") {
+		t.Fatalf("Probe without a suite = %v (class %q), want a permanent refusal naming the suite", err, class)
+	}
 }
 
 // TestCheckBinariesReportsEveryBrokenSuite: every existing configured
@@ -1229,7 +1240,7 @@ func TestProbeCancelledMidRunReturnsTheContextError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { _, err := s.(source.Prober).Probe(ctx, strings.NewReader("archive")); done <- err }()
-	time.Sleep(150 * time.Millisecond)
+	waitStarted(t, "pg_restore")
 	cancel()
 	select {
 	case err := <-done:
