@@ -31,6 +31,13 @@ type Unit struct {
 	Source source.Source
 	// Artifact is the unit's envelope, with the unit's own name under it.
 	Artifact model.Artifact
+	// Pipeline is the processor instance names the unit's bytes flow through,
+	// in encode order: the parent's pipeline, because a unit is built from the
+	// same plugin type and the same routing.
+	Pipeline []string
+	// Warnings are the coded, non-fatal facts the credential decision found
+	// about this unit's bytes.
+	Warnings []model.Warning
 	// Problem is this unit's own failure: a unit whose source could not be built
 	// or checked fails alone, and the units beside it still run.
 	Problem error
@@ -41,6 +48,13 @@ type SourceFactory func(ctx context.Context, typ, instance string, raw jsontext.
 
 // SourceCheck runs one source's own Check exactly as the run checks it.
 type SourceCheck func(ctx context.Context, src source.Source, instance string) error
+
+// CredentialCheck applies one built source's credential/sealing decision
+// exactly as the run's Resolve does: a refusal fails the source, a warning is
+// carried beside its row. It is the configuration's own decision, applied to
+// discovered and enumerated sources the same way it is applied to declared
+// ones.
+type CredentialCheck func(ctx context.Context, src source.Source, artifact model.Artifact, pipeline []string) (model.Warning, error)
 
 // Own records a source with the caller's scope, which closes it in reverse
 // build order.
@@ -53,6 +67,9 @@ type Expansion struct {
 	Build SourceFactory
 	// Check runs the built source's Check; nil skips it, as a plugin without one.
 	Check SourceCheck
+	// Credential applies the run's credential/sealing decision to each built
+	// unit; nil skips it.
+	Credential CredentialCheck
 	// Own registers every source this expansion builds with the caller's scope;
 	// nil means the caller keeps ownership some other way.
 	Own Own
@@ -99,6 +116,7 @@ func (p Planner) Expand(ctx context.Context, parent Unit, e Expansion) []Unit {
 			Instance: parent.Instance + "/" + u.Name,
 			Type:     parent.Type,
 			Artifact: parent.Artifact,
+			Pipeline: parent.Pipeline,
 		}
 		unit.Artifact.Name = parent.Artifact.Name + "/" + u.Name
 		if why := unitNameRefusal(u.Name); why != "" {
@@ -115,13 +133,25 @@ func (p Planner) Expand(ctx context.Context, parent Unit, e Expansion) []Unit {
 		if c, ok := s.(io.Closer); ok && e.Own != nil {
 			e.Own(c)
 		}
-		if e.Check != nil {
+		// The credential decision is the run's own, applied before anything
+		// operational touches the unit: a refusal is this unit's failure, a
+		// warning rides beside it.
+		if e.Credential != nil {
+			w, err := e.Credential(ctx, s, unit.Artifact, unit.Pipeline)
+			switch {
+			case err != nil:
+				unit.Problem = err
+			case w.Code != "":
+				unit.Warnings = []model.Warning{w}
+			}
+		}
+		if e.Check != nil && unit.Problem == nil {
 			if err := e.Check(ctx, s, unit.Instance); err != nil {
 				unit.Problem = err
 			} else {
 				unit.Source = s
 			}
-		} else {
+		} else if unit.Problem == nil {
 			unit.Source = s
 		}
 		out = append(out, unit)

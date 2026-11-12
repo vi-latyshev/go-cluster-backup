@@ -322,9 +322,34 @@ func TestCheckShapeReachesIntoARealDiscoveryRule(t *testing.T) {
 			example = jsontext.Value(d.Example)
 		}
 	}
-	broken := bytes.Replace(example, []byte(`"connect_attempts": 6`), []byte(`"connect_attempts": "{{ port 0 0 }}"`), 1)
+	// The rules are read the way the assembly reads them: the module's document
+	// merged under a declared discovery, rule sources included, so the nested
+	// source config is complete before the shape walk sees it.
+	service, err := yamlToJSON(t, defaults.Defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defs, err := configuration.LoadDefaults(reg, []jsontext.Value{service})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := jsontext.Value(`{"discoveries":{"workloads":{"type":"kubernetes_labels","config":` + string(example) + `}}}`)
+	merged, _, mergeErrs := defs.Merge(reg, user)
+	if len(mergeErrs) > 0 {
+		t.Fatalf("the example discovery does not merge: %v", mergeErrs)
+	}
+	var declared struct {
+		Discoveries map[string]struct {
+			Config jsontext.Value `json:"config"`
+		} `json:"discoveries"`
+	}
+	if err := json.Unmarshal(merged, &declared); err != nil {
+		t.Fatal(err)
+	}
+	example = declared.Discoveries["workloads"].Config
+	broken := bytes.Replace(example, []byte(`"connect_attempts":6`), []byte(`"connect_attempts":"{{ port 0 0 }}"`), 1)
 	if bytes.Equal(broken, example) {
-		t.Fatal("the example no longer carries connect_attempts: 6; update this probe")
+		t.Fatal("the example no longer carries connect_attempts:6; update this probe")
 	}
 	firstRule := func(raw jsontext.Value) configuration.RuleSource {
 		t.Helper()
@@ -336,7 +361,7 @@ func TestCheckShapeReachesIntoARealDiscoveryRule(t *testing.T) {
 	}
 
 	rule := firstRule(broken)
-	err := reg.CheckShape("source", rule.Type, rule.Config, "/discoveries/workloads"+rule.ConfigPath)
+	err = reg.CheckShape("source", rule.Type, rule.Config, "/discoveries/workloads"+rule.ConfigPath)
 	if err == nil || !strings.Contains(err.Error(),
 		"/discoveries/workloads/pods/0/source/config/connect_attempts must be a JSON number, got a JSON string") {
 		t.Fatalf("a template in a real rule's number field slipped through: %v", err)

@@ -1,0 +1,97 @@
+# A per-node deployment: one writer per node, each backing up only the objects
+# its node owns. Two releases run this shape — one per node — and this file is
+# the node-a release. The node-b release states its own `writer_identity`, its
+# own storage prefix and its own catalog name; everything else is the same
+# document.
+#
+# Separate prefixes are the normal topology: each writer surveys, retains and
+# deletes under its own prefix, so no lease, collision check or retention pass
+# ever compares two writers' runs. A SHARED prefix is supported only when every
+# writer of it uses ONE catalog ConfigMap (one lease): one release creates it
+# and the peers set `catalog.create: false`. A shared prefix with unrelated
+# catalogs can overwrite another writer's manifest and is refused by no
+# configuration — do not build it.
+
+run:
+  spool_dir: /spool
+  spool_reserve_bytes: 1GiB
+  max_artifact_bytes: 3GiB
+  deadline: 90m
+  lease_hard_bound: 6000s
+  # The stable writer id: every manifest stores it, and protection counts only
+  # this writer's runs — a peer's run is never credited, kept by policy or
+  # deleted here, while its bytes still count against the cap. `node_scope`
+  # without one would let two writers treat each other's runs as their own.
+  writer_identity: node-a
+
+discoveries:
+  workloads:
+    type: kubernetes_labels
+    config:
+      secrets_path: /run/discovered
+      exclude: {label: backup.example/ignore, value: "true"}
+      undeclared_volumes: {importance: best_effort}
+      # The chart fills BACKUP_NODE_NAME from spec.nodeName in every writer
+      # pod. An empty value is the explicit opt-out of every node check; with
+      # node_scope on, the empty value refuses the discovery instead.
+      node_env: BACKUP_NODE_NAME
+      # Only objects this node owns are backed up. An object on a declared
+      # peer is recorded as an `elsewhere` exclusion naming that node; an
+      # object whose placement cannot be proven — or one on a node outside
+      # this list — fails its artifact instead of being silently skipped.
+      node_scope: true
+      # Every node that runs a writer of this configuration, this one
+      # included: a set that leaves out the writer reading it would delegate
+      # everything and back up nothing.
+      writer_nodes: [node-a, node-b]
+      pods: []
+      volumes:
+        # The claim is bound to a local PersistentVolume; the source reads the
+        # path the PersistentVolume reports, never a mount made for this pod.
+        # This file's node must be the node the volume is pinned to, or the
+        # artifact fails before the directory is opened.
+        - name: files
+          selector: "backup.example/engine=files"
+          min_matches: 0
+          artifact:
+            group: volumes
+            name: "{{ .Namespace }}/{{ .Name }}"
+            importance: required
+            sensitivity: plain
+          pipeline: [compress]
+          source:
+            type: files
+            config:
+              root: "{{ volumePath }}"
+              ignore_vanished: true
+              on_change: record
+
+processors:
+  compress:
+    type: zstd
+    config: {level: better, window_bytes: 8MiB, decode_window_bytes: 16MiB}
+
+storages:
+  primary:
+    type: s3
+    retention:
+      scheduled: {type: keep_last, config: {count: 7, count_incomplete: true}}
+      manual: {type: keep_last, config: {count: 3, count_incomplete: true}}
+    max_total_bytes: 50GB
+    time_budget: 30m
+    config:
+      endpoint: https://s3.example.com
+      region: us-east-1
+      bucket: cluster-backup
+      # One prefix per writer. A shared prefix needs one shared catalog — see
+      # the header of this file.
+      prefix: cluster-backup/node-a
+      access_key_id: {file: /run/secrets/s3/access-key-id}
+      secret_access_key: {file: /run/secrets/s3/secret-access-key}
+      addressing: path
+
+catalog:
+  type: kubernetes_configmap
+  config:
+    namespace: backup
+    name: go-cluster-backup-catalog-node-a

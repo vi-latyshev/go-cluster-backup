@@ -51,7 +51,7 @@ func buildLogged(t *testing.T, cfg string, log *slog.Logger) (source.Source, err
 }
 
 func config(root string, ignoreVanished bool) string {
-	return fmt.Sprintf(`{"root": %q, "ignore_vanished": %t}`, root, ignoreVanished)
+	return fmt.Sprintf(`{"root": %q, "ignore_vanished": %t, "on_change": "record"}`, root, ignoreVanished)
 }
 
 // tree writes a small tree: a file, a subdirectory with a file and a symlink.
@@ -251,8 +251,9 @@ func TestCheckRefusesMissingRoot(t *testing.T) {
 
 func TestNewRejectsBadConfig(t *testing.T) {
 	for _, cfg := range []string{
-		`{"root": "", "ignore_vanished": true}`,
-		`{"root": "relative", "ignore_vanished": true}`,
+		`{"root": "", "ignore_vanished": true, "on_change": "record"}`,
+		`{"root": "relative", "ignore_vanished": true, "on_change": "record"}`,
+		`{"root": "/tmp", "ignore_vanished": true, "on_change": "sometimes"}`,
 	} {
 		if _, err := build(t, cfg); err == nil {
 			t.Errorf("config %s accepted", cfg)

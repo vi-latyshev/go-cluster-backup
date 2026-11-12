@@ -719,6 +719,41 @@ func fluxExample(t *testing.T, root string) exampleValues {
 	return exampleValues{valuesYAML: string(encoded), config: config}
 }
 
+// TestFluxExampleExternalSecretFeedsTheConsumedSecret: the Flux HelmRelease
+// names one credential Secret twice — the volume mount the configuration reads
+// files from, and the RBAC grant for API-level reads — and the ExternalSecret
+// sample must create exactly that Secret, or a fresh Flux install starts with a
+// missing credential. Placeholders only: the test reads no store and no cluster.
+func TestFluxExampleExternalSecretFeedsTheConsumedSecret(t *testing.T) {
+	root := repoRoot(t)
+	release := loadYAML(t, filepath.Join(root, "examples", "flux", "helmrelease.yaml"))
+	values, ok := nested(release, "spec", "values").(map[string]any)
+	if !ok {
+		t.Fatal("examples/flux/helmrelease.yaml has no spec.values mapping")
+	}
+	var consumed []string
+	for _, raw := range asList(values["secretMounts"]) {
+		mount, _ := raw.(map[string]any)
+		if secretName, _ := mount["secretName"].(string); secretName != "" {
+			consumed = append(consumed, secretName)
+		}
+	}
+	consumed = append(consumed, stringsOf(nested(values, "rbac", "secretNames"))...)
+	if len(consumed) == 0 {
+		t.Fatal("the Flux HelmRelease consumes no Secret; the ExternalSecret sample has nothing to match")
+	}
+	external := loadYAML(t, filepath.Join(root, "examples", "flux", "externalsecret.yaml"))
+	if got, _ := external["apiVersion"].(string); got != "external-secrets.io/v1" {
+		t.Fatalf("examples/flux/externalsecret.yaml is %q, want the ExternalSecret v1 API", got)
+	}
+	target, _ := nested(external, "spec", "target", "name").(string)
+	for _, want := range consumed {
+		if target != want {
+			t.Errorf("the ExternalSecret target name is %q, want the HelmRelease's consumed Secret %q", target, want)
+		}
+	}
+}
+
 func argocdExample(t *testing.T, root string) exampleValues {
 	t.Helper()
 	doc := loadYAML(t, filepath.Join(root, "examples", "argocd", "application.yaml"))
@@ -844,6 +879,20 @@ func grants(role map[string]any, apiGroup, resource, verb string) bool {
 		}
 	}
 	return false
+}
+
+// TestNodeDiscoveryCanGetItsOwnNode: the node-local discovery reads the pod's
+// node to prove it runs where a pinned or local volume lives. The ClusterRole
+// grants get by name only; a list would enumerate every node and is not needed.
+func TestNodeDiscoveryCanGetItsOwnNode(t *testing.T) {
+	docs := documents(t, renderExample(t, "minimal"))
+	role := find(t, docs, "ClusterRole", fullname)
+	if !grants(role, "", "nodes", "get") {
+		t.Errorf("ClusterRole %s does not grant get on nodes, so node-local discovery cannot prove its pod's node", fullname)
+	}
+	if grants(role, "", "nodes", "list") {
+		t.Errorf("ClusterRole %s grants list on nodes; discovery reads its own node by name only", fullname)
+	}
 }
 
 // TestNotesPreflightRecipeFollowsTheRestoreArgs: a Job made from the restore
@@ -1050,6 +1099,168 @@ func TestEveryPodHonoursTheSharedExtras(t *testing.T) {
 	if initContainers == 0 {
 		t.Error("no initContainer was rendered, so the stage extras are not proven")
 	}
+}
+
+// writerInitContainersValues turns on the stage initContainer and adds two user
+// init containers to the writer pods: one plain collector mounting a
+// writer.volumes volume, and one that states the merged policy itself, which is
+// accepted rather than a conflict.
+func writerInitContainersValues(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "writer-init-containers.yaml")
+	body := `stage:
+  enabled: true
+writer:
+  volumes:
+    - name: writer-node
+      hostPath:
+        path: /node/writer
+        type: Directory
+  initContainers:
+    - name: collector
+      image: example.com/collector:1
+      command: ["/collector", "/node"]
+      volumeMounts:
+        - name: writer-node
+          mountPath: /node
+    - name: stated-policy
+      image: example.com/collector:1
+      terminationMessagePolicy: FallbackToLogsOnError
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing the writer init container values: %v", err)
+	}
+	return path
+}
+
+// TestWriterInitContainersGetTheTerminationPolicy: a user collector that fails
+// before the writer starts must leave its last log lines in the termination
+// message the previous-run report reads, so the chart merges
+// FallbackToLogsOnError into every entry. The entries render only on the writer
+// pods, before the stage initContainer, and may mount writer.volumes.
+func TestWriterInitContainersGetTheTerminationPolicy(t *testing.T) {
+	root := repoRoot(t)
+	manifest, err := render(t,
+		"-f", filepath.Join(root, "examples", "values", "minimal.yaml"),
+		"-f", writerInitContainersValues(t),
+		"--set-file", "config="+filepath.Join(root, "examples", "config", "minimal.yaml"),
+	)
+	if err != nil {
+		t.Fatalf("rendering the chart with writer.initContainers: %v", err)
+	}
+	docs := documents(t, manifest)
+	for _, objectName := range []string{fullname, fullname + "-manual"} {
+		pod := writerPod(t, docs, objectName)
+		var names []string
+		initContainers := asList(pod["initContainers"])
+		for _, raw := range initContainers {
+			container, _ := raw.(map[string]any)
+			names = append(names, fmt.Sprint(container["name"]))
+			if got, _ := container["terminationMessagePolicy"].(string); got != "FallbackToLogsOnError" {
+				t.Errorf("%s init container %v has terminationMessagePolicy %q, want FallbackToLogsOnError",
+					objectName, container["name"], got)
+			}
+		}
+		if got, want := strings.Join(names, ","), "collector,stated-policy,stage"; got != want {
+			t.Errorf("%s initContainers are %q, want %q (user entries before stage)", objectName, got, want)
+		}
+		collector := containerByName(t, pod, "initContainers", "collector")
+		if mounts := containerMountPaths(t, collector); !contains(mounts, "/node") {
+			t.Errorf("%s collector mounts %v, want /node from writer.volumes", objectName, mounts)
+		}
+		if volumes := volumeNames(t, pod); !contains(volumes, "writer-node") {
+			t.Errorf("%s declares %v, want the writer.volumes volume the collector mounts", objectName, volumes)
+		}
+	}
+
+	restorePod := at(t, find(t, docs, "CronJob", fullname+"-restore"), "spec", "jobTemplate", "spec", "template", "spec")
+	hookPod := at(t, find(t, docs, "Job", fullname+"-validate"), "spec", "template", "spec")
+	for what, pod := range map[string]map[string]any{"the restore pod": restorePod, "the hook pod": hookPod} {
+		for _, raw := range asList(pod["initContainers"]) {
+			container, _ := raw.(map[string]any)
+			if got, _ := container["name"].(string); got == "collector" || got == "stated-policy" {
+				t.Errorf("%s runs the writer-only init container %q", what, got)
+			}
+		}
+	}
+}
+
+// TestWriterInitContainerConflictingPolicyFailsRender: an explicit policy on a
+// user init container would drop the log tail the previous-run report needs, so
+// a conflicting value must fail the render instead of being rendered verbatim.
+func TestWriterInitContainerConflictingPolicyFailsRender(t *testing.T) {
+	root := repoRoot(t)
+	path := filepath.Join(t.TempDir(), "conflict.yaml")
+	body := `writer:
+  initContainers:
+    - name: collector
+      image: example.com/collector:1
+      terminationMessagePolicy: File
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing the conflicting policy values: %v", err)
+	}
+	_, err := render(t,
+		"-f", filepath.Join(root, "examples", "values", "minimal.yaml"),
+		"-f", path,
+		"--set-file", "config="+filepath.Join(root, "examples", "config", "minimal.yaml"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "terminationMessagePolicy") {
+		t.Fatalf("a conflicting init container policy returned %v, want a render failure naming terminationMessagePolicy", err)
+	}
+}
+
+// TestNodeEnvMatchesTheEmbeddedDefaults: the chart supplies the pod's node to
+// the containers that discover and restore node-local data, and the tool reads
+// the variable's name from its embedded defaults document, so the two must not
+// drift. The stage initContainer enumerates static sources only and gets no node
+// env.
+func TestNodeEnvMatchesTheEmbeddedDefaults(t *testing.T) {
+	root := repoRoot(t)
+	defaults := loadYAML(t, filepath.Join(root, "internal", "plugins", "configuration", "defaults", "defaults.yaml"))
+	nodeEnv, _ := nested(defaults, "plugins", "config", "discovery/kubernetes_labels", "node_env").(string)
+	if nodeEnv == "" {
+		t.Fatalf("the embedded defaults document declares no plugins.config.discovery/kubernetes_labels.node_env; " +
+			"the chart's BACKUP_NODE_NAME would be a hand-written duplicate (the integration step adds that default)")
+	}
+	docs := documents(t, renderExample(t, "k3s-single-node"))
+	for _, objectName := range []string{fullname, fullname + "-manual"} {
+		pod := writerPod(t, docs, objectName)
+		if got := fieldPath(containerByName(t, pod, "containers", "backup"), nodeEnv); got != "spec.nodeName" {
+			t.Errorf("%s backup container reads %s from %q, want the downward API fieldRef spec.nodeName", objectName, nodeEnv, got)
+		}
+		if entry := envEntry(containerByName(t, pod, "initContainers", "stage"), nodeEnv); entry != nil {
+			t.Errorf("%s stage initContainer carries %s; stage enumerates static sources and needs no node env", objectName, nodeEnv)
+		}
+	}
+	restore := containerByName(t, at(t, find(t, docs, "CronJob", fullname+"-restore"), "spec", "jobTemplate", "spec", "template", "spec"), "containers", "restore")
+	if got := fieldPath(restore, nodeEnv); got != "spec.nodeName" {
+		t.Errorf("the restore container reads %s from %q, want the downward API fieldRef spec.nodeName", nodeEnv, got)
+	}
+}
+
+// envEntry returns the named env entry of a container, or nil.
+func envEntry(container map[string]any, envName string) map[string]any {
+	for _, raw := range asList(container["env"]) {
+		entry, _ := raw.(map[string]any)
+		if entry["name"] == envName {
+			return entry
+		}
+	}
+	return nil
+}
+
+// fieldPath returns the downward API fieldRef path of a named env entry, or ""
+// when the container has no such entry.
+func fieldPath(container map[string]any, envName string) string {
+	entry := envEntry(container, envName)
+	if entry == nil {
+		return ""
+	}
+	valueFrom, _ := entry["valueFrom"].(map[string]any)
+	fieldRef, _ := valueFrom["fieldRef"].(map[string]any)
+	path, _ := fieldRef["fieldPath"].(string)
+	return path
 }
 
 // extrasValues is a values file that turns on the stage initContainer and adds

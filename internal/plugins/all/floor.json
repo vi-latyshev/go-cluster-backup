@@ -102,6 +102,7 @@
         "configuration",
         "discovery",
         "errors",
+        "human",
         "instances",
         "kubeapi",
         "model",
@@ -215,10 +216,23 @@
       "imports": [
         "configuration",
         "errors",
+        "extcmd",
         "instances",
         "model",
         "must",
         "notifier"
+      ]
+    },
+    {
+      "id": "pgclient",
+      "factory": false,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "extcmd",
+        "io",
+        "model"
       ]
     },
     {
@@ -339,12 +353,34 @@
       ]
     },
     {
+      "id": "retention/keep_versions",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "instances",
+        "retention"
+      ]
+    },
+    {
       "id": "source",
       "factory": false,
       "floor": true,
       "imports": [
         "instances",
         "model"
+      ]
+    },
+    {
+      "id": "source/collected",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "instances",
+        "io",
+        "model",
+        "source"
       ]
     },
     {
@@ -359,6 +395,19 @@
         "io",
         "model",
         "must",
+        "source"
+      ]
+    },
+    {
+      "id": "source/k3s_etcd",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "instances",
+        "io",
+        "model",
         "source"
       ]
     },
@@ -386,9 +435,24 @@
         "errors",
         "extcmd",
         "instances",
-        "io",
         "model",
         "must",
+        "pgclient",
+        "source"
+      ]
+    },
+    {
+      "id": "source/postgres_globals",
+      "factory": true,
+      "floor": false,
+      "imports": [
+        "configuration",
+        "errors",
+        "extcmd",
+        "instances",
+        "io",
+        "model",
+        "pgclient",
         "source"
       ]
     },

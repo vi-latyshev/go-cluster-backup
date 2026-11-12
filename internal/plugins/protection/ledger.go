@@ -30,6 +30,13 @@ type LedgerOptions struct {
 	StaleCutoff time.Time
 	// Retry is the execution policy every deletion call runs under.
 	Retry execution.Options
+	// WriterIdentity is the stable writer id this run belongs to, "" when the
+	// deployment did not opt into one. It is not a serialisation: writers that
+	// share a prefix must share its catalog/lease. It only tells a run of
+	// another writer apart from this one — such a run is never credited as a
+	// copy, fed to a policy, floored or deleted here, while its bytes still
+	// count against the storage's cap.
+	WriterIdentity string
 }
 
 // Accounting is the capacity-only view of the protection ledger: the bookings a
@@ -155,7 +162,7 @@ func (l *Ledger) Start(surveys map[string]inventory.Survey) {
 		cap.occupancy = surveyBytes(s)
 		cap.known = s.OK
 	}
-	l.state = newRetentionState(surveys)
+	l.state = newRetentionState(surveys, l.o.WriterIdentity)
 	l.started = true
 }
 
@@ -196,6 +203,19 @@ func (l *Ledger) Used(name string) int64 { return l.caps[name].used() }
 
 // Limits reports one storage's cap and the bytes held, for a refusal report.
 func (l *Ledger) Limits(name string) (limit, used int64) { return l.caps[name].limits() }
+
+// OccupancyKnown reports whether one storage's occupancy is a trustworthy
+// total: false when the survey failed and before any survey ran, or when the
+// lease records that an earlier writer's accepted writes may still land. A
+// manual admission refusal and a storage's report read it, so an unknown total
+// is never rendered as a numeric overflow.
+func (l *Ledger) OccupancyKnown(name string) bool {
+	if l == nil {
+		return false
+	}
+	c, ok := l.caps[name]
+	return ok && c.occupancyKnown()
+}
 
 // capState accounts one storage's occupancy against its configured cap and
 // admits a manual run's writes. Occupancy is the survey's own listing bytes —

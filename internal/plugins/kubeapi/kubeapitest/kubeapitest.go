@@ -1,10 +1,10 @@
 // Package kubeapitest is the fake Kubernetes API server the kubeapi client and
 // the Kubernetes plugins are tested against: an httptest TLS server that answers
-// the routes they use — pod, job, PVC, PV and event listings, pod and job reads,
-// Secrets, and ConfigMap reads, puts and patches — with the JSON shapes the real
-// API server returns — label selectors, phase field selectors, continue-token
-// pagination, base64 Secret data, and a ConfigMap update that can conflict on
-// resourceVersion.
+// the routes they use — pod, job, PVC, PV and event listings and reads, node
+// reads, Secrets, and ConfigMap reads, puts and patches — with the JSON shapes
+// the real API server returns — label selectors, phase field selectors,
+// continue-token pagination, base64 Secret data, and a ConfigMap update that can
+// conflict on resourceVersion.
 package kubeapitest
 
 import (
@@ -79,6 +79,7 @@ type Server struct {
 	pvs     []item
 	jobs    []item
 	events  []item
+	nodes   []item
 	secrets map[string]map[string]string
 	configs map[string]*configMap
 
@@ -145,6 +146,7 @@ func New(t *testing.T) *Server {
 	})
 	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/secrets/{name}", s.handleSecret)
 	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/pods/{name}", s.handlePodGet)
+	mux.HandleFunc("GET /api/v1/nodes/{name}", s.handleNodeGet)
 	mux.HandleFunc("GET /api/v1/namespaces/{namespace}/configmaps/{name}", s.handleConfigMapGet)
 	mux.HandleFunc("PUT /api/v1/namespaces/{namespace}/configmaps/{name}", s.handleConfigMapPut)
 	mux.HandleFunc("PATCH /api/v1/namespaces/{namespace}/configmaps/{name}", s.handleConfigMapPatch)
@@ -236,6 +238,28 @@ func (s *Server) handlePodGet(w http.ResponseWriter, r *http.Request) {
 // AddPod adds one pod object as raw JSON.
 func (s *Server) AddPod(raw string) { s.add(&s.pods, raw) }
 
+// AddNode adds one node object as raw JSON. A Node is cluster-scoped: its
+// fixture carries no namespace.
+func (s *Server) AddNode(raw string) { s.add(&s.nodes, raw) }
+
+// handleNodeGet serves one Node by name — the read a writer makes to prove its
+// own node is readable before it opens a node-local path.
+func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.refuse(r, w, "nodes/"+name, "nodes") {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, it := range s.nodes {
+		if it.name == name {
+			writeJSON(w, http.StatusOK, it.raw)
+			return
+		}
+	}
+	writeStatus(w, http.StatusNotFound, "NotFound", fmt.Sprintf("nodes %q not found", name))
+}
+
 // AddPVC adds one persistent volume claim object as raw JSON.
 func (s *Server) AddPVC(raw string) { s.add(&s.pvcs, raw) }
 
@@ -298,8 +322,8 @@ func (s *Server) add(list *[]item, raw string) {
 }
 
 // Deny answers one object or one whole resource with 403, the way RBAC refuses
-// a Secret outside resourceNames. Keys are "pods", "secrets", "configmaps",
-// "secrets/<namespace>/<name>" or "configmaps/<namespace>/<name>".
+// a Secret outside resourceNames. Keys are "pods", "nodes", "secrets",
+// "configmaps", "secrets/<namespace>/<name>" or "configmaps/<namespace>/<name>".
 func (s *Server) Deny(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -470,7 +494,7 @@ func (s *Server) forced(keys []string) (int, string, string) {
 		}
 		if s.denied[key] {
 			return http.StatusForbidden, "Forbidden",
-				fmt.Sprintf("secrets or configmaps %q is forbidden: User cannot get resource - add it to resourceNames", key)
+				fmt.Sprintf("resource %q is forbidden: User cannot get resource - add it to resourceNames", key)
 		}
 	}
 	return 0, "", ""

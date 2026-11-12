@@ -95,6 +95,14 @@ func validateCommand(ctx context.Context, opts Options, reg *instances.Registry,
 	if len(problems) > 0 {
 		return failure(stderr, opts.Program, "validate", errors.Join(problems...))
 	}
+	// Coded, non-fatal findings of the offline checks — a source type's
+	// published credential exception — are diagnostics, never a refusal: the
+	// same bytes are warned about, not failed, at run time.
+	if e != nil {
+		for _, w := range e.Warnings() {
+			writef(stderr, "warning: %s: %s\n", w.Code, w.Message)
+		}
+	}
 	if !*preflight {
 		writef(stdout, "%s: valid\n", *cfgPath)
 		return exitOK
@@ -116,11 +124,24 @@ func validateCommand(ctx context.Context, opts Options, reg *instances.Registry,
 		switch {
 		case r.Excluded != "":
 			// A decision, not a fault: the object was seen and deliberately
-			// carries no artifact, and its line says which decision it is.
+			// carries no artifact, and its line says which decision it is. An
+			// elsewhere delegation names the peer node that owns the object.
 			excluded++
-			writef(stdout, "  %s/%s: excluded (%s): %s\n", r.Kind, r.Instance, r.Excluded, r.ExcludedReason)
+			node := ""
+			if r.ExcludedNode != "" {
+				node = " of node " + r.ExcludedNode
+			}
+			writef(stdout, "  %s/%s: excluded (%s%s): %s\n", r.Kind, r.Instance, r.Excluded, node, r.ExcludedReason)
 		case r.OK:
-			writef(stdout, "  %s/%s: ok\n", r.Kind, r.Instance)
+			// A coded, non-fatal fact is part of the answer: a discovered
+			// plaintext exception must not read as a clean ok.
+			if len(r.Warnings) == 0 {
+				writef(stdout, "  %s/%s: ok\n", r.Kind, r.Instance)
+				continue
+			}
+			for _, warn := range r.Warnings {
+				writef(stdout, "  %s/%s: ok (warning %s: %s)\n", r.Kind, r.Instance, warn.Code, warn.Message)
+			}
 		default:
 			failed++
 			writef(stdout, "  %s/%s: FAILED: %s\n", r.Kind, r.Instance, r.Error)

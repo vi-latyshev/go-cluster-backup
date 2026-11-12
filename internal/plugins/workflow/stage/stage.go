@@ -75,6 +75,9 @@ type Source struct {
 	// Pipeline is the config pipeline name, kept for the report; the bytes are
 	// produced by Steps.
 	Pipeline string
+	// RateLimit is the source envelope's raw bytes per second, applied before
+	// the first processor: part of the envelope, never a chain step.
+	RateLimit model.ByteSize
 	// Steps are the processor instances of the pipeline, in config order.
 	Steps []pipeline.Step
 }
@@ -301,7 +304,7 @@ func (o Options) stageOne(ctx context.Context, src Source, checks map[Check]erro
 	}
 	plan := pipeline.Plan{
 		Source: src.Instance, SourceInstance: src.Name, SourceType: src.Type,
-		Artifact: src.Artifact, Steps: src.Steps,
+		Artifact: src.Artifact, Steps: src.Steps, RateLimit: src.RateLimit,
 	}
 	res, err := o.Pipeline.Resolve(ctx, plan)
 	if err != nil {
@@ -309,9 +312,15 @@ func (o Options) stageOne(ctx context.Context, src Source, checks map[Check]erro
 		return ar
 	}
 	ar.Artifact = res.Artifact
-	// The record carries the artifact's exact file name tail and the chain; from
-	// here on the file is named by it, never by a directory scan.
-	rec := source.StagedRecord{Ext: res.Artifact.Ext, Chain: res.Chain}
+	// The coded, non-fatal facts of these bytes — the credential exception — are
+	// part of the stage's report, exactly as they are part of a run's: the record
+	// carries them forward, and the command prints them.
+	ar.Warnings = res.Warnings
+	// The record carries the artifact's exact file name tail, the chain and the
+	// coded warnings the stage found (a source's published credential
+	// exception); from here on the file is named by it, never by a directory
+	// scan, and the run side reports the warnings with the artifact.
+	rec := source.StagedRecord{Ext: res.Artifact.Ext, Chain: res.Chain, Warnings: res.Warnings}
 	// The ext the writer appends is the source's and every processor's trait
 	// joined: StagedArtifactName refuses one that would step out of the stage
 	// dir, so a hostile or broken trait fails here, before a byte is produced.

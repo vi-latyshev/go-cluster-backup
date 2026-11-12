@@ -44,6 +44,9 @@ type artifactPlan struct {
 	artifact model.Artifact
 	pipeline string
 	refs     []string // processor instance names of the pipeline, in order
+	// rateLimit is the source envelope's raw-byte limit for this artifact,
+	// applied before the first processor: 0 is unlimited.
+	rateLimit model.ByteSize
 	// steps are the pipeline's processors, in config order, with the instance
 	// names the manifest records.
 	steps   []pipeline.Step
@@ -261,7 +264,7 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 
 	started := time.Now().UTC()
 	rep := model.RunReport{Schema: model.ManifestSchema, RunID: e.layout.RunID(req.Kind, started), Kind: req.Kind,
-		StartedAt: started, Outcome: model.OutcomeRunning}
+		StartedAt: started, Outcome: model.OutcomeRunning, WriterIdentity: run.WriterIdentity}
 	e.event(human.New("run.start",
 		human.Text("kind", string(req.Kind)),
 		human.Text("run", rep.RunID),
@@ -284,11 +287,17 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 	// everything up must not read as a problem: the only exclusion worth a line
 	// at info is an undeclared claim, and that is a failed artifact (see the
 	// discovery's undeclared_volumes), named among the failures.
+	// The summary line counts each verdict by its own name: an elsewhere
+	// exclusion is a declared delegation to a peer writer, never "covered or
+	// ignored", and the two must not read as one number.
+	covered, elsewhere := exclusionCounts(excluded)
 	e.event(human.New("discovery.summary",
-		human.Count("artifacts", int64(len(plans))), human.Count("covered", int64(len(excluded)))))
+		human.Count("artifacts", int64(len(plans))), human.Count("covered", covered),
+		human.Count("elsewhere", elsewhere)))
 	for _, x := range excluded {
 		e.event(human.Debug("discovery.excluded",
-			human.Text("object", x.Name), human.Text("kind", string(x.Kind)), human.Text("reason", x.Reason)))
+			human.Text("object", x.Name), human.Text("kind", string(x.Kind)),
+			human.Text("node", x.Node), human.Text("reason", x.Reason)))
 	}
 
 	order := e.storages
@@ -463,6 +472,13 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 			surveyWG.Wait()
 			if uncertain {
 				if _, serr := e.lease.SettleInheritedUncertainty(ctx, req.Kind, rep.RunID, e.storageNames(), surveys); serr != nil {
+					// The record stays uncertain — conservative, and the run continues
+					// unknown. The failure is a coded warning beside the outcome, never
+					// a fake lease refusal: the run is not refused, its occupancy is.
+					rep.Warnings = append(rep.Warnings, model.Warning{
+						Code:    "catalog.uncertainty.settle.failed",
+						Message: "occupancy stays unknown: " + serr.Error(),
+					})
 					e.event(human.Failure("lease.uncertain.failed", human.Text("run", rep.RunID),
 						human.Text("reason", "occupancy stays unknown: "+serr.Error())))
 				}
@@ -511,7 +527,7 @@ func (e *Workflow) runOperation(ctx context.Context, req RunRequest) (model.RunR
 				if _, ok := handles[sb.name]; !ok {
 					continue
 				}
-				transfers[sb.name] = e.transferFor(sb, req.Kind, results[sb.name])
+				transfers[sb.name] = e.transferFor(sb, req.Kind, results[sb.name], e.sweepEligibility(surveys[sb.name]))
 			}
 			e.setTransfers(transfers)
 			// A run that was killed outright left its unfinished uploads behind: sweep
@@ -759,7 +775,7 @@ func (e *Workflow) collectArtifacts(ctx context.Context, checks failedChecks, sc
 	for _, sb := range e.sources {
 		plan := artifactPlan{
 			instance: sb.name, srcType: sb.typ, src: sb.inst, artifact: sb.artifact, pipeline: sb.pipeline,
-			refs: sb.refs, steps: stepsOf(e.processorTypes, sb.refs, sb.procs),
+			refs: sb.refs, steps: stepsOf(e.processorTypes, sb.refs, sb.procs), rateLimit: sb.rateLimit,
 		}
 		if err := checks.err("source", sb.name); err != nil {
 			plan.problem = fmt.Errorf("source check: %w", err)
@@ -787,13 +803,15 @@ func (e *Workflow) collectArtifacts(ctx context.Context, checks failedChecks, sc
 				// one record of the decision, and nothing of it is built — an
 				// excluded volume never reads its source's config. The group is
 				// the one the discovery named, which is empty when no rule would
-				// have produced the object.
+				// have produced the object; a declared peer's node is what makes
+				// an elsewhere verdict an accounted delegation, not a silent skip.
 				excluded = append(excluded, model.Exclusion{
 					Name: f.Artifact.Name, Group: f.ExcludedGroup, Kind: f.Excluded, Reason: f.ExcludedReason,
+					Node: f.ExcludedNode,
 				})
 				continue
 			}
-			plan := artifactPlan{instance: f.Name, artifact: f.Artifact}
+			plan := artifactPlan{instance: f.Name, artifact: f.Artifact, rateLimit: f.RateLimit}
 			switch {
 			case f.Problem != "":
 				// The object matched a rule but its source could not be
@@ -852,6 +870,20 @@ func (e *Workflow) collectArtifacts(ctx context.Context, checks failedChecks, sc
 		seen[name] = true
 	}
 	return plans, excluded
+}
+
+// exclusionCounts splits the run's deliberate exclusions by what they mean: an
+// ignored or covered object is accounted for by this run, while an elsewhere
+// object is a declared peer writer's and is never "covered or ignored".
+func exclusionCounts(excluded []model.Exclusion) (covered, elsewhere int64) {
+	for _, x := range excluded {
+		if x.Kind == model.ExclusionElsewhere {
+			elsewhere++
+			continue
+		}
+		covered++
+	}
+	return covered, elsewhere
 }
 
 // expandPlan turns one resolved plan into the plans of the artifacts its
@@ -921,13 +953,59 @@ func pipelineCheckProblem(checks failedChecks, refs []string) error {
 
 // transferFor binds the transfer provider to one destination of this run: the
 // handle is the only write authority, the ledger is where its overlapping
-// upload books, and the storage wall-clock budget is the caller's.
-func (e *Workflow) transferFor(sb *storageBinding, kind model.RunKind, st *storageRunState) *transfer.Transfer {
+// upload books, the storage wall-clock budget is the caller's, and the eligible
+// test is the stale sweep's ownership filter for this destination.
+func (e *Workflow) transferFor(sb *storageBinding, kind model.RunKind, st *storageRunState, eligible func(string) bool) *transfer.Transfer {
 	return transfer.New(transfer.Options{
 		Retry: e.retry, Clock: st.clock, Log: e.deps("storage", sb.cfg.Type, sb.name).Log,
 		Accounting: e.ledger.Accounting(), Storage: sb.name, MaxArtifactBytes: e.run.MaxArtifactBytes.Int64(),
-		Manual: kind == model.RunKindManual, CallParallelism: sb.cfg.CallParallelism,
+		Manual: kind == model.RunKindManual, CallParallelism: sb.cfg.CallParallelism, Eligible: eligible,
 	})
+}
+
+// sweepEligibility is the stale-multipart sweep's ownership test for one
+// storage. With no writer identity every upload belongs to this writer — the
+// deployment's one-writer-per-prefix rule. With one, a sweep may abort only an
+// upload under a run whose readable manifest on this storage names the same
+// writer: another writer's run, a manifestless run and a run this build could
+// not read have no provable owner, and no sweep ever aborts on a guess.
+func (e *Workflow) sweepEligibility(sur inventory.Survey) func(string) bool {
+	own := e.run.WriterIdentity
+	if own == "" {
+		return nil
+	}
+	var prefixes []string
+	if sur.OK {
+		for id, r := range sur.Runs {
+			if r.Manifest == nil || r.ManifestProblem != "" || r.Manifest.WriterIdentity != own {
+				continue
+			}
+			key, err := e.layout.RunKey(id)
+			if err != nil {
+				continue // a key that does not render cannot prove ownership
+			}
+			prefixes = append(prefixes, key+"/")
+		}
+	}
+	return func(key string) bool {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(key, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// pipelinePlan is the pipeline's input for one artifact: the source envelope,
+// its rate limit and the resolved pipeline. Both Resolve and Produce read the
+// same plan, so the limiter can never be configured on one call and forgotten on
+// the other.
+func pipelinePlan(plan artifactPlan) pipeline.Plan {
+	return pipeline.Plan{
+		Source: plan.src, SourceInstance: plan.instance, SourceType: plan.srcType,
+		Artifact: plan.artifact, Steps: plan.steps, RateLimit: plan.rateLimit,
+	}
 }
 
 // stepsOf pairs the pipeline's's processor instances with the types they were
@@ -972,16 +1050,18 @@ func (e *Workflow) processArtifact(ctx context.Context, sp *spool.Spool, plan ar
 	// The plan's traits are resolved before the first byte: the object key exists
 	// before its bytes, so a multipart storage can reserve the cap and open its
 	// upload while the producer is still writing.
-	res, err := e.pipe.Resolve(ctx, pipeline.Plan{
-		Source: plan.src, SourceInstance: plan.instance, SourceType: plan.srcType,
-		Artifact: plan.artifact, Steps: plan.steps,
-	})
+	res, err := e.pipe.Resolve(ctx, pipelinePlan(plan))
 	if err != nil {
 		ar.Error = fmt.Errorf("artifact %s: %w", plan.artifact.Name, err).Error()
 		e.event(human.Failure("artifact.failed",
 			human.Text("artifact", human.ArtifactLabel(plan.artifact.Group, plan.artifact.Name)), human.Text("reason", ar.Error)))
 		return ar, verified
 	}
+	// The resolved facts include the warnings the source's envelope already
+	// knows — bytes that carry credentials under a published exception, a
+	// stage record carried forward — and they travel to the manifest and the
+	// finished message with the artifact's result.
+	ar.Warnings = res.Warnings
 	key, err := e.layout.ArtifactKey(runID, res.Artifact)
 	if err != nil {
 		ar.Error = err.Error()
@@ -1047,11 +1127,7 @@ func (e *Workflow) processArtifact(ctx context.Context, sp *spool.Spool, plan ar
 			}
 		}(sb)
 	}
-	producePlan := pipeline.Plan{
-		Source: plan.src, SourceInstance: plan.instance, SourceType: plan.srcType,
-		Artifact: plan.artifact, Steps: plan.steps,
-	}
-	pa, err := e.pipe.Produce(ctx, sp, producePlan, res, g)
+	pa, err := e.pipe.Produce(ctx, sp, pipelinePlan(plan), res, g)
 	if err != nil {
 		// The storages that overlapped are still unwinding: wait for them before
 		// the artifact is declared failed, so no goroutine outlives its file.
@@ -1067,6 +1143,7 @@ func (e *Workflow) processArtifact(ctx context.Context, sp *spool.Spool, plan ar
 	ar.Chain = pa.Chain
 	ar.Source = pa.Source
 	ar.Stats = pa.Stats
+	ar.Warnings = pa.Warnings
 	// Every storage the followers did not verify uploads the finished file: a
 	// destination without the capability, one that fits one request, and one
 	// whose overlap was refused all take the whole-object path. Each storage
@@ -1233,8 +1310,15 @@ func (e *Workflow) reserveWrite(sb *storageBinding, st *storageRunState, key str
 		return true
 	}
 	limit, used := e.ledger.Limits(sb.name)
-	err := fmt.Errorf("cap_exceeded: %s would put the storage past its configured max_total_bytes (%s of %s used)",
+	reason := fmt.Sprintf("%s would put the storage past its configured max_total_bytes (%s of %s used)",
 		label, model.ByteSize(used), model.ByteSize(limit))
+	if !e.ledger.OccupancyKnown(sb.name) {
+		// An unknown total is a lower bound, never a proven overflow: the refusal
+		// names the unknown, not a cap the run may still fit under.
+		reason = fmt.Sprintf("%s cannot be admitted: the storage's occupancy is unknown (%s held against a %s cap is a lower bound)",
+			label, model.ByteSize(used), model.ByteSize(limit))
+	}
+	err := fmt.Errorf("cap_exceeded: %s", reason)
 	st.refuseCap(err, limit, used)
 	e.storageEvent(sb, human.Failure("storage.cap.refused",
 		human.Text("artifact", label), human.Bytes("size", size), human.Text("reason", err.Error())))
@@ -1333,7 +1417,8 @@ func (e *Workflow) writeManifests(ctx context.Context, kind model.RunKind, order
 			_, err := execution.Attempt(ctx, e.retry, "manifest "+sb.name, func(ctx context.Context, _ int) (struct{}, error) {
 				st.addAttempts(1)
 				if _, err := execution.SafeValue(func() (model.ObjectInfo, error) {
-					return handles[sb.name].Put(ctx, storage.PutRequest{Key: key, Size: int64(len(body)), SHA256: sum},
+					return handles[sb.name].Put(ctx, storage.PutRequest{Key: key, Size: int64(len(body)), SHA256: sum,
+						Purpose: storage.PurposeMetadata},
 						bytes.NewReader(body))
 				}); err != nil {
 					return struct{}{}, err
@@ -1380,6 +1465,12 @@ func (e *Workflow) assembleResults(order []*storageBinding, results map[string]*
 		}
 		if joined := errors.Join(uploadErr, retentionErr); joined != nil {
 			res.Error = joined.Error()
+		}
+		if retentionErr != nil {
+			// The retention pass's own failure has a field of its own: a verified
+			// upload keeps its outcome, and a reader never parses Error to tell
+			// the two failures apart.
+			res.RetentionError = retentionErr.Error()
 		}
 		out = append(out, res)
 	}
@@ -1590,6 +1681,13 @@ func (e *Workflow) retentionSweeps(ctx context.Context, started time.Time, kind 
 		st.result.Kept = res.Kept
 		st.result.Deleted = res.Deleted
 		st.result.Freed = res.Freed
+		st.result.CapEvicted = res.CapEvicted
+		st.result.CapOverflowBytes = res.CapOverflow
+		// The ledger is the authoritative occupancy: a failed survey, a foreign
+		// upload left in the inventory or an inherited uncertainty all make the
+		// byte totals a lower bound, and the report says so rather than pretending
+		// a known number.
+		st.result.OccupancyUnknown = !e.ledger.OccupancyKnown(sb.name)
 		st.mu.Unlock()
 		if err != nil {
 			st.setRetentionError(err)
@@ -1654,7 +1752,9 @@ func uploadsSettled(order []*storageBinding, results map[string]*storageRunState
 
 // checkRunIDFree refuses a run whose id a storage already holds: an id is
 // second-precise, and two runs of the same id would overwrite each other's
-// objects and manifest. It runs before the first upload.
+// objects and manifest. It runs before the authority is minted and the first
+// upload starts, and against the FULL survey — never a writer-filtered
+// partition: a foreign run with the same id collides exactly the same way.
 func (e *Workflow) checkRunIDFree(surveys map[string]inventory.Survey, runID string) error {
 	for _, name := range sortedKeys(surveys) {
 		sur := surveys[name]
@@ -1681,15 +1781,13 @@ func (e *Workflow) dryRunReport(ctx context.Context, rep model.RunReport, plans 
 			ar.Outcome = model.ArtifactFailed
 			ar.Error = plan.problem.Error()
 		default:
-			res, err := e.pipe.Resolve(ctx, pipeline.Plan{
-				Source: plan.src, SourceInstance: plan.instance, SourceType: plan.srcType,
-				Artifact: plan.artifact, Steps: plan.steps,
-			})
+			res, err := e.pipe.Resolve(ctx, pipelinePlan(plan))
 			if err != nil {
 				ar.Outcome = model.ArtifactFailed
 				ar.Error = err.Error()
 			} else {
 				ar.Artifact = res.Artifact
+				ar.Warnings = res.Warnings
 			}
 		}
 		if ar.Outcome != model.ArtifactOK {

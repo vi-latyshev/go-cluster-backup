@@ -33,12 +33,33 @@ type StorageTraits struct {
 	Checksums []string
 }
 
+// Purpose says what one object is for: an artifact's bytes or the run's own
+// metadata. The distinction is explicit because a storage's class rules are per
+// purpose — a payload class a deployment chose for artifacts must never make
+// the manifest cold, and a manifest is what every survey, retention pass and
+// restore reads first.
+type Purpose string
+
+const (
+	// PurposePayload is an artifact's bytes. The zero value is the payload
+	// purpose, so an upload that does not say what it is uploads data.
+	PurposePayload Purpose = ""
+	// PurposeMetadata is a small object the service itself reads back — the run
+	// manifest. A storage may pin its own class for it, whatever the configured
+	// payload class is.
+	PurposeMetadata Purpose = "metadata"
+)
+
 // PutRequest identifies one object. Size is always known: transfer uploads
 // from its spool file, never from a stream of unknown length.
 type PutRequest struct {
 	Key    string
 	Size   int64
 	SHA256 string
+	// Purpose is what the object is; the zero value is PurposePayload. A
+	// storage that distinguishes metadata from payloads reads it to choose the
+	// object's class; every other storage ignores it.
+	Purpose Purpose
 }
 
 // ListRequest pages a listing; Token "" starts at the first page.

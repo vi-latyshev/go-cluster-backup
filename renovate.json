@@ -54,6 +54,18 @@
       "groupName": "container images"
     },
     {
+      "description": "The copied PostgreSQL 15 client stays on 15: a 16 client cannot stand in a directory named 15, and the image build refuses a suite whose programs disagree with their own directory. It rides the alpine container-images group.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "docker.io/library/postgres"
+      ],
+      "allowedVersions": "<16",
+      "semanticCommitType": "fix",
+      "groupName": "container images"
+    },
+    {
       "description": "The lint, vulnerability and chart tools never reach the binary.",
       "matchManagers": [
         "gomod"

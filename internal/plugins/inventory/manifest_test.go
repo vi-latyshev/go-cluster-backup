@@ -390,3 +390,131 @@ func TestR3_C3_MalformedDigestKeepsOccupancy(t *testing.T) {
 		t.Fatalf("listed bytes = %d, want %d: occupancy survives the refusal", r.Stored.Bytes, want)
 	}
 }
+
+// g2OldLiteral is a complete v2.1.0 manifest document, spelled out as the
+// writer of that release emitted it: every member the current writer still
+// emits, and none of the fields this build added. The current strict reader
+// must accept it unchanged — the new members are optional, and the release note
+// carries the one-way direction (a v2.1.0 reader cannot read a 2.2.0 run).
+const g2OldLiteral = `{
+  "schema": 1,
+  "run_id": "20261001T040000Z",
+  "kind": "scheduled",
+  "started_at": "2026-10-01T04:00:00Z",
+  "duration": "4m39s",
+  "outcome": "delivered",
+  "artifacts": [{
+    "artifact": {"name": "db/postgres", "group": "databases", "ext": ".dump.zst", "sensitivity": "plain", "importance": "required", "sealed": true},
+    "outcome": "ok",
+    "key": "runs/20261001T040000Z/databases/db/postgres.dump.zst",
+    "chain": [{"instance": "zstd3", "type": "zstd", "ext": ".zst", "seals": false}],
+    "source": {"instance": "pg", "type": "postgres", "origin": "postgres://db:5432/x"},
+    "pipeline": "zstd3",
+    "raw_bytes": 900,
+    "bytes": 100,
+    "stats": {"skipped_entries": 0, "padded_files": 0},
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "duration": "1s",
+    "error": ""
+  }],
+  "storages": [{"storage": "primary", "type": "s3", "outcome": "verified", "objects": 1, "bytes": 100, "duration": "1s", "attempts": 1, "kept": 1, "deleted": [], "freed": 0, "error": ""}],
+  "excluded": [{"name": "volumes/ns/data", "kind": "ignored", "reason": "the marker the rule's config names"}],
+  "previous": {"run_id": "20260930T040000Z", "unfinished": false, "last_good_at": "2026-09-30T04:00:00Z"},
+  "exit_code": 0
+}`
+
+// TestG2_OldLiteralManifestDecodesAndNewOptionalFieldsToo: the current reader
+// accepts a literal v2.1.0 document unchanged, and every member this build
+// added decodes beside it — optional means absent is fine, never that the
+// reader may demand it.
+func TestG2_OldLiteralManifestDecodesAndNewOptionalFieldsToo(t *testing.T) {
+	kind := model.RunKindScheduled
+	if _, err := decodeManifest([]byte(g2OldLiteral), c3RunID, kind); err != nil {
+		t.Fatalf("the literal v2.1.0 manifest was refused: %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(g2OldLiteral), &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["writer_identity"] = "node-a"
+	doc["warnings"] = []any{map[string]any{"code": "catalog.settle.failed", "message": "the catalog write failed"}}
+	artifact := doc["artifacts"].([]any)[0].(map[string]any)
+	artifact["warnings"] = []any{map[string]any{"code": "source.credentials.unsealed", "message": "plaintext credentials"}}
+	artifact["stats"].(map[string]any)["changed_files"] = 2
+	exclusion := doc["excluded"].([]any)[0].(map[string]any)
+	exclusion["kind"] = "elsewhere"
+	exclusion["node"] = "node-b"
+	storage := doc["storages"].([]any)[0].(map[string]any)
+	storage["retention_error"] = "delete failed"
+	storage["cap_overflow_bytes"] = 4096
+	storage["cap_evicted"] = []any{"old-run"}
+	storage["occupancy_unknown"] = true
+
+	rep, err := decodeManifest(mustMarshal(t, doc), c3RunID, kind)
+	if err != nil {
+		t.Fatalf("the new optional members were refused: %v", err)
+	}
+	if rep.WriterIdentity != "node-a" || len(rep.Warnings) != 1 || rep.Warnings[0].Code != "catalog.settle.failed" {
+		t.Fatalf("run report = %+v", rep)
+	}
+	if len(rep.Artifacts[0].Warnings) != 1 || rep.Artifacts[0].Stats.ChangedFiles != 2 {
+		t.Fatalf("artifact = %+v", rep.Artifacts[0])
+	}
+	if rep.Excluded[0].Kind != model.ExclusionElsewhere || rep.Excluded[0].Node != "node-b" {
+		t.Fatalf("exclusion = %+v", rep.Excluded[0])
+	}
+	s := rep.Storages[0]
+	if s.RetentionError != "delete failed" || s.CapOverflowBytes != 4096 || len(s.CapEvicted) != 1 || !s.OccupancyUnknown {
+		t.Fatalf("storage = %+v", s)
+	}
+}
+
+// TestG2_ExclusionNodeIsMeaningfulOnlyWithElsewhere: the shared enum root knows
+// three verdicts, and a node belongs to exactly one of them.
+func TestG2_ExclusionNodeIsMeaningfulOnlyWithElsewhere(t *testing.T) {
+	cases := map[string]struct {
+		kind string
+		node string
+		want string
+	}{
+		"elsewhere without a node": {kind: "elsewhere", want: "must name the peer node"},
+		"node on ignored":          {kind: "ignored", node: "node-b", want: "belongs only to an elsewhere exclusion"},
+		"node on covered":          {kind: "covered", node: "node-b", want: "belongs only to an elsewhere exclusion"},
+		"unknown kind":             {kind: "maybe", node: "node-b", want: "not one this build knows"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var doc map[string]any
+			if err := json.Unmarshal([]byte(g2OldLiteral), &doc); err != nil {
+				t.Fatal(err)
+			}
+			exclusion := doc["excluded"].([]any)[0].(map[string]any)
+			exclusion["kind"] = tc.kind
+			if tc.node != "" {
+				exclusion["node"] = tc.node
+			}
+			_, err := decodeManifest(mustMarshal(t, doc), c3RunID, model.RunKindScheduled)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("decode = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestG2_FailedArtifactNeedsNoObject: a failed artifact records the failure, not
+// a copy; an empty key and digest are consistent with that outcome.
+func TestG2_FailedArtifactNeedsNoObject(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(g2OldLiteral), &doc); err != nil {
+		t.Fatal(err)
+	}
+	artifact := doc["artifacts"].([]any)[0].(map[string]any)
+	artifact["outcome"] = model.ArtifactFailed
+	artifact["key"] = ""
+	artifact["sha256"] = ""
+	artifact["error"] = "the dump failed"
+	if _, err := decodeManifest(mustMarshal(t, doc), c3RunID, model.RunKindScheduled); err != nil {
+		t.Fatalf("a failed artifact was refused: %v", err)
+	}
+}

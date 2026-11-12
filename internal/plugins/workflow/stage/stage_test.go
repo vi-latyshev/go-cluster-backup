@@ -51,6 +51,9 @@ type production struct {
 	chain   []model.ProcessorStep
 	body    string
 	dumpErr error
+	// warnings are the resolved artifact's coded non-fatal facts, which the
+	// stage record carries to the run side.
+	warnings []model.Warning
 	// transient is returned by the first Dump and cleared, for the retry proofs.
 	transient error
 }
@@ -62,17 +65,20 @@ type fakePipeline struct {
 	resolveErr  map[string]error
 	resolves    int
 	dumps       map[string]int
+	// plans are the exact plans Resolve received, for the envelope proofs.
+	plans []pipeline.Plan
 }
 
 func (p *fakePipeline) Resolve(_ context.Context, plan pipeline.Plan) (pipeline.Resolved, error) {
 	p.resolves++
+	p.plans = append(p.plans, plan)
 	if err := p.resolveErr[plan.SourceInstance]; err != nil {
 		return pipeline.Resolved{}, err
 	}
 	prod := p.productions[plan.SourceInstance]
 	artifact := plan.Artifact
 	artifact.Ext = prod.ext
-	return pipeline.Resolved{Artifact: artifact, Chain: prod.chain}, nil
+	return pipeline.Resolved{Artifact: artifact, Chain: prod.chain, Warnings: prod.warnings}, nil
 }
 
 func (p *fakePipeline) Dump(_ context.Context, dst io.Writer, plan pipeline.Plan, _ pipeline.Resolved) (int64, error) {
@@ -724,3 +730,51 @@ func TestStagedSourceReadsBackThePair(t *testing.T) {
 }
 
 // quote renders a path as a JSON string for a factory config.
+
+// TestRunCarriesTheEnvelopeRateAndWarnings: the source envelope's rate_limit
+// reaches the pipeline plan before the first byte and is never a chain step,
+// and the coded warnings the resolution decided ride the stage record to the
+// run side.
+func TestRunCarriesTheEnvelopeRateAndWarnings(t *testing.T) {
+	dir := t.TempDir()
+	src, prod := one("cp", &production{ext: ".tar", body: "bytes"})
+	src.RateLimit = 4 << 20
+	prod.warnings = []model.Warning{{Code: "source.credentials.unsealed", Message: "plaintext credentials"}}
+	p := newPipeline(map[string]*production{"cp": prod})
+	rep, err := Run(context.Background(), options(dir, p, src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Outcome != model.OutcomeDelivered {
+		t.Fatalf("outcome = %q", rep.Outcome)
+	}
+	if len(p.plans) != 1 || p.plans[0].RateLimit != 4<<20 {
+		t.Fatalf("plans = %+v, want the envelope's rate limit", p.plans)
+	}
+	if len(p.plans[0].Steps) != 0 {
+		t.Fatalf("the rate limit became a pipeline step: %+v", p.plans[0].Steps)
+	}
+	rec, err := source.ReadStagedRecord(dir, "cp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Warnings) != 1 || rec.Warnings[0] != prod.warnings[0] {
+		t.Fatalf("record warnings = %+v, want %+v", rec.Warnings, prod.warnings)
+	}
+}
+
+// TestReviewStageReportCarriesCredentialWarning is the review's counterexample:
+// the credential warning the resolution decided is part of the stage's report,
+// not only of the chain record a later run reads.
+func TestReviewStageReportCarriesCredentialWarning(t *testing.T) {
+	src, prod := one("cp", &production{ext: ".tar", body: "bytes"})
+	prod.warnings = []model.Warning{{Code: "source.credentials.unsealed", Message: "plaintext credentials"}}
+	p := newPipeline(map[string]*production{"cp": prod})
+	rep, err := Run(context.Background(), options(t.TempDir(), p, src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Artifacts[0].Warnings) != 1 {
+		t.Fatalf("stage report lost credential warning: %+v", rep.Artifacts[0])
+	}
+}

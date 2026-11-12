@@ -47,8 +47,10 @@ func (s *Source) Describe(ctx context.Context) (source.SourceTraits, error) {
 	}
 	// Sealed stays false: what this source's bytes are is the recorded chain's
 	// to say, step by step, and claiming it here would call plaintext sealed
-	// whenever a stage pipeline ran without a sealing processor.
-	return source.SourceTraits{Ext: rec.Ext, Origin: "file://" + path}, nil
+	// whenever a stage pipeline ran without a sealing processor. The record's
+	// own coded warnings — the stage's credential exception — ride into the run
+	// report with the artifact.
+	return source.SourceTraits{Ext: rec.Ext, Origin: "file://" + path, Warnings: rec.Warnings}, nil
 }
 
 // Check runs at preflight: the record and the artifact it names must be there. A

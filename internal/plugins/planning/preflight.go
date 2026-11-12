@@ -27,10 +27,16 @@ type Result struct {
 	OK       bool
 	Error    string
 	// Excluded is non-empty for an object the discovery saw and deliberately
-	// does not back up: model.ExclusionIgnored or model.ExclusionCovered, with
-	// ExcludedReason saying why.
+	// does not back up: model.ExclusionIgnored, model.ExclusionCovered or
+	// model.ExclusionElsewhere, with ExcludedReason saying why.
 	Excluded       model.ExclusionKind
 	ExcludedReason string
+	// ExcludedNode is the declared peer writer's node of an elsewhere
+	// exclusion: the delegation's identity, preserved from the discovery's Found.
+	ExcludedNode string
+	// Warnings are the coded, non-fatal facts found about this instance's
+	// bytes — a source type's published credential exception.
+	Warnings []model.Warning
 }
 
 // Target names one declared instance a preflight can select.
@@ -49,6 +55,10 @@ type Instance struct {
 	Name string
 	// Check is the plugin's own Check; nil when it implements none.
 	Check instances.Checker
+	// BinariesCheck is the optional local proof of a configured binary suite —
+	// the PostgreSQL client directories — taken before any remote Check; nil
+	// when the instance carries no such suite.
+	BinariesCheck instances.CheckBinaries
 	// Decode is the instance's restore-side check, set for the processors that
 	// implement it: what `validate --preflight` asks about key material.
 	Decode processor.DecodeChecker
@@ -77,6 +87,11 @@ type Options struct {
 	Build SourceFactory
 	// Check runs a built source's Check; nil skips it.
 	Check SourceCheck
+	// Credential applies the run's credential/sealing decision to a built source
+	// before its Check; nil skips it. It makes a discovered source answer the
+	// same refusal or warning a declared one does, instead of reporting ok to a
+	// run that will refuse the same bytes.
+	Credential CredentialCheck
 	// WantDecode asks every processor's restore-side check too.
 	WantDecode bool
 	// Discovered runs every discovery and checks the sources it finds.
@@ -92,6 +107,10 @@ type Row struct {
 	Err      error
 	Excluded model.ExclusionKind
 	Reason   string
+	// Node is the declared peer writer's node of an elsewhere exclusion.
+	Node string
+	// Warnings are the coded, non-fatal facts found about this instance.
+	Warnings []model.Warning
 }
 
 // Targets lists every built instance a preflight can select — what the CLI
@@ -123,7 +142,8 @@ func (p Planner) Results(ctx context.Context, req Request, o Options) []Result {
 	out := make([]Result, 0, len(rows))
 	for _, r := range rows {
 		res := Result{Kind: r.Kind, Instance: r.Name, OK: r.Err == nil,
-			Excluded: r.Excluded, ExcludedReason: r.Reason}
+			Excluded: r.Excluded, ExcludedReason: r.Reason, ExcludedNode: r.Node,
+			Warnings: r.Warnings}
 		if r.Err != nil {
 			res.Error = r.Err.Error()
 		}
@@ -171,7 +191,17 @@ func (p Planner) Check(ctx context.Context, selection []Target, o Options) []Row
 			out = append(out, row)
 			continue
 		}
-		if inst.Check != nil {
+		// The local suite is proved before anything touches the network: a
+		// configured client directory that is incomplete, mixed, or of another
+		// major is the deployment, and the remote Check must not hide it behind
+		// a connection error.
+		if inst.BinariesCheck != nil {
+			_, err := execution.Attempt(ctx, p.policy, "check binaries "+inst.Kind+" "+inst.Name, func(ctx context.Context, _ int) (struct{}, error) {
+				return struct{}{}, execution.SafeCall(func() error { return inst.BinariesCheck.CheckBinaries(ctx) })
+			})
+			row.Err = err
+		}
+		if inst.Check != nil && row.Err == nil {
 			_, err := execution.Attempt(ctx, p.policy, "check "+inst.Kind+" "+inst.Name, func(ctx context.Context, _ int) (struct{}, error) {
 				return struct{}{}, execution.SafeCall(func() error { return inst.Check.Check(ctx) })
 			})
@@ -266,7 +296,7 @@ func (p Planner) runDiscoveries(ctx context.Context, o Options, rows []Row, sele
 // would build it.
 func (p Planner) checkFound(ctx context.Context, f discovery.Found, o Options) []Row {
 	if f.Excluded != "" {
-		return []Row{{Kind: "source", Name: f.Name, Excluded: f.Excluded, Reason: f.ExcludedReason}}
+		return []Row{{Kind: "source", Name: f.Name, Excluded: f.Excluded, Reason: f.ExcludedReason, Node: f.ExcludedNode}}
 	}
 	row := Row{Kind: "source", Name: f.Name}
 	if f.Problem != "" {
@@ -288,19 +318,31 @@ func (p Planner) checkFound(ctx context.Context, f discovery.Found, o Options) [
 	if c, ok := s.(io.Closer); ok {
 		own(c)
 	}
+	var warnings []model.Warning
+	if o.Credential != nil {
+		w, err := o.Credential(ctx, s, f.Artifact, f.Pipeline)
+		if err != nil {
+			row.Err = err
+			return []Row{row}
+		}
+		if w.Code != "" {
+			warnings = append(warnings, w)
+		}
+	}
 	if o.Check != nil {
 		if err := o.Check(ctx, s, f.Name); err != nil {
 			row.Err = err
 			return []Row{row}
 		}
 	}
-	units := p.Expand(ctx, Unit{Instance: f.Name, Type: f.Type, Source: s, Artifact: f.Artifact},
-		Expansion{Build: o.Build, Check: o.Check, Own: own})
+	units := p.Expand(ctx, Unit{Instance: f.Name, Type: f.Type, Source: s, Artifact: f.Artifact,
+		Pipeline: f.Pipeline, Warnings: warnings},
+		Expansion{Build: o.Build, Check: o.Check, Credential: o.Credential, Own: own})
 	rows := make([]Row, 0, len(units))
 	for _, u := range units {
 		// The parent's own unit is already checked above and carries no
 		// problem; a unit reports the failure of building or checking it.
-		rows = append(rows, Row{Kind: "source", Name: u.Instance, Err: u.Problem})
+		rows = append(rows, Row{Kind: "source", Name: u.Instance, Err: u.Problem, Warnings: u.Warnings})
 	}
 	return rows
 }

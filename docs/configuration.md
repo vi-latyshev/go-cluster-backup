@@ -13,6 +13,12 @@ Reference configurations:
   label, one S3-compatible storage.
 - [examples/config/k3s-single-node.yaml](../examples/config/k3s-single-node.yaml)
   — adds the k3s datastore stage and file volumes.
+- [examples/config/k3s-per-node.yaml](../examples/config/k3s-per-node.yaml) —
+  one writer per node, scoped discovery, a stable writer identity and its own
+  storage prefix.
+- [examples/config/monitoring.yaml](../examples/config/monitoring.yaml) — the
+  webhook notifier pushing run metrics to a Prometheus Pushgateway, with the
+  alert rules in [examples/monitoring](../examples/monitoring/).
 - `cmd/go-cluster-backup/testdata/config.yaml` — every field of every plugin,
   validated by a test.
 
@@ -114,6 +120,26 @@ arrive already encoded — `staged`, reading what `stage` left — declares no
 pipeline: it carries the chain of the process that produced its bytes, and the
 manifest records that chain.
 
+### Rate limit
+
+`rate_limit` is a source-envelope field, on a configured source, a discovery
+rule or a `stage.sources` entry — not a processor and never a chain entry: a
+restore never reads it and needs no instance for it. It is the raw bytes per
+second the source may hand to the pipeline's **first** processor; `0` is
+unlimited and that is the default. The burst is fixed by the implementation and
+at most 1 MiB, so cumulative admitted bytes stay within `burst + rate ×
+elapsed` for one attempt; an attempt starts with a fresh bucket and a cancelled
+or expired context ends the wait, kills the producer and joins it.
+
+The limiter spreads the source's reads over time and changes no byte of the
+artifact, the chain or the manifest. It does **not** reduce the server's total
+work: a slowed `pg_dump` keeps its transaction and `AccessShareLock` longer, so
+`size / rate` is added to the dump's lock window — a PostgreSQL standby can hit
+`max_standby_streaming_delay` sooner, and a migration waiting for a table's lock
+queues every later query behind it. Size the limit for the window the source can
+afford, keep `lock_timeout` on migrations, and do not treat the knob as a load
+reduction.
+
 ### Sizing
 
 The processor knobs trade CPU, memory and stored size, and nothing else here
@@ -163,7 +189,10 @@ each level and compare size and CPU — before changing a level.
   finish a run sooner.
 - **Native `pg_dump` compression** — the `postgres` source passes
   `compression` to `pg_dump --compress`, and it defaults to `none` because the
-  pipeline compresses. A deployment may let `pg_dump` compress instead
+  pipeline compresses. A PostgreSQL 15 client takes only a numeric level, so
+  `none` becomes `--compress=0` and an unsupported method is refused by name
+  ([PostgreSQL clients](#postgresql-clients)). A deployment may let `pg_dump`
+  compress instead
   (`zstd:3`, `lz4`, …) and declare no `zstd` processor for that artifact: one
   compressor, never both. The stored object is then already compressed, so its
   recorded raw size is the compressed size and a message's ratio reads about
@@ -222,6 +251,87 @@ deployment's decision, written in its marker or its rules — the tool reports a
 undeclared volume as a failure and never decides for the deployment that it may
 be dropped.
 
+### Node scope
+
+A writer that reads node-local data must prove which node it runs on before it
+reads a path. `node_env` names the environment variable holding this pod's node
+name — the chart fills `BACKUP_NODE_NAME` from `spec.nodeName` in every writer
+and restore pod. The empty value is the explicit opt-out of every node check;
+with the variable absent or empty and `node_scope` false, the discovery keeps
+the old non-Kubernetes behaviour and does not call the API for a node.
+
+`node_scope: true` turns the proof into a writer scope, and it needs two things
+the deployment states:
+
+- `writer_nodes`: every node that runs a writer of this configuration, this one
+  included, and it must be nonempty. A set that leaves out the writer reading
+  it would delegate everything and back up nothing.
+- a nonempty `run.writer_identity` (see [Writer identity](#writer-identity)):
+  with two writers, both would otherwise treat the other's runs as their own.
+
+The own node is proven once per collect with a read-only `Node` GET; an API
+answer that cannot be read under `node_scope` refuses the discovery — fail
+closed, never a wider cluster scope. Without `node_scope`, an unreadable node
+warns once per collect and fails only the affected node-local artifacts. The
+remedy is an RBAC grant of `nodes` `get` (the chart's ClusterRole carries it) or
+the explicit `node_env: ""` opt-out.
+
+Under the scope, every object gets exactly one verdict:
+
+- **own node** — the rule renders as usual;
+- **declared peer** — the object is recorded as an `elsewhere` exclusion naming
+  the peer's node and no source is built for it. A delegation is the
+  deployment's decision, not evidence the peer's Job ran: a writer whose node is
+  absent or down sends nothing at all, so monitor each writer's freshness
+  externally (see [examples/monitoring](../examples/monitoring/));
+- **outside `writer_nodes`, or placement that cannot be proven** — the object
+  fails one artifact with its rule's importance, even when `min_matches` is
+  satisfied: `min_matches` counts the global matching objects before the node
+  filter, and an empty result is not evidence of nothing to back up.
+
+One placement resolver decides every node-local claim, under `node_scope: true`
+**and** false; only `node_env` unset or empty keeps the old unchecked read.
+Before a path is opened, exactly two syntactic proofs exist and nothing weaker
+is accepted:
+
+- **Outside scope**, a required node affinity that pins exactly this node is
+  this writer's; the path is read. An **identity pin** is `metadata.name`
+  *only* as a single-value `matchFields` requirement, or
+  `kubernetes.io/hostname` *only* as a single-value `matchExpressions`
+  requirement — the one label Kubernetes treats as node-unique by convention.
+  A `metadata.name` written as a label (`matchExpressions`) is an ordinary label
+  and never identity; when one term carries both a field pin and a hostname
+  filter, the field pin wins and forces the name alone.
+- **Under scope**, the affinity must close over the declared set: every
+  alternative term is such an identity pin whose value is in `writer_nodes`. A
+  unique own pin reads; a unique declared peer is `elsewhere`; several declared
+  candidates need the mounting pod.
+
+Everything else — a label selector (including a `metadata.name` label), a
+multi-value `In`, `NotIn`/`Exists`/`Gt`/`Lt`, an empty value, a pin to a node
+outside `writer_nodes`, or an unpinned `hostPath` — may admit a node nobody
+declared, so only the **single Running pod that mounts the claim** can prove
+placement. That
+pod's node is this writer's: the path is read. A declared peer under scope:
+`elsewhere`. Any other node — every other node outside scope — fails the
+artifact naming it. No mounting pod proves nothing, so the artifact fails:
+outside scope with *narrow its required node affinity to one node, or enable
+`node_scope` with `writer_nodes`*; under scope with *narrow its required node
+affinity to a node in `writer_nodes`*.
+
+Several mounting pods on different nodes, an affinity that contradicts the
+mounting pod, or a local PersistentVolume with no required affinity fails the
+artifact: the node holding its data cannot be proven.
+
+A `Pending` claim that already has a binding gets the same proof. This is an
+availability change: under scope a label selector, a multi-value `In` or a pin to
+an undeclared node now needs its mounting Running pod, and a provisioning-time
+claim without one fails until the pod exists or the affinity is narrowed;
+outside scope, a volume whose affinity admits more than one node and has no
+single mounting pod is likewise refused. The marker still wins over every
+verdict: an explicitly excluded object is ignored rather than delegated,
+whatever its node.
+
 ### Layout
 
 Key templates. Artifacts land under `runs/<run id>/<group>/<name><ext>`, the
@@ -244,6 +354,39 @@ never a pipeline looked up in the current config, through read-only
 Handle/Uploader/Inventory under a live `guard.Authority`; zero, expired or
 revoked handles refuse. Only the protection ledger holds `guard.Remover`.
 Raw instances stay behind `internal/plugins/storage/internal`.
+
+Newer runs record optional members a strict older reader does not know:
+`changed_files` (written by default with `on_change: record`), coded `warnings`,
+`writer_identity` and `elsewhere` exclusions. A build older than 2.2.0 refuses
+such a manifest, so listing, verifying and restoring a run written by 2.2.0 or
+later needs a 2.2.0 or newer binary. There is no downgrade decoder and no schema
+fork: the current format is the only one supported, and a rollback of the writer
+does not make its new runs readable.
+
+### Storage class and cold payloads
+
+`storages.<name>.config.storage_class` is the class of **artifact** objects,
+written exactly as the endpoint names it — `STANDARD`, `ICE`, `COLD`, `SINGLE`,
+any token of 1–64 letters, digits, `_` or `-`. The plugin does not map it to an
+AWS enum and does not check it against AWS: an S3-compatible service names its
+own classes. The empty value sends no class header at all, leaving the bucket's
+default in force; an invalid token fails the storage's construction before the
+first request.
+
+The run manifest is never sent with the payload class: every manifest write,
+whole or multipart, carries the explicit `STANDARD` class whatever the payload
+class or the bucket default. A survey, a retention pass and every restore read
+the manifests first, so a cold manifest would either bill retrieval or fail with
+`InvalidObjectState` and turn every run into a problem run. Keep bucket lifecycle
+rules from transitioning or expiring the manifest keys (`runs/<id>/manifest.json`)
+even when artifacts themselves may age into a colder class.
+
+A cold payload class is the deployment's durability decision, and retrieval is
+the provider's: cloud.ru's `ICE`/`COLD`/`SINGLE`, for example, follow that
+service's own retrieval and cost rules, not AWS Glacier's. Confirm the class and
+restore path against the actual endpoint before relying on it. The repository's
+tests exercise the protocol against a fake; no provider class or retrieval
+behaviour is claimed verified here.
 
 ### Run outcome
 
@@ -375,6 +518,46 @@ its later failure is reported by the next run.
 
 A storage's `CapExceeded`, `CapLimitBytes` and
 `CapUsedBytes` and a lease refusal (`.Run.Lease`) reach a template too.
+`CapEvicted`, `CapOverflowBytes`, `RetentionError` and `OccupancyUnknown` do as
+well, and the run's coded warnings are `.Run.Warnings` with `.Code` and
+`.Message` (`catalog.uncertainty.settle.failed` names a settlement failure that
+leaves occupancy unknown; a stage record can carry `source.credentials.unsealed`).
+
+### Endpoint templates
+
+`url` and every header value are **literal** by default, `{{ braces` included: a
+config written for 2.1.0 keeps its exact bytes. `endpoint_templates: true` turns
+both into text templates with one function — the endpoint-only set
+
+```
+secret PATH   the mounted secret file at the absolute PATH, at most 4096 bytes,
+              a trailing CR/LF trimmed; projected Secret symlinks are followed
+```
+
+The argument must be exactly one **string literal** holding an absolute path —
+`secret "/run/secrets/token"`. A computed, nested or piped argument
+(`secret (printf …)`, `secret (secret "/run/x")`, `"/run/x" | secret`) and a
+relative literal are refused offline at `validate`: a computed value could put
+the secret's own bytes into diagnostics, and a relative path has no mount to
+name. Only the endpoint parses this function; the message and payload templates
+never receive `secret`, so a receiver's body cannot read a secret file. No
+rendered secret or endpoint appears in argv, `config effective`, template/build
+errors or request-failure text (an error names the stage, event and file path,
+never a byte of the value).
+
+The URL's scheme and authority stay literal: they must be complete before the
+first action and terminated by `/`, `?` or `#`, userinfo is forbidden, and the
+rendered scheme/host/port must equal the literal ones. An action may therefore
+supply a path segment, a query value or a header value — never the host. A
+malformed template, or one whose render would move the request to another
+authority, is refused before any request is made. This is what stops
+`https://hooks.example.com{{ secret "/s/u" }}` with a file holding
+`.evil.tld/x` or `@169.254.169.254/` from becoming an SSRF primitive.
+
+`validate` parses the endpoint templates offline without reading a file;
+`validate --preflight` (`Check`) renders the real files once, so a missing or
+oversized mount fails the notifier before the first event; `Notify` re-renders
+per delivery, so a rotated Secret is visible without rebuilding the notifier.
 
 ### Run knobs and budgeting
 
@@ -530,7 +713,10 @@ the outcome is `failed`, the reason is in the report (`.Run.Lease` names the
 holder on a refusal), and the finished notification is sent. A catalog that
 cannot hold a lease at all leaves a manual run unable to start (exit 1) and a
 scheduled run lease-free. `Release` drops only the claim its own acquisition
-token names.
+token names. A release that fails after the finished event was delivered cannot
+appear in an event already sent: it is the structured log line
+`lease.release.failed`, and an external log rule is its only signal — it never
+becomes a fake refusal in an earlier report.
 
 A takeover proves the holder's process ended, not that provider-side requests
 settled: Yandex Disk may answer HTTP 202 before its asynchronous commit. Durable
@@ -542,6 +728,35 @@ another holder's state, and failed durable updates leave occupancy unknown.
 While occupancy is unknown, manual admission stays closed and unsafe reclamation
 is forbidden; scheduled runs retain soft-cap/reporting behaviour. Retention also
 protects another run's incomplete objects until `deadline + finish_allowance`.
+
+### Writer identity
+
+`run.writer_identity` is a stable id a per-node deployment opts into; empty is
+the ordinary single-writer deployment. Every manifest stores it, and protection
+partitions runs by it, so a foreign writer's runs are never credited as verified
+protection, never counted by a keep policy or a floor, and never deleted by
+retention or the cap — while every listed byte still counts toward that
+storage's occupancy, and foreign copies stay readable for restore. A run with
+no manifest is protected, not assumed owned, under a nonempty identity: a missing
+manifest cannot prove who wrote it. The identity is not a substitute for
+serialization — same-prefix writers must share ONE catalog lease.
+
+A per-node deployment normally gives each writer its own storage prefix, so no
+survey ever compares two writers' runs ([examples/config/k3s-per-node.yaml](../examples/config/k3s-per-node.yaml)).
+A **shared** prefix is supported only when every writer of it uses one catalog
+ConfigMap: one release creates it, the peers set `catalog.create: false`, and the
+lease serialises them. Two ordinary writers configured with one prefix and
+unrelated catalogs are unsupported — neither identity filtering nor the
+pre-write check makes a read-then-write atomic, and the second writer would
+overwrite the first writer's manifest. A manual run cannot go lease-free: a
+catalog that cannot hold a lease at all refuses it, while only a scheduled run
+continues without one.
+
+Before any write, the full survey refuses a run id or prefix this run would
+collide with: the collision check runs over every surveyed run, before the write
+authority is issued and before the first `Put`, so a refused run leaves nothing.
+A serialized loser therefore observes the winner's run instead of overwriting
+it.
 
 ### Retention
 
@@ -555,6 +770,22 @@ other kind. A storage with no `manual` partition refuses manual runs.
 |---|---|
 | `gfs` | the newest run of each of the newest `daily` calendar days, `weekly` ISO weeks and `monthly` calendar months, in `timezone`, plus a floor of the newest `min_keep` runs |
 | `keep_last` | the newest `count` runs, with a floor of the newest `min_keep` |
+| `keep_versions` | the newest `count` successful copies of each live artifact, with a floor of the newest `min_keep` copies |
+
+`keep_versions` keeps copies, not runs: its unit is an artifact identity,
+`<group>/<name>`. An identity is **live** while any run among the newest `count`
+runs of this writer and kind named it — whatever that run's outcome, because a
+failed run still saw its source's artifacts. A live identity keeps the newest
+`count` runs that hold a successful copy of it, and the newest `min_keep` of
+those are a floor. An identity only older runs name has been dropped from the
+source: it adds no policy keep, and its last copies are held only by protection's
+newest-copy floor. A run that holds no successful copy at all is decided by
+`count_incomplete`: with `false` it is kept outside the slots, because retention
+has no copy to judge it by; with `true` it is kept only while it ranks among the
+newest `count` runs. A run whose copies are all of dead identities does not fall
+back into keep — the fallback is for a run with an empty artifact list, not for
+dead ones. `count` and `min_keep` are at least 1 and `min_keep` does not exceed
+`count`. `keep_last` and `gfs` are unchanged; the cap below belongs to no policy.
 
 A **verified** copy is one whose run outcome is not `failed`, whose upload to
 that storage verified, and whose manifest is readable. Within one day, week or
@@ -597,6 +828,159 @@ after its manifest is saved and verified it frees room in this order — an
 inactive incomplete attempt first, then the oldest manual runs, then its own
 history by the byte budget — and a leftover overflow, where the floor protects
 more than the cap allows, is reported without failing the run.
+
+Each storage's result carries the cap and retention signals a template or an
+external rule reads instead of parsing text: `cap_exceeded`, with
+`cap_limit_bytes` and `cap_used_bytes`, for a manual refusal; `cap_overflow_bytes`
+for what the scheduled sweep could not free; `cap_evicted` for the run ids the
+cap deleted; `retention_error` for the retention pass's own failure, kept apart
+from the storage's upload verdict, which it never rewrites; and
+`occupancy_unknown` when the ledger could not establish the occupancy, so the
+cap numbers beside it are a lower bound, never zero. A manual refusal on unknown
+occupancy says so and is not a numeric overflow. The same facts are in the run's
+coded warnings where they have no storage to belong to, and the monitoring
+example reads all of them ([examples/monitoring](../examples/monitoring/)).
+
+## Sources
+
+### PostgreSQL clients
+
+The image ships an exact-major PostgreSQL client suite for every supported
+server: `pg_dump`, `pg_dumpall`, `pg_restore` and `psql` of 15, 16, 17 and 18
+under `/usr/libexec/postgresql15` … `/usr/libexec/postgresql18`. `client_dirs`
+lists the directories to search, newest first by default; a directory that does
+not exist is skipped, and `PATH` is the last candidate — a complete suite there
+is usable, a partial one is not — so a custom install may point at its own
+suites. A configured directory that exists but is unusable —
+missing a program, or mixing majors — is a refusal even when another suite is
+valid: a half-installed client is never silently bypassed.
+
+A `postgres` or `postgres_globals` instance reads the server's own major once,
+with a read-only `server_version_num` query that may use any available `psql`
+before the suite is chosen, and then every operational call — enumeration,
+dump, apply, probe — resolves the suite of that exact major. A server major with
+no usable suite fails before a dump or an apply starts, naming the major and the
+suites that were found; there is no "nearest major" fallback. `pg_restore` of
+the newest validated suite reads an archive without a server for a `probed`
+verify.
+
+`doctor` and `validate --preflight` prove the configured suites themselves
+(locally, from the merged defaults) rather than a hand-written `PATH` list, so a
+wrong-major or missing directory fails before the image or the run reaches a
+database. The PG15 suite is copied from the digest-pinned official PostgreSQL 15
+image together with its own libpq, so it is not in Alpine's package database:
+an OS package scanner cannot see it. PostgreSQL 15 reaches end of life on
+2027-11-11; the Renovate rule keeps that image below 16 on purpose, and the
+suite must be removed or replaced by a separate decision before then.
+
+A PostgreSQL 15 `pg_dump` accepts only a numeric compression level, not the
+modern method syntax. The source maps the config to it: `compression: none`
+becomes `--compress=0`, a bare number or `gzip:<level>` becomes that level.
+`gzip` without a level, `zstd`, `lz4` and every other method are refused
+permanently by name on a server whose suite is 15, instead of failing inside
+`pg_dump`. PostgreSQL 16 and later receive the configured argument unchanged.
+
+### PostgreSQL roles and globals
+
+`postgres_globals` emits the server's complete `pg_dumpall --globals-only`
+output **byte for byte**: roles, role memberships, role settings and
+tablespaces. `role_hashes` is required — the deployment chooses; there is no
+embedded default. `true` keeps the password hashes (pg_dumpall's default),
+`false` passes `--no-role-passwords`. Either way role settings can carry secrets
+(`ALTER ROLE … SET` is not a password), so the artifact is credential content
+**unconditionally** and its pipeline must seal it — there is no plaintext warning
+exception and no deployment switch that softens it. The artifact is fetch-only:
+the source implements no `Restorer`, never rewrites or applies SQL, and its probe
+checks only the dump's header and footer for completeness — never that the SQL is
+safe or restorable. The operator procedure is
+[restore.md#postgresql-globals](restore.md#postgresql-globals).
+
+A per-database `postgres` dump carries that database's schema, data, owners and
+grants, not the cluster's roles and memberships; the globals artifact is the
+other half. Restoring a database whose objects name roles that do not exist on
+the target fails, so restore roles first or create them.
+
+### k3s datastores
+
+`k3s_state` snapshots a k3s **sqlite/kine** datastore and the server token as one
+tar stream, from a mounted datastore copy or through `stage`. Its bytes are
+credential content: a token plus the datastore bootstraps a cluster. A published
+plaintext configuration (no sealing processor) stays valid under 2.2.0 and
+records the coded warning `source.credentials.unsealed` in `validate`, preflight
+and every run's artifact report — it is diagnostic, never a refusal, and never
+weakens the `sensitivity: secret` rule. New credential sources do not share that
+exception: an unsealed `k3s_etcd` or `postgres_globals` artifact is refused
+before the first byte.
+
+`k3s_etcd` snapshots a k3s **embedded etcd** datastore. It reads the newest
+finished regular snapshot in `snapshot_dir` (newest mtime, then name), ignores
+hidden and temporary names, and refuses a compressed newest snapshot by name:
+those bytes do not carry the trailing checksum this source verifies, and an
+older snapshot is never a fallback for a compressed, stale or corrupt newest
+one. `max_age` is required and deployment-specific; both the snapshot and the
+token are read only from the configured absolute paths, the snapshot is opened
+without following a link and re-checked against the directory's record, and its
+trailing etcd SHA256 is recomputed while the bytes stream. A short, changed or
+corrupt snapshot fails the artifact. The tar holds `snapshot.db` exactly as etcd
+saved it (data plus trailer) and `token`; the prober reads the tar back and
+repeats the trailer check. Always credential content, with no plaintext
+exception. Restore: [restore.md#k3s-control-plane](restore.md#k3s-control-plane).
+
+The selected snapshot is only as good as k3s's own snapshot retention: if k3s's
+schedule stops, `max_age` turns the artifact red instead of backing up an old
+cluster state quietly.
+
+### Vendor snapshots
+
+`collected` ingests one file a vendor collector published, for formats whose
+native tools own consistency: a Vault Raft snapshot, a ClickHouse `BACKUP`
+archive, a validated `nats backup stream` directory packed as one file. It is a
+distinct raw-byte source, not a `staged` alias: it has no chain record and
+decodes nothing.
+
+The collector publishes the data file and a digest-only marker beside it, exactly
+`<path>.sha256`, holding the lowercase hex SHA256 of the data with at most one
+trailing LF or CRLF. Both files are opened through the data file's directory
+with `O_NOFOLLOW` and `O_NONBLOCK` and must be regular files — a marker that
+became a link to a secret, a FIFO that would hold the run or a device that would
+stream forever is refused, never read. The marker is bounded at 4096 bytes
+before it is parsed, and only the canonical shapes are accepted: a GNU sha256sum
+line, a filename suffix, uppercase hex or a BOM is a refusal, not a digest. Both
+the data and the marker must be fresh (`max_age`), the data is hashed as it
+streams, and the file must still be the one the open saw; a mismatch is the
+collector's data-then-marker publication in flight, so it is `transient` and the
+retry reads the finished pair. Stale or malformed input, or a non-regular file,
+is permanent. Marker bytes never appear in an error.
+
+The source claims byte identity and freshness, never semantic validity: the
+vendor's own inspect/validate step runs before the marker is published, and the
+restore is the vendor's tool again. The artifact keeps the envelope's own
+extension (`ext`), sensitivity and processor pipeline; a vendor snapshot whose
+bytes are credentials is declared `sensitivity: secret` and sealed like any
+other artifact. Recipes:
+[restore.md#vendor-snapshots](restore.md#vendor-snapshots). The
+repository's automated gates do not execute those vendor restores; rehearse a
+recipe on scratch data before relying on it.
+
+### File trees
+
+`files` copies a directory tree as one tar stream. `on_change` decides what a
+file that changes **under the read** does:
+
+- `record` (the default) keeps today's behaviour — an entry that cannot be
+  carried or vanished is counted in `skipped_entries`, a file that shrank is
+  zero-padded and counted in `padded_files` — and adds `changed_files`: a file
+  replaced, grown, or rewritten in place at the same size is counted and the
+  archive is kept. The counts are in the report and the stored manifest.
+- `fail` fails that artifact on the first detected mutation: a changed entry, a
+  zero-padded short read or a post-copy metadata mismatch. Static refusals — a
+  socket or FIFO, a delete tolerated by `ignore_vanished` — are not mutations and
+  never start retries, whatever the policy.
+
+Neither policy makes a live filesystem consistent. A file tree that belongs to a
+running database, or to a vendor store that requires a snapshot, must be
+quiesced or snapshotted by its own tool; the archive preserves content, owners,
+modes and links, not one moment.
 
 ## The log
 
@@ -684,10 +1068,13 @@ go-cluster-backup restore verify --config FILE (--run ID | --run newest-ok) [--a
 - **validate** — offline: structure, types, templates, every reference between
   instances, every error at once with its path. It succeeds on a config whose
   secret files do not exist: a secret is a reference, and only a plugin's `Check`
-  reads it. `--preflight` adds those checks for every declared instance and for
+  reads it. Coded non-fatal warnings — a plaintext `k3s_state` artifact, a stage
+  record's carried warning — are printed on stderr and never change the exit
+  code. `--preflight` adds those checks for every declared instance and for
   every source a discovery finds, prints one line per instance — `ok`, `excluded
-  (kind): reason` for an object a discovery deliberately does not back up, or
-  `FAILED` with the reason — then the count of checked instances and a separate
+  (kind): reason` for an object a discovery deliberately does not back up, with
+  `elsewhere of node <name>` naming a declared peer, or `FAILED` with the
+  reason — then the count of checked instances and a separate
   count of excluded objects, and exits non-zero on any failure. `--instance
   KIND/NAME` restricts it, for a pod that cannot reach every instance; a named
   discovery brings the sources it finds with it, the summary counts only what was
@@ -700,7 +1087,10 @@ go-cluster-backup restore verify --config FILE (--run ID | --run newest-ok) [--a
   loader kinds, Floor, effective dependencies, cycles and availability offline,
   without constructing instances or doing I/O.
 - **schema** — the JSON Schema of a configuration file.
-- **doctor** — every external binary any registered plugin declares is on `PATH`.
+- **doctor** — every external binary any registered plugin declares is on
+  `PATH`, and every plugin with a configured binary suite (the PostgreSQL
+  sources) proves its `client_dirs` locally: a missing or wrong-major suite fails
+  the image's own gate even when `PATH` has no `pg_dump`.
 - **restore** — see [restore.md](restore.md).
 
 ## Template surface
@@ -711,14 +1101,20 @@ those names, so a rename is a breaking change. It is pinned by tests
 (`internal/plugins/configuration/template_surface_test.go`, `internal/plugins/layout/layout_surface_test.go`).
 
 - **Fields:** `RunReport`, `ArtifactResult`, `Artifact`, `StorageResult`,
-  `DumpStats`, `Exclusion`, `PreviousRun`, `PreviousFailure`, `AttemptFailure`,
-  `FailedPod`, `ContainerFailure`, `ContainerTermination`, `LeaseState`,
-  `Event`; and the layout data
+  `DumpStats`, `Warning`, `Exclusion`, `PreviousRun`, `PreviousFailure`,
+  `AttemptFailure`, `FailedPod`, `ContainerFailure`, `ContainerTermination`,
+  `LeaseState`, `Event`; and the layout data
   (`Run.ID`, `Run.StartedAt`, `Artifact.Group`, `Artifact.Name`, `Artifact.Ext`).
+  Newer members a template may read: `.Run.WriterIdentity`, `.Run.Warnings`,
+  `.Artifact.Warnings`, `.Stats.ChangedFiles`, `.Excluded[].Node`, and
+  `.Storages[].RetentionError` / `.CapOverflowBytes` / `.CapEvicted` /
+  `.OccupancyUnknown`.
 - **Functions:** the core set — `json`, `date`, `bytes`, `sibytes`, `duration`,
   `pick` — plus the notifier's own (`blank`, `byGroup`, `failed`, `sumBytes`,
   `pickdef`, `clip`) and the discovery's own (`label`, `envValue`, `envFile`,
-  `port`, `volumePath`).
+  `port`, `volumePath`). The endpoint-only `secret` set is not part of these: it
+  exists solely for the webhook `url` and header values with
+  `endpoint_templates: true` and is never available to a message or payload.
 
 ## Adding a plugin
 

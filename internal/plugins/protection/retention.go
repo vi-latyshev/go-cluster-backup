@@ -41,7 +41,14 @@ type SweepResult struct {
 	Kept    int
 	Deleted []string
 	Freed   int64
-	Err     error
+	// CapEvicted names the runs the cap deleted: what protection cost the
+	// operator, distinguished from the policy's own drops in Deleted.
+	CapEvicted []string
+	// CapOverflow is the bytes still held past the configured cap once every
+	// safe eviction is spent — the floor protects more than the cap allows.
+	// Zero on an unknown occupancy: unknown is never reported as overflow.
+	CapOverflow int64
+	Err         error
 }
 
 // Sweep runs the run kind's policy and — for a scheduled run — the occupancy
@@ -75,14 +82,38 @@ func (l *Ledger) retentionPhase(ctx context.Context, s Sweep) SweepResult {
 	if s.Overlay != nil {
 		current = s.Overlay.RunID
 	}
+	// The policy sees this writer's runs only: another writer's run sharing the
+	// prefix is never a candidate for credit, a slot, the floor or a deletion,
+	// though its bytes stay in the storage's occupancy (the cap counts every
+	// run). A run whose manifest is missing or unreadable cannot prove its
+	// writer, and "unknown" is never taken for "mine".
 	runs := make([]model.StoredRun, 0, len(sur.Runs)+1)
 	present := map[string]bool{}
 	for _, id := range slices.Sorted(maps.Keys(sur.Runs)) {
-		runs = append(runs, sur.Runs[id].Stored)
+		r := sur.Runs[id]
+		if !ownsRun(l.o.WriterIdentity, r) {
+			continue
+		}
+		runs = append(runs, r.Stored)
 		present[id] = true
 	}
 	if s.Overlay != nil && !present[s.Overlay.RunID] {
 		runs = append(runs, *s.Overlay)
+	}
+	// The ONE ledger is projected onto the policy input right here — after the
+	// current run's credit and before any decision. Artifacts are the copies
+	// this storage verified and whose manifest is saved (the ledger's held
+	// copies); ObservedArtifacts are every identity a readable manifest names,
+	// whatever its outcome, so a policy that keeps versions can tell a live
+	// artifact from one the source has dropped.
+	for i := range runs {
+		id := runs[i].RunID
+		runs[i].Artifacts = l.state.heldIdentities(id, s.Storage, runs[i].Kind)
+		if s.Overlay != nil && id == s.Overlay.RunID {
+			runs[i].ObservedArtifacts = artifactIdentities(s.Artifacts)
+			continue
+		}
+		runs[i].ObservedArtifacts = l.state.observed[id]
 	}
 	d := &deleter{ctx: ctx, l: l, storage: s.Storage, sur: sur, current: current,
 		cutoff: l.o.StaleCutoff, cap: l.caps[s.Storage]}
@@ -112,7 +143,8 @@ func (l *Ledger) retentionPhase(ctx context.Context, s Sweep) SweepResult {
 	if s.Kind == model.RunKindScheduled && d.failed == nil {
 		d.evictForCap(d.cap, runs)
 	}
-	return SweepResult{Kept: len(runs) - len(d.deleted), Deleted: d.deleted, Freed: d.freed, Err: d.failed}
+	return SweepResult{Kept: len(runs) - len(d.deleted), Deleted: d.deleted, Freed: d.freed,
+		CapEvicted: d.evicted, CapOverflow: d.overflow, Err: d.failed}
 }
 
 // creditCurrent records the run being written in the retention state before any
@@ -189,6 +221,13 @@ type retentionState struct {
 	// held is the per-artifact copy ledger, keyed by storage and then by kind:
 	// artifact identity -> storage -> kind -> run id -> the run's instant.
 	held map[string]map[string]map[model.RunKind]map[string]time.Time
+	// observed is every artifact identity a readable manifest named, whatever the
+	// outcome: the liveness input of a policy that keeps versions.
+	observed map[string][]string
+	// foreign names the runs this writer must not judge: another writer's, or a
+	// run whose manifest could not prove its writer. They are never credited,
+	// floored or deleted here.
+	foreign map[string]bool
 	// problems names the runs whose manifest is listed but could not be read,
 	// parsed or accepted. Such a run is never dropped in this sweep.
 	problems map[string]string
@@ -199,11 +238,13 @@ type retentionState struct {
 	uncertainRuns map[string]bool
 }
 
-func newRetentionState(surveys map[string]inventory.Survey) *retentionState {
+func newRetentionState(surveys map[string]inventory.Survey, writer string) *retentionState {
 	st := &retentionState{
 		verified:      map[string]map[string]bool{},
 		kinds:         map[string]model.RunKind{},
 		held:          map[string]map[string]map[model.RunKind]map[string]time.Time{},
+		observed:      map[string][]string{},
+		foreign:       map[string]bool{},
 		problems:      map[string]string{},
 		uncertainRuns: map[string]bool{},
 	}
@@ -213,16 +254,76 @@ func newRetentionState(surveys map[string]inventory.Survey) *retentionState {
 		}
 		for id, r := range s.Runs {
 			st.kinds[id] = r.Stored.Kind
+			if !ownsRun(writer, r) {
+				st.foreign[id] = true
+				continue
+			}
 			if r.Stored.Verified {
 				st.mark(id, name)
 			}
 			if r.ManifestProblem != "" {
 				st.problems[id] = r.ManifestProblem
 			}
+			if r.Manifest != nil {
+				if ids := artifactIdentities(r.Manifest.Artifacts); len(ids) > 0 {
+					st.observed[id] = ids
+				}
+			}
 			st.recordHeld(name, id, r)
 		}
 	}
 	return st
+}
+
+// ownsRun reports whether one surveyed run belongs to this writer. With no
+// configured identity every run under the prefix is this writer's — the
+// deployment's one-writer-per-prefix rule. With one, only a readable manifest
+// naming the same writer is proof: a run without a manifest, or with one this
+// build cannot read, cannot prove ownership, and "unknown" is never taken for
+// permission to delete.
+func ownsRun(writer string, r inventory.Run) bool {
+	if writer == "" {
+		return true
+	}
+	if r.Manifest == nil || r.ManifestProblem != "" {
+		return false
+	}
+	return r.Manifest.WriterIdentity == writer
+}
+
+// artifactIdentities is every artifact identity one run's results name, whatever
+// their outcome, in first-seen order: a manifest records a failed artifact too,
+// and a policy that keeps versions needs to know the run still looked for it.
+func artifactIdentities(results []model.ArtifactResult) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, ar := range results {
+		if ar.Artifact.Name == "" {
+			continue
+		}
+		id := artifactIdentity(ar.Artifact)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// heldIdentities lists the artifacts this run holds a successful copy of on one
+// storage, in a stable order: the policy input a keep-versions rule reads.
+func (st *retentionState) heldIdentities(runID, storage string, kind model.RunKind) []string {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []string
+	for artifact, byStorage := range st.held {
+		if _, ok := byStorage[storage][kind][runID]; ok {
+			out = append(out, artifact)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // recordHeld adds one surveyed run's artifact copies on one storage to the
@@ -338,6 +439,9 @@ func (st *retentionState) markUncertain(runID string) {
 func (st *retentionState) canDrop(runID, storage string) (bool, string) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.foreign[runID] {
+		return false, "the run belongs to another writer or cannot prove it is this writer's: this writer never deletes it"
+	}
 	if st.uncertainRuns[runID] {
 		return false, "the lease record's uncertainty names this run: its inventory is the settlement proof"
 	}
@@ -438,7 +542,11 @@ type deleter struct {
 	cap       *capState
 	deleted   []string
 	freed     int64
-	failed    error
+	// evicted names the runs the cap removed (also present in deleted), and
+	// overflow is the bytes the cap could not free, for the storage's report.
+	evicted  []string
+	overflow int64
+	failed   error
 }
 
 // drop deletes one run's objects — manifest first — unless the floor refuses it.
@@ -522,7 +630,7 @@ func (d *deleter) evictForCap(cap *capState, runs []model.StoredRun) {
 		if cap.used() <= cap.cap || d.failed != nil {
 			return
 		}
-		d.drop(id)
+		d.evict(id)
 	}
 	for _, id := range d.candidates(runs, func(r model.StoredRun) bool {
 		return r.Manifest && r.Kind == model.RunKindManual
@@ -530,7 +638,7 @@ func (d *deleter) evictForCap(cap *capState, runs []model.StoredRun) {
 		if cap.used() <= cap.cap || d.failed != nil {
 			return
 		}
-		d.drop(id)
+		d.evict(id)
 	}
 	// The remaining scheduled history, newest first, trimmed by the byte budget:
 	// what is left of the cap once every other kind's bytes are set aside. The
@@ -555,12 +663,25 @@ func (d *deleter) evictForCap(cap *capState, runs []model.StoredRun) {
 		if cap.used() <= cap.cap || d.failed != nil {
 			break
 		}
-		d.drop(r.RunID)
+		d.evict(r.RunID)
 	}
 	if d.failed == nil && cap.used() > cap.cap {
+		d.overflow = cap.used() - cap.cap
 		d.l.event(d.storage, human.Warning("storage.cap.overflow",
-			human.Bytes("over", cap.used()-cap.cap),
+			human.Bytes("over", d.overflow),
 			human.Text("reason", "the floor protects more than the cap allows")))
+	}
+}
+
+// evict runs the cap's deletion of one run and remembers it when the deletion
+// confirmed: the storage's report names every run the cap removed, separately
+// from the policy's own drops. A refused or failed deletion is not named —
+// nothing was removed.
+func (d *deleter) evict(id string) {
+	before := len(d.deleted)
+	d.drop(id)
+	if len(d.deleted) > before {
+		d.evicted = append(d.evicted, id)
 	}
 }
 

@@ -26,7 +26,7 @@ func Apply(lr *loader.Registry, factories *instances.Registry) error {
 		Type:      "files",
 		Summary:   Spec.Summary,
 		Stability: instances.Stable,
-		Example:   []byte(`{"root": "/volumes/example/name", "ignore_vanished": true}`),
+		Example:   []byte(`{"root": "/volumes/example/name", "ignore_vanished": true, "on_change": "record"}`),
 		New: func(ctx context.Context, cfg Config, deps instances.Deps) (source.Source, error) {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -36,6 +36,11 @@ func Apply(lr *loader.Registry, factories *instances.Registry) error {
 			}
 			if !filepath.IsAbs(cfg.Root) {
 				return nil, fmt.Errorf("root %q must be absolute", cfg.Root)
+			}
+			switch cfg.OnChange {
+			case "", "record", "fail":
+			default:
+				return nil, fmt.Errorf("on_change %q: want \"record\" or \"fail\"", cfg.OnChange)
 			}
 			log := deps.Log
 			if log == nil {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -52,15 +53,23 @@ func config(t *testing.T, addr string) string {
 // configDB is the single-database config of a named database.
 func configDB(t *testing.T, addr, database string) string {
 	t.Helper()
-	return fmt.Sprintf(`{"address": %q, "database": %q, "username": "app", "password": {"file": %q}, "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
-		addr, database, passwordFile(t))
+	return fmt.Sprintf(`{"address": %q, "database": %q, "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
+		addr, database, passwordFile(t), noSuiteDir(t))
 }
 
 // configFormat is the single-database config in a named dump format.
 func configFormat(t *testing.T, addr, format string) string {
 	t.Helper()
-	return fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "format": %q, "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
-		addr, passwordFile(t), format)
+	return fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": %q, "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
+		addr, passwordFile(t), noSuiteDir(t), format)
+}
+
+// noSuiteDir is an absolute directory that does not exist: a test that proves
+// the PATH suite is used still names client_dirs, because the strict decoder
+// requires the field the defaults document supplies in production.
+func noSuiteDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "postgresql18")
 }
 
 func passwordFile(t *testing.T) string {
@@ -94,7 +103,10 @@ func listener(t *testing.T) string {
 }
 
 // stubs writes fake binaries recording their argv, env and stdin, and puts
-// them at the front of PATH.
+// them at the front of PATH. Every binary answers --version with 18.6 and the
+// read-only server_version_num query with 180006 unless a STUB_LOG file
+// overrides it; a server-major query is answered before the generic output so
+// one stub can serve both the selection query and a plugin's own psql call.
 func stubs(t *testing.T, names ...string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -105,17 +117,22 @@ func stubs(t *testing.T, names ...string) {
 		script := `#!/bin/sh
 printf '%s\n' "$@" > "$STUB_LOG/argv.` + name + `"
 env | grep -E '^(PGPASSWORD|PGCONNECT_TIMEOUT)=' > "$STUB_LOG/env.` + name + `"
+code=0; if [ -f "$STUB_LOG/exit.` + name + `" ]; then code=$(cat "$STUB_LOG/exit.` + name + `"); fi
 for a in "$@"; do
   if [ "$a" = "--version" ]; then
     if [ -f "$STUB_LOG/version-exit" ]; then exit "$(cat "$STUB_LOG/version-exit")"; fi
-    cat "$STUB_LOG/version.` + name + `" 2>/dev/null; exit 0
+    if [ -f "$STUB_LOG/version.` + name + `" ]; then cat "$STUB_LOG/version.` + name + `"; else printf '` + name + ` (PostgreSQL) 18.6\n'; fi
+    exit 0
+  fi
+  if [ "$a" = "select current_setting('server_version_num')" ] && [ "$code" = 0 ]; then
+    if [ -f "$STUB_LOG/server-major" ]; then cat "$STUB_LOG/server-major"; else printf '180006\n'; fi
+    exit 0
   fi
 done
 if [ ! -t 0 ]; then cat > "$STUB_LOG/stdin.` + name + `"; fi
 cat "$STUB_LOG/out.` + name + `" 2>/dev/null
 if [ -f "$STUB_LOG/stderr.` + name + `" ]; then cat "$STUB_LOG/stderr.` + name + `" >&2; fi
 if [ -f "$STUB_LOG/sleep.` + name + `" ]; then : > "$STUB_LOG/started.` + name + `"; exec sleep "$(cat "$STUB_LOG/sleep.` + name + `")"; fi
-code=0; if [ -f "$STUB_LOG/exit.` + name + `" ]; then code=$(cat "$STUB_LOG/exit.` + name + `"); fi
 exit "$code"
 `
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
@@ -159,13 +176,92 @@ func waitStarted(t *testing.T, name string) {
 	}
 }
 
+// stubSuite writes a complete fake client suite into dir: one script per
+// program, every program answering --version with the major the versions map
+// names for it and psql answering the read-only server-version query with
+// serverMajor. The scripts use shell builtins only, so they run with PATH
+// naming no suite at all.
+func stubSuite(t *testing.T, dir string, versions map[string]int, serverMajor int) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"pg_dump", "pg_dumpall", "pg_restore", "psql"} {
+		major, ok := versions[name]
+		if !ok {
+			major = versions["*"]
+		}
+		script := "#!/bin/sh\n" +
+			`printf '%s\n' "$0" > "$STUB_LOG/bin.` + name + `"` + "\n" +
+			`printf '%s\n' "$@" > "$STUB_LOG/argv.` + name + `"` + "\n" +
+			"for a in \"$@\"; do\n" +
+			"  if [ \"$a\" = \"--version\" ]; then printf '" + name + " (PostgreSQL) " + strconv.Itoa(major) + ".0\\n'; exit 0; fi\n" +
+			"done\n" +
+			"for a in \"$@\"; do\n" +
+			"  if [ \"$a\" = \"select current_setting('server_version_num')\" ]; then printf '" + strconv.Itoa(serverMajor) + "0006\\n'; exit 0; fi\n" +
+			"done\n" +
+			"exit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// suiteDir writes one usable suite of a named major into a directory whose own
+// name states that major, with no PATH involved.
+func suiteDir(t *testing.T, major int) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "postgresql"+strconv.Itoa(major))
+	stubSuite(t, dir, map[string]int{"*": major}, major)
+	return dir
+}
+
+// suiteWithPsql is a usable suite whose psql answers --version and the
+// read-only server-version query, and otherwise runs the body: a test that
+// needs the selection to succeed and one later query to fail.
+func suiteWithPsql(t *testing.T, body string) string {
+	t.Helper()
+	dir := suiteDir(t, 18)
+	script := "#!/bin/sh\n" +
+		`printf '%s\n' "$@" > "$STUB_LOG/argv.psql"` + "\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$a\" = \"--version\" ]; then printf 'psql (PostgreSQL) 18.6\\n'; exit 0; fi\n" +
+		"done\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$a\" = \"select current_setting('server_version_num')\" ]; then printf '180006\\n'; exit 0; fi\n" +
+		"done\n" +
+		body + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "psql"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// configDirs is the single-database config that names its client suites.
+func configDirs(t *testing.T, addr string, compression string, dirs ...string) string {
+	t.Helper()
+	raw := map[string]any{
+		"address": addr, "database": "app", "username": "app",
+		"password":    map[string]any{"file": passwordFile(t)},
+		"client_dirs": dirs,
+		"format":      "custom", "compression": compression,
+		"connect_attempts": 2, "connect_interval": "20ms",
+		"all_databases": false, "exclude_databases": []string{},
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 func TestGeneralConformance(t *testing.T) {
 	plugintest.CheckSpec(t, testRegistry(t))
 }
 
 func TestSourceConformance(t *testing.T) {
 	sourcetest.Run(t, func(t *testing.T) source.Source {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
 			t.Fatal(err)
@@ -175,7 +271,7 @@ func TestSourceConformance(t *testing.T) {
 }
 
 func TestDescribe(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +292,7 @@ func TestDescribe(t *testing.T) {
 }
 
 func TestDumpArgsCarryNoPassword(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "out.pg_dump", "dump-bytes")
 	addr := listener(t)
 	s, err := build(t, config(t, addr))
@@ -247,7 +343,7 @@ func TestDumpPassesTheDatabaseNameAsAValue(t *testing.T) {
 	} {
 		t.Run(tc.label, func(t *testing.T) {
 			name := tc.name
-			stubs(t, "pg_dump", "psql", "pg_restore")
+			stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 			stubSet(t, "out.pg_dump", "dump-bytes")
 			addr := listener(t)
 			s, err := build(t, configDB(t, addr, name))
@@ -276,7 +372,7 @@ func TestDumpPassesTheDatabaseNameAsAValue(t *testing.T) {
 }
 
 func TestDumpConfigPasswordOutranksTheEnvironment(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	t.Setenv("PGPASSWORD", "inherited-and-wrong")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
@@ -293,7 +389,7 @@ func TestDumpConfigPasswordOutranksTheEnvironment(t *testing.T) {
 }
 
 func TestDumpRefusedCredentialsArePermanent(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "exit.pg_dump", "1")
 	stubSet(t, "stderr.pg_dump", "pg_dump: error: connection to server failed: FATAL:  password authentication failed for user \"app\"")
 	s, err := build(t, config(t, listener(t)))
@@ -310,7 +406,7 @@ func TestDumpRefusedCredentialsArePermanent(t *testing.T) {
 }
 
 func TestDumpConnectionRefusedIsTransient(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "exit.pg_dump", "1")
 	stubSet(t, "stderr.pg_dump", "pg_dump: error: connection to server at \"10.0.0.1\", port 5432 failed: Connection refused")
 	s, err := build(t, config(t, listener(t)))
@@ -327,7 +423,7 @@ func TestDumpConnectionRefusedIsTransient(t *testing.T) {
 }
 
 func TestDumpUnreachableTargetIsTransient(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, "127.0.0.1:1"))
 	if err != nil {
 		t.Fatal(err)
@@ -342,7 +438,7 @@ func TestDumpUnreachableTargetIsTransient(t *testing.T) {
 }
 
 func TestDumpWriterFailureStopsTheDump(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "out.pg_dump", strings.Repeat("x", 256<<10))
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
@@ -358,7 +454,7 @@ func TestDumpWriterFailureStopsTheDump(t *testing.T) {
 }
 
 func TestDumpReturnsOnCancellationMidRun(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "sleep.pg_dump", "10")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
@@ -383,38 +479,95 @@ func TestDumpReturnsOnCancellationMidRun(t *testing.T) {
 	}
 }
 
-func TestCheckComparesMajors(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
-	stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 18.6\n")
-	stubSet(t, "out.psql", "180006\n")
-	s, err := build(t, config(t, listener(t)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.(instances.Checker).Check(context.Background()); err != nil {
-		t.Fatalf("Check: %v", err)
-	}
-	got := strings.Split(strings.TrimSpace(stubLog(t, "argv.psql")), "\n")
-	if !strings.Contains(strings.Join(got, " "), "--dbname=dbname='app'") {
-		t.Fatalf("psql argv = %q, want the database as a dbname value", got)
-	}
-	if got[len(got)-1] != "select current_setting('server_version_num')" {
-		t.Fatalf("psql argv = %q", got)
-	}
-	for _, arg := range got {
-		if strings.Contains(arg, "s3cret-pw") {
-			t.Fatalf("the password appears on psql argv: %q", got)
+// TestCheckSelectsTheServersExactMajor: the suite is chosen by the server's
+// own major, and a major no local suite holds is a permanent named refusal —
+// never a fallback to whatever client happens to be installed.
+func TestCheckSelectsTheServersExactMajor(t *testing.T) {
+	t.Run("the PATH suite of the server's major", func(t *testing.T) {
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
+		s, err := build(t, config(t, listener(t)))
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-
-	stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 17.5\n")
-	err = s.(instances.Checker).Check(context.Background())
-	if err == nil {
-		t.Fatal("a major version mismatch was accepted")
-	}
-	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
-		t.Fatalf("mismatch class = %q, want permanent (%v)", class, err)
-	}
+		if err := s.(instances.Checker).Check(context.Background()); err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		argv := strings.Split(strings.TrimSpace(stubLog(t, "argv.psql")), "\n")
+		if !strings.Contains(strings.Join(argv, " "), "--dbname=dbname='app'") {
+			t.Fatalf("psql argv = %q, want the database as a dbname value", argv)
+		}
+		if argv[len(argv)-1] != "select current_setting('server_version_num')" {
+			t.Fatalf("psql argv = %q", argv)
+		}
+		for _, arg := range argv {
+			if strings.Contains(arg, "s3cret-pw") {
+				t.Fatalf("the password appears on psql argv: %q", argv)
+			}
+		}
+	})
+	t.Run("a configured suite of the server's major, without PATH", func(t *testing.T) {
+		t.Setenv("STUB_LOG", t.TempDir())
+		t.Setenv("PATH", t.TempDir())
+		s, err := build(t, configDirs(t, "127.0.0.1:1", "none", suiteDir(t, 17)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The address is unreachable, so the full Check stops at the TCP wait;
+		// the local capability is what this case is about.
+		if err := s.(instances.CheckBinaries).CheckBinaries(context.Background()); err != nil {
+			t.Fatalf("CheckBinaries: %v", err)
+		}
+	})
+	t.Run("no suite of the server's major", func(t *testing.T) {
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
+		s, err := build(t, config(t, listener(t)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stubSet(t, "server-major", "170006\n")
+		err = s.(instances.Checker).Check(context.Background())
+		if err == nil {
+			t.Fatal("a server major no local suite holds was accepted")
+		}
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+			t.Fatalf("class = %q, want permanent (%v)", class, err)
+		}
+		if !strings.Contains(err.Error(), "server major 17") || !strings.Contains(err.Error(), "18") {
+			t.Fatalf("the refusal names neither the server major nor the held ones: %v", err)
+		}
+	})
+	t.Run("a PATH suite that mixes majors", func(t *testing.T) {
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
+		stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 17.5\n")
+		s, err := build(t, config(t, listener(t)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.(instances.Checker).Check(context.Background())
+		if err == nil {
+			t.Fatal("a suite mixing majors was accepted")
+		}
+		if !strings.Contains(err.Error(), "mixes majors") {
+			t.Fatalf("the refusal does not name the mixed suite: %v", err)
+		}
+	})
+	t.Run("a directory whose name disagrees with its programs", func(t *testing.T) {
+		t.Setenv("STUB_LOG", t.TempDir())
+		t.Setenv("PATH", t.TempDir())
+		dir := filepath.Join(t.TempDir(), "postgresql15")
+		stubSuite(t, dir, map[string]int{"*": 16}, 16)
+		s, err := build(t, configDirs(t, "127.0.0.1:1", "none", dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.(instances.CheckBinaries).CheckBinaries(context.Background())
+		if err == nil {
+			t.Fatal("a suite whose directory names major 15 but holds 16 was accepted")
+		}
+		if !strings.Contains(err.Error(), "names major 15") {
+			t.Fatalf("the refusal does not name the directory major: %v", err)
+		}
+	})
 }
 
 func TestCheckWithoutBinaries(t *testing.T) {
@@ -440,7 +593,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		m := map[string]any{
 			"address": "h:5432", "database": "app", "username": "app",
 			"password": map[string]any{"file": "/p"}, "format": "custom", "compression": "none",
-			"connect_attempts": 1, "connect_interval": "1s",
+			"connect_attempts": 1, "connect_interval": "1s", "client_dirs": []string{"/nonexistent/postgresql18"},
 			"all_databases": false, "exclude_databases": []string{},
 		}
 		mutate(m)
@@ -468,6 +621,8 @@ func TestNewRejectsBadConfig(t *testing.T) {
 			m["all_databases"] = true
 			m["exclude_databases"] = []string{""}
 		},
+		"no client dirs":        func(m map[string]any) { m["client_dirs"] = []string{} },
+		"a relative client dir": func(m map[string]any) { m["client_dirs"] = []string{"postgresql18"} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := build(t, cfg(mutate)); err == nil {
@@ -480,7 +635,7 @@ func TestNewRejectsBadConfig(t *testing.T) {
 const restoreOptions = `{"jobs": 1, "no_owner": false, "no_acl": false, "connect_attempts": 2, "connect_interval": "20ms"}`
 
 func TestApplySideBySide(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -523,7 +678,7 @@ func TestApplySideBySide(t *testing.T) {
 }
 
 func TestApplyInPlace(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -549,7 +704,7 @@ func TestApplyInPlace(t *testing.T) {
 }
 
 func TestApplyJobsReadTheFileBackedArtifactDirectly(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -587,7 +742,7 @@ func TestApplyJobsReadTheFileBackedArtifactDirectly(t *testing.T) {
 }
 
 func TestApplyJobsRefuseAnArtifactFromAStream(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -605,13 +760,15 @@ func TestApplyJobsRefuseAnArtifactFromAStream(t *testing.T) {
 	if !strings.Contains(err.Error(), "jobs 4") {
 		t.Fatalf("the refusal does not name the option: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(os.Getenv("STUB_LOG"), "argv.pg_restore")); err == nil {
-		t.Fatal("pg_restore ran despite the refusal")
+	// The suite's --version probe runs, so the log exists; what must not be
+	// there is a restore invocation.
+	if argv := stubLog(t, "argv.pg_restore"); strings.Contains(argv, "--exit-on-error") {
+		t.Fatalf("pg_restore restored despite the refusal: %q", argv)
 	}
 }
 
 func TestApplyRefusesBadRequests(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -635,7 +792,7 @@ func TestApplyRefusesBadRequests(t *testing.T) {
 }
 
 func TestApplySideBySideLabelSanitized(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -652,7 +809,7 @@ func TestApplySideBySideLabelSanitized(t *testing.T) {
 }
 
 func TestApplySideBySideQuotesADatabaseNameWithAQuote(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, configDB(t, listener(t), `app"quoted`))
 	if err != nil {
 		t.Fatal(err)
@@ -673,7 +830,7 @@ func TestApplySideBySideQuotesADatabaseNameWithAQuote(t *testing.T) {
 }
 
 func TestPlainFormatIsFetchOnly(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, configFormat(t, listener(t), "plain"))
 	if err != nil {
 		t.Fatal(err)
@@ -696,7 +853,7 @@ func TestPlainFormatIsFetchOnly(t *testing.T) {
 }
 
 func TestProbe(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -719,19 +876,35 @@ func TestProbe(t *testing.T) {
 	}
 }
 
-func TestErrorsAreJoined(t *testing.T) {
+// TestCheckBinariesReportsEveryBrokenSuite: every existing configured
+// directory is judged, and all their failures come back together, so a
+// deployment learns about both instead of one per run.
+func TestCheckBinariesReportsEveryBrokenSuite(t *testing.T) {
+	t.Setenv("STUB_LOG", t.TempDir())
 	t.Setenv("PATH", t.TempDir())
-	s, err := build(t, config(t, "127.0.0.1:1"))
+	dirA := filepath.Join(t.TempDir(), "postgresql18")
+	dirB := filepath.Join(t.TempDir(), "postgresql17")
+	for _, dir := range []string{dirA, dirB} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := build(t, configDirs(t, "127.0.0.1:1", "none", dirA, dirB))
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = s.(instances.Checker).Check(context.Background())
+	err = s.(instances.CheckBinaries).CheckBinaries(context.Background())
 	var joined interface{ Unwrap() []error }
 	if !errors.As(err, &joined) {
-		t.Fatalf("expected every missing binary reported at once, got %v", err)
+		t.Fatalf("expected every broken suite reported at once, got %v", err)
 	}
-	if len(joined.Unwrap()) != 3 {
-		t.Fatalf("joined %d errors, want 3: %v", len(joined.Unwrap()), err)
+	if len(joined.Unwrap()) != 2 {
+		t.Fatalf("joined %d errors, want 2: %v", len(joined.Unwrap()), err)
+	}
+	for _, dir := range []string{dirA, dirB} {
+		if !strings.Contains(err.Error(), dir) {
+			t.Fatalf("the refusal does not name %s: %v", dir, err)
+		}
 	}
 }
 
@@ -739,7 +912,7 @@ func TestErrorsAreJoined(t *testing.T) {
 // contract) and --jobs are mutually exclusive; the combination is refused by
 // the plugin before a connection or a command, and side_by_side keeps jobs.
 func TestApplyInPlaceRefusesJobs(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -768,12 +941,12 @@ func TestApplyInPlaceRefusesJobs(t *testing.T) {
 // cancellation branch is unreachable once the wait has already given up.
 func slowConfig(t *testing.T, addr string) string {
 	t.Helper()
-	return fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "format": "custom", "compression": "none", "connect_attempts": 20, "connect_interval": "200ms", "all_databases": false, "exclude_databases": []}`,
-		addr, passwordFile(t))
+	return fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": "custom", "compression": "none", "connect_attempts": 20, "connect_interval": "200ms", "all_databases": false, "exclude_databases": []}`,
+		addr, passwordFile(t), noSuiteDir(t))
 }
 
 func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := instances.Build(ctx, testRegistry(t), source.Kind, "postgres",
@@ -806,10 +979,37 @@ func TestCancelledContextIsRefusedEverywhere(t *testing.T) {
 	}
 }
 
+// TestApplyRefusesANoSuiteServer: the restore selects the target's exact major
+// before a byte is read.
+func TestApplyRefusesANoSuiteServer(t *testing.T) {
+	t.Setenv("STUB_LOG", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	dir := suiteWithPsql(t, "printf '180006\\n'") // not reached: the version loop answers
+	// Rewrite the server-version answer to a major no suite holds.
+	script, err := os.ReadFile(filepath.Join(dir, "psql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "psql"),
+		[]byte(strings.ReplaceAll(string(script), "printf '180006\\n'", "printf '170006\\n'")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := build(t, configDirs(t, listener(t), "none", dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.(source.Restorer).Apply(context.Background(), source.ApplyRequest{
+		Mode: source.ApplySideBySide, Label: "l", Options: jsontext.Value(restoreOptions),
+	}, strings.NewReader("x"))
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
+	}
+}
+
 // TestCheckUnreachableIsTransient: a server that does not answer is worth
 // another attempt; the preflight must say so rather than refuse the run.
 func TestCheckUnreachableIsTransient(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, "127.0.0.1:1"))
 	if err != nil {
 		t.Fatal(err)
@@ -823,9 +1023,14 @@ func TestCheckUnreachableIsTransient(t *testing.T) {
 // TestCheckCancelledDuringConnectReturnsTheContextError: cancellation is not
 // the server's fault, and the preflight must report it as such.
 func TestCheckCancelledDuringConnectReturnsTheContextError(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, slowConfig(t, "127.0.0.1:1"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	// Warm the local suite resolution first: this case is about the connect
+	// wait, not about cancelling while the binaries are probed.
+	if err := s.(instances.CheckBinaries).CheckBinaries(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -839,10 +1044,10 @@ func TestCheckCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 }
 
 func TestCheckFailsWithoutThePasswordFile(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	pass := passwordFile(t)
-	cfg := fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
-		listener(t), pass)
+	cfg := fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
+		listener(t), pass, noSuiteDir(t))
 	s, err := build(t, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -860,7 +1065,7 @@ func TestCheckFailsWithoutThePasswordFile(t *testing.T) {
 // preflight's own failures.
 func TestCheckReportsWhatItCannotRead(t *testing.T) {
 	t.Run("a failing pg_dump --version", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		stubSet(t, "version-exit", "1")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
@@ -871,7 +1076,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		}
 	})
 	t.Run("no version in the output", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) unknown\n")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
@@ -882,7 +1087,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		}
 	})
 	t.Run("a version number that does not fit", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 99999999999999999999999.1\n")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
@@ -893,7 +1098,7 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		}
 	})
 	t.Run("a failing psql query", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 18.6\n")
 		stubSet(t, "exit.psql", "1")
 		stubSet(t, "stderr.psql", "psql: error: connection to server failed: Connection refused")
@@ -906,9 +1111,8 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 		}
 	})
 	t.Run("a server version that is not a number", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
-		stubSet(t, "version.pg_dump", "pg_dump (PostgreSQL) 18.6\n")
-		stubSet(t, "out.psql", "not-a-number\n")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
+		stubSet(t, "server-major", "not-a-number\n")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
 			t.Fatal(err)
@@ -922,9 +1126,9 @@ func TestCheckReportsWhatItCannotRead(t *testing.T) {
 // TestUnitsCancelledDuringConnectReturnsTheContextError: the enumeration is a
 // plugin call like any other.
 func TestUnitsCancelledDuringConnectReturnsTheContextError(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
-	cfg := fmt.Sprintf(`{"address": "127.0.0.1:1", "database": "app", "username": "app", "password": {"file": %q}, "format": "custom", "compression": "none", "connect_attempts": 20, "connect_interval": "200ms", "all_databases": true, "exclude_databases": []}`,
-		passwordFile(t))
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
+	cfg := fmt.Sprintf(`{"address": "127.0.0.1:1", "database": "app", "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": "custom", "compression": "none", "connect_attempts": 20, "connect_interval": "200ms", "all_databases": true, "exclude_databases": []}`,
+		passwordFile(t), noSuiteDir(t))
 	s, err := build(t, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -939,9 +1143,10 @@ func TestUnitsCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 	}
 }
 
-// TestDumpFailsWhenPgDumpIsMissing: the binary is resolved at the dump, and a
-// deployment without it is a transient fault of this call.
-func TestDumpFailsWhenPgDumpIsMissing(t *testing.T) {
+// TestDumpRefusesAMissingClientSuite: the suite is resolved at the dump, and a
+// deployment without any usable suite is a permanent refusal, not a retry that
+// can never conjure a binary.
+func TestDumpRefusesAMissingClientSuite(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
@@ -949,17 +1154,73 @@ func TestDumpFailsWhenPgDumpIsMissing(t *testing.T) {
 	}
 	err = s.Dump(context.Background(), io.Discard)
 	if err == nil {
-		t.Fatal("Dump reported success without pg_dump")
+		t.Fatal("Dump reported success without a client suite")
 	}
-	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
-		t.Fatalf("class = %q, want transient (%v)", class, err)
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
+	}
+	if !strings.Contains(err.Error(), "PostgreSQL client suite") {
+		t.Fatalf("the refusal does not name the suite: %v", err)
+	}
+}
+
+// TestDumpUsesTheConfiguredSuiteWithoutPATH: a deployment that installs the
+// client into its own directory and leaves PATH alone still dumps; the suite
+// the config names is the one that runs.
+func TestDumpUsesTheConfiguredSuiteWithoutPATH(t *testing.T) {
+	t.Setenv("STUB_LOG", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	dir := suiteDir(t, 18)
+	s, err := build(t, configDirs(t, listener(t), "none", dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Dump(context.Background(), io.Discard); err != nil {
+		t.Fatalf("Dump: %v", err)
+	}
+	if got := stubLog(t, "bin.pg_dump"); !strings.Contains(got, dir) {
+		t.Fatalf("pg_dump ran from %q, want the configured suite %s", got, dir)
+	}
+}
+
+// TestDumpMapsCompressionForPG15: a PostgreSQL 15 server's pg_dump takes only
+// a numeric --compress level, so gzip:N is mapped to N, and a method it cannot
+// express refuses the dump by name before a byte leaves the server.
+func TestDumpMapsCompressionForPG15(t *testing.T) {
+	t.Setenv("STUB_LOG", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	s, err := build(t, configDirs(t, listener(t), "gzip:3", suiteDir(t, 15)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Dump(context.Background(), io.Discard); err != nil {
+		t.Fatalf("Dump: %v", err)
+	}
+	argv := strings.Join(strings.Split(strings.TrimSpace(stubLog(t, "argv.pg_dump")), "\n"), " ")
+	if !strings.Contains(argv, "--compress=3") {
+		t.Fatalf("pg_dump argv = %q, want the mapped numeric level", argv)
+	}
+
+	s, err = build(t, configDirs(t, listener(t), "zstd:3", suiteDir(t, 15)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.Dump(context.Background(), io.Discard)
+	if err == nil {
+		t.Fatal("a zstd compression was accepted by a PostgreSQL 15 client")
+	}
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Fatalf("class = %q, want permanent (%v)", class, err)
+	}
+	if !strings.Contains(err.Error(), "zstd:3") || !strings.Contains(err.Error(), "15") {
+		t.Fatalf("the refusal names neither the value nor the major: %v", err)
 	}
 }
 
 // TestProbeCancelledMidRunReturnsTheContextError: the probe waits on a command,
 // and a cancelled context is reported as the cancellation, not the kill.
 func TestProbeCancelledMidRunReturnsTheContextError(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "sleep.pg_restore", "10")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
@@ -984,7 +1245,7 @@ func TestProbeCancelledMidRunReturnsTheContextError(t *testing.T) {
 // before a command runs.
 func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 	t.Run("an unreachable target", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		s, err := build(t, config(t, "127.0.0.1:1"))
 		if err != nil {
 			t.Fatal(err)
@@ -997,7 +1258,7 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		}
 	})
 	t.Run("cancelled during the connect", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		s, err := build(t, slowConfig(t, "127.0.0.1:1"))
 		if err != nil {
 			t.Fatal(err)
@@ -1015,7 +1276,7 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		}
 	})
 	t.Run("a label that yields no name", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
 			t.Fatal(err)
@@ -1028,7 +1289,7 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		}
 	})
 	t.Run("a name longer than PostgreSQL allows", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		s, err := build(t, config(t, listener(t)))
 		if err != nil {
 			t.Fatal(err)
@@ -1041,10 +1302,10 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		}
 	})
 	t.Run("a database the server refuses to create", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
-		stubSet(t, "exit.psql", "1")
-		stubSet(t, "stderr.psql", `psql: error: ERROR:  database "app_restore_l" already exists`)
-		s, err := build(t, config(t, listener(t)))
+		t.Setenv("STUB_LOG", t.TempDir())
+		t.Setenv("PATH", t.TempDir())
+		dir := suiteWithPsql(t, `case "$a" in CREATE\\ DATABASE*) printf 'ERROR:  database "app_restore_l" already exists\\n' >&2; exit 1;; esac`)
+		s, err := build(t, configDirs(t, listener(t), "none", dir))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1055,7 +1316,7 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		}
 	})
 	t.Run("an in-place restore that fails", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		stubSet(t, "exit.pg_restore", "1")
 		stubSet(t, "stderr.pg_restore", "pg_restore: error: could not execute query: ERROR:  relation already exists")
 		s, err := build(t, config(t, listener(t)))
@@ -1069,10 +1330,10 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 		}
 	})
 	t.Run("without the password file", func(t *testing.T) {
-		stubs(t, "pg_dump", "psql", "pg_restore")
+		stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 		pass := passwordFile(t)
-		cfg := fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
-			listener(t), pass)
+		cfg := fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
+			listener(t), pass, noSuiteDir(t))
 		s, err := build(t, cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -1091,7 +1352,7 @@ func TestApplyRefusalsCoverTheConnectAndNamingPaths(t *testing.T) {
 // TestApplyJobsNeedsARegularFile: pg_restore --jobs reads a path itself, so an
 // artifact that is not a regular file is refused by name.
 func TestApplyJobsNeedsARegularFile(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)
@@ -1116,7 +1377,7 @@ func TestApplyJobsNeedsARegularFile(t *testing.T) {
 // TestApplyJobsReportsAFailingRestore: the parallel restore's own command
 // failure is the call's error.
 func TestApplyJobsReportsAFailingRestore(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "exit.pg_restore", "1")
 	stubSet(t, "stderr.pg_restore", "pg_restore: error: could not execute query: ERROR:  relation already exists")
 	s, err := build(t, config(t, listener(t)))
@@ -1156,10 +1417,10 @@ func (w cancelFailWriter) Write([]byte) (int, error) {
 }
 
 func TestDumpFailsWithoutThePasswordFile(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	pass := passwordFile(t)
-	cfg := fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
-		listener(t), pass)
+	cfg := fmt.Sprintf(`{"address": %q, "database": "app", "username": "app", "password": {"file": %q}, "client_dirs": [%q], "format": "custom", "compression": "none", "connect_attempts": 2, "connect_interval": "20ms", "all_databases": false, "exclude_databases": []}`,
+		listener(t), pass, noSuiteDir(t))
 	s, err := build(t, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1173,7 +1434,7 @@ func TestDumpFailsWithoutThePasswordFile(t *testing.T) {
 }
 
 func TestDumpCancelledDuringConnectReturnsTheContextError(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, slowConfig(t, "127.0.0.1:1"))
 	if err != nil {
 		t.Fatal(err)
@@ -1191,7 +1452,7 @@ func TestDumpCancelledDuringConnectReturnsTheContextError(t *testing.T) {
 // TestDumpReportsTheContextWhenTheDestinationFailsUnderIt: a write that fails
 // while the run is being cancelled is the cancellation, not the destination.
 func TestDumpReportsTheContextWhenTheDestinationFailsUnderIt(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	stubSet(t, "out.pg_dump", "some dump bytes")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
@@ -1242,7 +1503,7 @@ func TestDumpReportsTheContextWhenTheCommandCannotStart(t *testing.T) {
 // TestApplyJobsReportsAClosedArtifact: pg_restore --jobs stats the artifact it
 // is handed, and a handle that cannot be asked is a transient fault.
 func TestApplyJobsReportsAClosedArtifact(t *testing.T) {
-	stubs(t, "pg_dump", "psql", "pg_restore")
+	stubs(t, "pg_dump", "pg_dumpall", "psql", "pg_restore")
 	s, err := build(t, config(t, listener(t)))
 	if err != nil {
 		t.Fatal(err)

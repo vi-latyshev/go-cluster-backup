@@ -449,3 +449,86 @@ func TestBinaryErrorsNamesEveryInstance(t *testing.T) {
 		t.Fatalf("errs without a lookup = %v", errs)
 	}
 }
+
+// binariesChecker scripts the optional local suite proof.
+type binariesChecker struct {
+	err   error
+	calls int
+}
+
+func (b *binariesChecker) CheckBinaries(context.Context) error {
+	b.calls++
+	return b.err
+}
+
+// TestCheckProvesTheBinarySuiteBeforeTheRemoteCheck: a configured client suite
+// is proved locally first — a wrong-major or incomplete directory is the
+// deployment's fault, and the remote Check must not hide it behind a connection
+// error. A suite that holds up lets the remote Check run.
+func TestCheckProvesTheBinarySuiteBeforeTheRemoteCheck(t *testing.T) {
+	suite := &binariesChecker{err: errors.New("client suite /usr/libexec/postgresql15 names major 15 but its programs report 16")}
+	remote := &checker{}
+	inst := Instance{Kind: "source", Name: "pg", Check: remote, BinariesCheck: suite}
+	rows := testPlanner(1).Check(context.Background(), nil, Options{Instances: []Instance{inst}})
+	if len(rows) != 1 || rows[0].Err == nil || !strings.Contains(rows[0].Err.Error(), "names major 15") {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if remote.calls != 0 {
+		t.Fatal("the remote check ran on an unusable client suite")
+	}
+
+	suite.err = nil
+	rows = testPlanner(1).Check(context.Background(), nil, Options{Instances: []Instance{inst}})
+	if len(rows) != 1 || rows[0].Err != nil {
+		t.Fatalf("rows = %+v", rows)
+	}
+	if suite.calls != 2 || remote.calls != 1 {
+		t.Fatalf("suite calls = %d, remote calls = %d", suite.calls, remote.calls)
+	}
+
+	// An instance without the capability is never asked for a suite.
+	noSuite := Instance{Kind: "source", Name: "plain", Check: &checker{}}
+	rows = testPlanner(1).Check(context.Background(), nil, Options{Instances: []Instance{noSuite}})
+	if len(rows) != 1 || rows[0].Err != nil {
+		t.Fatalf("rows = %+v", rows)
+	}
+}
+
+// TestCheckFoundAppliesTheCredentialDecision: a discovered source answers the
+// run's credential rule before its operational Check — a refusal is its failed
+// row, a warning rides beside an ok row.
+func TestCheckFoundAppliesTheCredentialDecision(t *testing.T) {
+	f := &fleet{children: map[string]source.Source{
+		"workloads/refused": &unitSource{unitsErr: errors.ErrUnsupported},
+		"workloads/warned":  &unitSource{unitsErr: errors.ErrUnsupported},
+	}}
+	refused := plainFound("workloads/refused", "databases/refused")
+	refused.Type = "fake"
+	warned := plainFound("workloads/warned", "databases/warned")
+	warned.Type = "fake"
+	d := &scriptedDiscovery{passes: [][]discovery.Found{{refused, warned}}}
+	credential := func(_ context.Context, _ source.Source, artifact model.Artifact, _ []string) (model.Warning, error) {
+		if artifact.Name == "databases/refused" {
+			return model.Warning{}, errors.New("carries credentials and its pipeline has no sealing processor")
+		}
+		return model.Warning{Code: "source.credentials.unsealed", Message: "plaintext credentials"}, nil
+	}
+	rows := testPlanner(1).Check(context.Background(), nil, Options{
+		Instances:   []Instance{instance("discovery", "workloads", &checker{})},
+		Discoveries: []Discoverer{{Name: "workloads", Instance: d}},
+		Build:       f.build,
+		Check:       f.check,
+		Credential:  credential,
+		Discovered:  true,
+	})
+	byKey := map[string]Row{}
+	for _, r := range rows {
+		byKey[r.Kind+"/"+r.Name] = r
+	}
+	if r := byKey["source/workloads/refused"]; r.Err == nil || !strings.Contains(r.Err.Error(), "carries credentials") {
+		t.Fatalf("the refused row = %+v", r)
+	}
+	if r := byKey["source/workloads/warned"]; r.Err != nil || len(r.Warnings) != 1 || r.Warnings[0].Code != "source.credentials.unsealed" {
+		t.Fatalf("the warned row = %+v", r)
+	}
+}

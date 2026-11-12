@@ -1,0 +1,104 @@
+# promtool test rules for prometheusrule.yaml.
+#
+# promtool reads plain rule groups, not the PrometheusRule wrapper, so the
+# command extracts `spec` into a scratch directory first. Run with the pinned
+# tool:
+#   docker run --rm -v "$PWD/examples/monitoring:/src:ro" --entrypoint sh \
+#     prom/prometheus:v3.6.0 -c '
+#       cd /tmp &&
+#       awk "f{print} /^spec:/{f=1}" /src/prometheusrule.yaml > rules.extracted.yaml &&
+#       cp /src/prometheusrules_test.yaml . &&
+#       promtool test rules prometheusrules_test.yaml'
+#
+# The push group is the subject: the expected-source rule must name an artifact
+# identity, not a writer aggregate. A fresh writer keeps a healthy sibling's
+# series updating while one explicitly expected artifact is gone.
+rule_files:
+  - rules.extracted.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: a vanished expected source fires while a healthy sibling keeps reporting
+    interval: 1m
+    input_series:
+      - series: 'push_time_seconds{job="go-cluster-backup",writer="node-a"}'
+        values: '0+60x30'
+      - series: 'gcb_run_started{job="go-cluster-backup",writer="node-a"}'
+        values: '0+0x30'
+      - series: 'gcb_artifact_present{job="go-cluster-backup",writer="node-a",artifact="volumes/app-uploads"}'
+        values: '1+0x30'
+      - series: 'gcb_artifact_ok{job="go-cluster-backup",writer="node-a",artifact="volumes/app-uploads"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GoClusterBackupExpectedSourceMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: go-cluster-backup
+              writer: node-a
+              artifact: volumes/uploads
+            exp_annotations:
+              summary: Expected backup source volumes/uploads is missing from writer node-a
+              description: >-
+                The writer keeps reporting, but this artifact identity has not
+                appeared in its latest push: discovery stopped matching it, the
+                artifact was renamed, or its source failed before producing a
+                result. The run can still be delivered, so no aggregate signal
+                covers this gap.
+
+  - name: an artifact warning fires the warnings alert while run warnings stay zero
+    interval: 1m
+    input_series:
+      - series: 'gcb_run_started{job="go-cluster-backup",writer="node-a"}'
+        values: '0+0x10'
+      - series: 'gcb_run_warnings_total{job="go-cluster-backup",writer="node-a"}'
+        values: '0+0x10'
+      - series: 'gcb_artifact_warnings{job="go-cluster-backup",writer="node-a",artifact="control-plane/k3s-state"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: GoClusterBackupRunWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: go-cluster-backup
+              writer: node-a
+            exp_annotations:
+              summary: Backup writer node-a reported coded warnings
+              description: >-
+                Catalog mark/settle/clear failures are run warnings; an artifact
+                warning such as source.credentials.unsealed (plaintext credential
+                bytes) is counted per artifact. Both are non-fatal and visible
+                here.
+
+  - name: a present expected source does not fire
+    interval: 1m
+    input_series:
+      - series: 'push_time_seconds{job="go-cluster-backup",writer="node-a"}'
+        values: '0+60x30'
+      - series: 'gcb_run_started{job="go-cluster-backup",writer="node-a"}'
+        values: '0+0x30'
+      - series: 'gcb_artifact_present{job="go-cluster-backup",writer="node-a",artifact="volumes/uploads"}'
+        values: '1+0x30'
+      - series: 'gcb_artifact_ok{job="go-cluster-backup",writer="node-a",artifact="volumes/uploads"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GoClusterBackupExpectedSourceMissing
+        exp_alerts: []
+
+  - name: a run in progress suppresses the missing-source alert
+    interval: 1m
+    input_series:
+      - series: 'push_time_seconds{job="go-cluster-backup",writer="node-a"}'
+        values: '0+60x30'
+      - series: 'gcb_run_started{job="go-cluster-backup",writer="node-a"}'
+        values: '1+0x30'
+      - series: 'gcb_artifact_present{job="go-cluster-backup",writer="node-a",artifact="volumes/app-uploads"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GoClusterBackupExpectedSourceMissing
+        exp_alerts: []

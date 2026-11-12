@@ -596,6 +596,9 @@ func validateSources(sources map[string]SourceInstance, path string) []error {
 	for _, name := range sortedKeys(sources) {
 		s := sources[name]
 		errs = append(errs, validateArtifact(s.Artifact, path+"/"+name+"/artifact")...)
+		if s.RateLimit < 0 {
+			errs = append(errs, fmt.Errorf("%s/%s/rate_limit must not be negative: %d", path, name, s.RateLimit))
+		}
 		for i, ref := range s.Pipeline {
 			if ref == "" {
 				errs = append(errs, fmt.Errorf("%s/%s/pipeline/%d is empty; an empty pipeline is written as []", path, name, i))
@@ -684,6 +687,12 @@ type RunConfig struct {
 	// container's allowance. It must be set to match activeDeadlineSeconds; it is
 	// the only evidence allowed to stand in for a pod object that vanished.
 	LeaseHardBound model.Duration `json:"lease_hard_bound" required:"true" doc:"longest any writer can live (run deadline + finish allowance + stage allowance); must match the Job's activeDeadlineSeconds"`
+	// WriterIdentity is the stable writer id this deployment opted into, "" when
+	// it did not. Every manifest stores it; protection uses it to tell a peer
+	// writer's runs from this writer's, so a peer run sharing the prefix is never
+	// credited, floored or deleted. It is not a serialisation: writers that share
+	// a prefix must share its catalog/lease.
+	WriterIdentity string `json:"writer_identity" doc:"stable writer id this deployment opts into; stored in every manifest so a peer writer sharing the prefix is never credited or deleted; empty opts out"`
 }
 
 type RetryConfig struct {
@@ -751,6 +760,12 @@ type SourceInstance struct {
 	// instance names; a restore never reads this list, it reads the chain the
 	// manifest recorded ([zstd, seal]).
 	Pipeline []string `json:"pipeline" required:"true" doc:"names of the processor instances this source flows through, in encode order; [] means the bytes go as the source wrote them"`
+	// RateLimit caps the raw bytes per second the source produces, before the
+	// pipeline's first processor. 0 is unlimited. The burst is part of the
+	// implementation (at most 1 MiB), never a second knob: spreading reads over
+	// time extends the dump's snapshot and lock window, and it never reduces
+	// the server's total work.
+	RateLimit model.ByteSize `json:"rate_limit" doc:"raw bytes per second the source may produce, before compression; 0 is unlimited; a fixed burst of at most 1MiB applies"`
 	// Config is the plugin's own config: opaque to the assembly, and stated by the
 	// deployment unless the type's defaults block creates it whole. The schema decides
 	// per type; the defaults check reads it against that type's block.

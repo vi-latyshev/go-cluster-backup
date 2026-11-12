@@ -51,6 +51,10 @@ type RunOptions struct {
 	DegradedExitCode       int
 	FailedExitCode         int
 	NotifierFailureIsFatal bool
+	// WriterIdentity is the stable writer id this deployment opted into, "" when
+	// it did not. Every manifest stores it, and the storage sweep aborts a stale
+	// upload only when the run it belongs to proves the same writer.
+	WriterIdentity string
 }
 
 // Storage is one built destination's read port as the workflow receives it:
@@ -76,6 +80,9 @@ type Source struct {
 	Pipeline   string
 	Refs       []string
 	Processors []processor.Processor
+	// RateLimit is the raw bytes per second this source may produce before its
+	// first processor: part of the source's envelope, never a chain step.
+	RateLimit model.ByteSize
 }
 
 // Discovery is one built discovery the run surveys.
@@ -226,6 +233,7 @@ type sourceBinding struct {
 	pipeline  string
 	refs      []string
 	procs     []processor.Processor
+	rateLimit model.ByteSize
 }
 
 type discoveryBinding struct {
@@ -403,6 +411,7 @@ func New(o Options, ledger *protection.Ledger) *Workflow {
 		w.sources = append(w.sources, sourceBinding{
 			name: s.Name, checkKind: s.CheckKind, typ: s.Type, inst: s.Instance,
 			artifact: s.Artifact, pipeline: s.Pipeline, refs: s.Refs, procs: s.Processors,
+			rateLimit: s.RateLimit,
 		})
 	}
 	for _, d := range o.Discoveries {

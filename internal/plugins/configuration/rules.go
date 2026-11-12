@@ -32,6 +32,10 @@ type RuleSource struct {
 	Pipeline    []string
 	Importance  model.Importance
 	Sensitivity model.Sensitivity
+	// RateLimit is the rule's own raw-bytes-per-second envelope, applied before
+	// the first processor; 0 is unlimited. It is extracted, never evaluated:
+	// the check only refuses a negative value.
+	RateLimit model.ByteSize
 }
 
 // RuleExtractor is the pure compiled hook a plugin type registers beside its
@@ -135,6 +139,9 @@ func checkRule(schema Schema, active Active, cfg *Config, prefix string, rs Rule
 	}
 	if rs.Sensitivity != model.SensitivityPlain && rs.Sensitivity != model.SensitivitySecret {
 		errs = append(errs, fmt.Errorf("%s: sensitivity must be \"plain\" or \"secret\", got %q", rulePath, rs.Sensitivity))
+	}
+	if rs.RateLimit < 0 {
+		errs = append(errs, fmt.Errorf("%s: rate_limit must not be negative: %d", rulePath, rs.RateLimit))
 	}
 	for i, ref := range rs.Pipeline {
 		if ref == "" {

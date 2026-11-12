@@ -103,6 +103,9 @@ func TestConfigValidateRejectsEveryField(t *testing.T) {
 		{"pipeline empty ref", func(c *Config) {
 			c.Sources = map[string]SourceInstance{"s": {Type: "fake", Artifact: validArtifactConfig(), Pipeline: []string{""}}}
 		}, "pipeline/0 is empty"},
+		{"source rate_limit", func(c *Config) {
+			c.Sources = map[string]SourceInstance{"s": {Type: "fake", Artifact: validArtifactConfig(), Pipeline: []string{}, RateLimit: -1}}
+		}, "rate_limit must not be negative"},
 		{"artifact group", func(c *Config) {
 			a := validArtifactConfig()
 			a.Group = ""
@@ -382,7 +385,7 @@ func TestCheckRulesReportsEveryFailure(t *testing.T) {
 		return []RuleSource{{
 			Path: "/rules/0", ConfigPath: "/rules/0/source/config",
 			Type: "testkit", Config: jsontext.Value(`{"address":"x","timeout":"30s"}`),
-			Pipeline: []string{""}, Importance: "maybe", Sensitivity: "weird",
+			Pipeline: []string{""}, Importance: "maybe", Sensitivity: "weird", RateLimit: -1,
 		}}, nil
 	}
 	cfg.Discoveries["envelope"] = Instance{Type: "envelope", Config: jsontext.Value(`{"rules":[]}`)}
@@ -394,6 +397,7 @@ func TestCheckRulesReportsEveryFailure(t *testing.T) {
 		"is null",
 		"importance must be",
 		"sensitivity must be",
+		"rate_limit must not be negative",
 		"pipeline/0 is empty",
 	} {
 		if !anyErrHas(errs, want) {

@@ -270,6 +270,7 @@ run:
   holder_namespace_env: ""
   holder_pod_env: ""
   holder_uid_env: ""
+  writer_identity: ""
   retry: {attempts: 4, initial_delay: 5s, max_delay: 40s, jitter: 0.2}
 layout:
   run_prefix: "runs/{{ .Run.ID }}"
@@ -320,11 +321,13 @@ sources:
     type: fake
     artifact: {group: vpn, name: wireguard, importance: required, sensitivity: secret}
     pipeline: [zstd3, seal]
+    rate_limit: 0
     config: {path: /vpn-config/wireguard.db, busy_timeout: 10s, integrity_check: quick}
   control_plane:
     type: fake
     artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: secret}
     pipeline: []
+    rate_limit: 0
     config: {dir: /backup/staged, name: k3s-state}
 processors:
   zstd3: {type: fake, config: {level: 3, concurrency: 1, window_bytes: 8388608}}
@@ -442,6 +445,7 @@ stage:
       type: fake
       artifact: {group: control-plane, name: k3s-state, importance: required, sensitivity: secret}
       pipeline: [zstd3, seal]
+      rate_limit: 0
       config: {datastore: /k3s-db/state.db, token: /k3s-token, scratch_dir: /plain, busy_timeout: 10s, integrity_check: quick}
 processors:
   zstd3: {type: fake, config: {level: 3, concurrency: 1, window_bytes: 8388608}}

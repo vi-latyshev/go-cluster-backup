@@ -1,0 +1,71 @@
+# Values for examples/config/k3s-per-node.yaml — the node-a writer of a
+# two-node deployment. The node-b release runs the same configuration with
+#   writer_identity: node-b
+#   prefix: cluster-backup/node-b
+#   catalog.name: go-cluster-backup-catalog-node-b
+# and this file's `nodeSelector`, `activeDeadlineSeconds` and catalog name
+# changed accordingly.
+#
+#   helm install backup-node-a oci://ghcr.io/vi-latyshev/charts/go-cluster-backup \
+#     --namespace backup --create-namespace \
+#     -f examples/values/k3s-per-node.yaml \
+#     --set-file config=examples/config/k3s-per-node.yaml
+#
+# A SHARED prefix instead of a prefix per writer is supported only with one
+# shared catalog ConfigMap: the node-a release keeps `catalog.create: true`,
+# every peer sets `catalog.create: false` and names the same ConfigMap. Without
+# that one lease, two writers can overwrite each other's manifest.
+
+# The config's run.lease_hard_bound is 6000s.
+activeDeadlineSeconds: 6000
+
+catalog:
+  # Matches catalog.config.name in examples/config/k3s-per-node.yaml.
+  name: go-cluster-backup-catalog-node-a
+
+secretMounts:
+  - secretName: cluster-backup-s3
+    mountPath: /run/secrets/s3
+
+rbac:
+  secretNames:
+    - cluster-backup-s3
+
+# This writer reads only its own node's volume paths. Its node must be one of
+# the config's writer_nodes.
+nodeSelector:
+  kubernetes.io/hostname: node-a
+
+# A local provisioner's storage root is root-owned, so the writer reads it as
+# root — without capabilities, and with the root filesystem still read-only.
+podSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  fsGroup: 0
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  runAsGroup: 0
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+writer:
+  volumes:
+    # The node's local-provisioner root. A volume's directory is resolved from
+    # its PersistentVolume (`volumePath`) and opened under this path, so the
+    # mountPath must be the prefix the PersistentVolume's local.path shares.
+    - name: node-storage
+      hostPath:
+        path: /var/lib/example/storage
+        type: Directory
+  volumeMounts:
+    - name: node-storage
+      mountPath: /var/lib/example/storage
+      readOnly: true

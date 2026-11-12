@@ -99,6 +99,24 @@ func (r *recordedSource) RecordedChain(ctx context.Context) ([]model.ProcessorSt
 	return r.chain, nil
 }
 
+// credentialSource carries credentials and answers the optional policy with the
+// verdict a test configures: the one way a source type keeps a published
+// plaintext configuration working without making plaintext the rule.
+type credentialSource struct {
+	fakeSource
+	verdict source.CredentialVerdict
+	err     error
+	calls   int
+}
+
+func (c *credentialSource) CredentialPolicy(ctx context.Context) (source.CredentialVerdict, error) {
+	c.calls++
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return c.verdict, c.err
+}
+
 // fakeProcessor is a processor whose traits and failures a test configures; its
 // Encode copies the stream and counts the calls.
 type fakeProcessor struct {
@@ -722,4 +740,110 @@ func spoolNames(t *testing.T, dir string) []string {
 		names = append(names, e.Name())
 	}
 	return names
+}
+
+// TestResolveRefusesPlaintextCredentialsBeforeTheFirstByte: bytes a source
+// names as credentials are refused unless something seals them — before a byte
+// is produced, not after the artifact is uploaded readable.
+func TestResolveRefusesPlaintextCredentialsBeforeTheFirstByte(t *testing.T) {
+	p := New(testOptions())
+	src := &fakeSource{traits: source.SourceTraits{Credentials: true}}
+	_, err := p.Resolve(context.Background(), testPlan(src))
+	if err == nil {
+		t.Fatal("unsealed credential bytes were accepted")
+	}
+	if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Fatalf("class = %q, want permanent", class)
+	}
+	if src.dumps != 0 {
+		t.Fatalf("the source was dumped %d times before the refusal", src.dumps)
+	}
+}
+
+// TestResolveWarnsForThePublishedCredentialException: a source type that answers
+// the warning verdict keeps its published plaintext configuration working and
+// the run records the coded warning on the artifact, not on a log line only.
+func TestResolveWarnsForThePublishedCredentialException(t *testing.T) {
+	p := New(testOptions())
+	src := &credentialSource{verdict: source.CredentialWarn}
+	src.traits = source.SourceTraits{Credentials: true}
+	sp, err := spool.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := testPlan(src)
+	res, err := p.Resolve(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src.calls != 1 {
+		t.Fatalf("the credential policy was asked %d times", src.calls)
+	}
+	if len(res.Warnings) != 1 || res.Warnings[0].Code != source.CredentialWarningCode {
+		t.Fatalf("resolved warnings = %+v", res.Warnings)
+	}
+	artifact, err := p.Produce(context.Background(), sp, plan, res, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifact.Warnings) != 1 || artifact.Warnings[0] != res.Warnings[0] {
+		t.Fatalf("artifact warnings = %+v, want %+v", artifact.Warnings, res.Warnings)
+	}
+}
+
+// TestResolveCredentialVerdictsThatDoNotWarn: a policy error fails the artifact,
+// an unsupported policy is the zero refuse verdict, and sealed bytes are never
+// asked about at all.
+func TestResolveCredentialVerdictsThatDoNotWarn(t *testing.T) {
+	p := New(testOptions())
+	broken := &credentialSource{err: errors.New("policy unavailable")}
+	broken.traits = source.SourceTraits{Credentials: true}
+	if _, err := p.Resolve(context.Background(), testPlan(broken)); err == nil {
+		t.Fatal("a failing credential policy was accepted")
+	}
+
+	unsupported := &credentialSource{err: errors.ErrUnsupported}
+	unsupported.traits = source.SourceTraits{Credentials: true}
+	if _, err := p.Resolve(context.Background(), testPlan(unsupported)); err == nil {
+		t.Fatal("an unsupported credential policy was accepted")
+	}
+
+	sealed := &credentialSource{verdict: source.CredentialWarn}
+	sealed.traits = source.SourceTraits{Credentials: true, Sealed: true}
+	res, err := p.Resolve(context.Background(), testPlan(sealed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.calls != 0 {
+		t.Fatalf("sealed bytes asked for a credential verdict %d times", sealed.calls)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("sealed bytes carried %+v", res.Warnings)
+	}
+
+	sealingStep := &fakeSource{traits: source.SourceTraits{Credentials: true}}
+	res, err = p.Resolve(context.Background(), testPlan(sealingStep,
+		Step{Instance: "seal", Type: "age", Processor: &fakeProcessor{traits: processor.ProcessorTraits{Ext: ".age", Seals: true}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Artifact.Sealed || len(res.Warnings) != 0 {
+		t.Fatalf("a sealing step = sealed %v, warnings %+v", res.Artifact.Sealed, res.Warnings)
+	}
+}
+
+// TestResolveCarriesTheSourcesOwnWarnings: a staged record's findings reach the
+// resolved artifact and the manifest beside the credential decision, and they
+// never fail the artifact.
+func TestResolveCarriesTheSourcesOwnWarnings(t *testing.T) {
+	src := &fakeSource{traits: source.SourceTraits{
+		Warnings: []model.Warning{{Code: "stage.carried", Message: "from the stage record"}},
+	}}
+	res, err := New(testOptions()).Resolve(context.Background(), testPlan(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Warnings) != 1 || res.Warnings[0].Code != "stage.carried" {
+		t.Fatalf("resolved warnings = %+v", res.Warnings)
+	}
 }

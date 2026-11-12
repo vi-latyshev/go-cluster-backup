@@ -1,0 +1,231 @@
+# Alerts for a go-cluster-backup deployment, in two halves:
+#
+#   * the go-cluster-backup.push group reads the series the config example
+#     examples/config/monitoring.yaml pushes to a Prometheus Pushgateway;
+#   * the go-cluster-backup.kubernetes group reads kube-state-metrics, so a run
+#     that never starts (a rejected initContainer, FailedCreate, an eviction, an
+#     OOMKill, a missed schedule) still pages — see examples/monitoring/README.md.
+#
+# Every writer has its own Pushgateway grouping key (`job` + `writer`) and its
+# own expectations: duplicate the push-group rules per writer label, or expand
+# them with a list of the writers the deployment runs. `absent()` can only
+# assert about the labels written in the expression, so a rule naming one writer
+# says nothing about the other.
+#
+# Placeholders: `backup` is the release namespace and `node-a` the writer's
+# Pushgateway grouping label. Replace both with the deployment's own.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: go-cluster-backup
+  namespace: monitoring
+  labels:
+    # The selector a kube-prometheus-stack release uses for its own rules;
+    # adjust it to the deployment's ruleSelector.
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # ── The backup reports itself (Pushgateway) ─────────────────────────────
+    - name: go-cluster-backup.push
+      rules:
+        # A writer that never pushed is an absent series, not a healthy one.
+        - alert: GoClusterBackupNeverReported
+          expr: absent(push_time_seconds{job="go-cluster-backup",writer="node-a"})
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Backup writer node-a has never reported
+            description: >-
+              No Pushgateway push from this writer. Check that its CronJob is
+              scheduled and that the manual CronJob can run, then read the
+              previous-run report of the next run or the Job's events.
+
+        # Pushgateway keeps the last push forever: its own push_time_seconds is
+        # the freshness signal. Do not alert on the last reported success — a
+        # source that stopped reporting keeps that old value.
+        - alert: GoClusterBackupReportStale
+          expr: time() - push_time_seconds{job="go-cluster-backup",writer="node-a"} > 93600
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Backup writer node-a has not reported for 26h
+            description: >-
+              The last push is older than the nightly schedule allows. The next
+              run's report may be failing before it starts; see the Job and pod
+              alerts below and the previous-run report in any notification.
+
+        # run_started pushes 1 and run_finished pushes 0: a run that dies without
+        # its finish event keeps this at 1.
+        - alert: GoClusterBackupRunStillStarted
+          expr: gcb_run_started{job="go-cluster-backup",writer="node-a"} == 1
+          for: 4h
+          labels:
+            severity: critical
+          annotations:
+            summary: Backup writer node-a started a run and never finished it
+            description: >-
+              The started event was pushed and no finished event followed within
+              the Job's deadline. Inspect the running Job's logs and events for
+              a killed or wedged container.
+
+        - alert: GoClusterBackupRunFailed
+          expr: gcb_run_outcome{job="go-cluster-backup",writer="node-a",outcome="failed"} == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: Backup writer node-a finished with outcome failed
+            description: >-
+              Read the finished notification or .Run of this run for the failing
+              artifact or storage; a refused writer lease names its holder.
+
+        - alert: GoClusterBackupRunDegraded
+          expr: gcb_run_outcome{job="go-cluster-backup",writer="node-a",outcome="degraded"} == 1
+          labels:
+            severity: warning
+          annotations:
+            summary: Backup writer node-a finished degraded
+            description: At least one best-effort artifact, storage or notification failed.
+
+        - alert: GoClusterBackupArtifactsFailed
+          expr: gcb_run_artifacts_failed{job="go-cluster-backup",writer="node-a"} > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: Backup writer node-a has failed artifacts
+            description: A required artifact failing fails the run; a best-effort one degrades it.
+
+        - alert: GoClusterBackupRunWarnings
+          expr: >-
+            max by (job, writer) (gcb_run_warnings_total{job="go-cluster-backup",writer="node-a"}) > 0
+            or max by (job, writer) (gcb_artifact_warnings{job="go-cluster-backup",writer="node-a"}) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Backup writer node-a reported coded warnings
+            description: >-
+              Catalog mark/settle/clear failures are run warnings; an artifact
+              warning such as source.credentials.unsealed (plaintext credential
+              bytes) is counted per artifact. Both are non-fatal and visible
+              here.
+
+        # PLACEHOLDER: one rule per explicitly expected source. The artifact
+        # label is the manifest identity `<group>/<name>` of the artifact the
+        # config's envelope declares. Duplicate this rule for every source the
+        # deployment requires: `absent()` can only assert about the identity it
+        # names, so a rule for one artifact says nothing about another.
+        #
+        # A healthy sibling keeps pushing while this source vanishes: the run
+        # may stay delivered, so its aggregate counts prove nothing about one
+        # missing source. PUT replaces the whole grouping key, so a vanished
+        # artifact loses its series; the `unless` keeps the rule quiet while a
+        # run is in progress, when the started push carries no artifact series.
+        - alert: GoClusterBackupExpectedSourceMissing
+          expr: >-
+            absent(gcb_artifact_present{job="go-cluster-backup",writer="node-a",artifact="volumes/uploads"})
+            unless on (job, writer) gcb_run_started{job="go-cluster-backup",writer="node-a"} == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Expected backup source volumes/uploads is missing from writer node-a
+            description: >-
+              The writer keeps reporting, but this artifact identity has not
+              appeared in its latest push: discovery stopped matching it, the
+              artifact was renamed, or its source failed before producing a
+              result. The run can still be delivered, so no aggregate signal
+              covers this gap.
+
+        - alert: GoClusterBackupStorageOccupancyUnknown
+          expr: max by (job, writer) (gcb_storage_occupancy_unknown{job="go-cluster-backup",writer="node-a"}) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Backup writer node-a cannot prove a storage's occupancy
+            description: >-
+              A failed survey or an earlier writer's accepted writes leave the
+              cap numbers a lower bound. Manual admission stays closed until a
+              successful full survey clears the uncertainty.
+
+        - alert: GoClusterBackupCapEvicted
+          expr: max by (job, writer) (gcb_storage_cap_evicted_runs{job="go-cluster-backup",writer="node-a"}) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Backup writer node-a deleted runs to stay under its byte cap
+            description: >-
+              The cap deleted runs a retention policy kept. Raise the cap or the
+              retention window; the deleted run ids are in the finished report.
+
+        - alert: GoClusterBackupRetentionError
+          expr: max by (job, writer) (gcb_storage_retention_error{job="go-cluster-backup",writer="node-a"}) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: Backup writer node-a failed its retention pass
+            description: >-
+              The retention pass failed on a storage; its verified copies stay
+              as they were. The finished report names the storage and the error.
+
+    # ── The cluster never let the run start (kube-state-metrics) ────────────
+    # These need kube-state-metrics. They exist because no in-process monitoring
+    # can report a pod that was rejected, evicted or killed before it ran.
+    - name: go-cluster-backup.kubernetes
+      rules:
+        - alert: GoClusterBackupJobFailed
+          expr: kube_job_status_failed{namespace="backup"} > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A go-cluster-backup Job in namespace backup failed
+            description: >-
+              Any failed writer, manual or restore Job. A failed initContainer,
+              a rejected pod and an evicted pod surface here; the Job's events
+              and the failed pod's container status name the reason.
+
+        - alert: GoClusterBackupJobDeadlineExceeded
+          expr: kube_job_status_failed{namespace="backup",reason="DeadlineExceeded"} > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A go-cluster-backup Job hit its activeDeadlineSeconds
+            description: >-
+              The run was killed at the deadline. Raise run.deadline and the
+              chart's activeDeadlineSeconds together, and raise
+              terminationGracePeriodSeconds only with the shutdown budgets.
+
+        - alert: GoClusterBackupPodOOMKilled
+          expr: kube_pod_container_status_terminated_reason{namespace="backup",container="backup",reason="OOMKilled"} > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A go-cluster-backup container was OOMKilled
+            description: Raise the writer's memory limit or lower the zstd window.
+
+        - alert: GoClusterBackupCronJobNotScheduled
+          expr: absent(kube_cronjob_status_last_schedule_time{namespace="backup",cronjob="backup-go-cluster-backup"})
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: The go-cluster-backup scheduled CronJob is missing or never scheduled
+            description: >-
+              The CronJob object does not exist or the controller has never
+              scheduled it. Check the release and the CronJob's events.
+
+        # A CronJob that cannot create its Job (FailedCreate — quota, a
+        # rejected pod template) leaves no Job and no pod to alert on; the last
+        # successful time is the external signal that the nightly chain broke.
+        - alert: GoClusterBackupNoSuccessfulJob
+          expr: time() - kube_cronjob_status_last_successful_time{namespace="backup",cronjob="backup-go-cluster-backup"} > 93600
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: The go-cluster-backup scheduled CronJob has no successful Job for 26h
+            description: >-
+              Read the CronJob's events for FailedCreate and the Job's pod
+              template; the next run cannot report a failure that never became
+              a pod.

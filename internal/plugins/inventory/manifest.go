@@ -87,7 +87,11 @@ func manifestShape(raw jsontext.Value, t reflect.Type, path string) []error {
 			val, present := obj[name]
 			field := path + "/" + name
 			if !present {
-				if strings.Contains(opts, "omitempty") {
+				// A member the writer may omit is one of the two optional
+				// options: omitempty for strings, slices and maps, omitzero for
+				// a scalar zero (json/v2's omitempty never omits a numeric or
+				// boolean zero).
+				if strings.Contains(opts, "omitempty") || strings.Contains(opts, "omitzero") {
 					continue
 				}
 				errs = append(errs, fmt.Errorf("missing field %s", field))
@@ -142,10 +146,16 @@ func manifestSemantics(rep *model.RunReport) []error {
 		}
 	}
 	for i, ex := range rep.Excluded {
-		switch ex.Kind {
-		case model.ExclusionIgnored, model.ExclusionCovered:
-		default:
+		if !ex.Kind.Known() {
 			errs = append(errs, fmt.Errorf("/excluded/%d: kind %q is not one this build knows", i, ex.Kind))
+		}
+		// An elsewhere exclusion is a delegation to a named peer writer: the
+		// node is what makes it a decision instead of a silent skip.
+		if ex.Kind == model.ExclusionElsewhere && ex.Node == "" {
+			errs = append(errs, fmt.Errorf("/excluded/%d: an elsewhere exclusion must name the peer node", i))
+		}
+		if ex.Kind != model.ExclusionElsewhere && ex.Node != "" {
+			errs = append(errs, fmt.Errorf("/excluded/%d: node %q belongs only to an elsewhere exclusion", i, ex.Node))
 		}
 	}
 	return errs

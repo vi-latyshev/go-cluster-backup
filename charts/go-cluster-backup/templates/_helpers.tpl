@@ -172,6 +172,20 @@ CronJobs. Takes a dict: `root` is the root context, `args` the container's args.
 */}}
 {{- define "go-cluster-backup.writerPodTemplate" -}}
 {{- $root := .root -}}
+{{/*
+Every user init container gets FallbackToLogsOnError merged in, so a collector
+that fails before the writer starts still leaves its last log lines in the
+container's termination message, which the previous-run report reads. An
+explicit conflicting policy fails the render rather than silently disabling
+that: the fix is to state FallbackToLogsOnError or omit the field.
+*/}}
+{{- $initContainers := list -}}
+{{- range $index, $container := $root.Values.writer.initContainers -}}
+{{- if and (hasKey $container "terminationMessagePolicy") (ne (toString (index $container "terminationMessagePolicy")) "FallbackToLogsOnError") -}}
+{{- fail (printf "writer.initContainers[%d] sets terminationMessagePolicy %q: the chart merges FallbackToLogsOnError into every init container so a failed collector's last log lines reach the previous-run report; state that value or omit the field" $index (toString (index $container "terminationMessagePolicy"))) -}}
+{{- end -}}
+{{- $initContainers = append $initContainers (merge (dict "terminationMessagePolicy" "FallbackToLogsOnError") $container) -}}
+{{- end -}}
 metadata:
   labels:
     {{- include "go-cluster-backup.selectorLabels" $root | nindent 4 }}
@@ -184,8 +198,12 @@ metadata:
   {{- end }}
 spec:
   {{- include "go-cluster-backup.podSpecCommon" (dict "root" $root) | nindent 2 }}
-  {{- if $root.Values.stage.enabled }}
+  {{- if or $initContainers $root.Values.stage.enabled }}
   initContainers:
+    {{- with $initContainers }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if $root.Values.stage.enabled }}
     - name: stage
       image: {{ include "go-cluster-backup.image" $root }}
       imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -207,6 +225,7 @@ spec:
         {{- with $root.Values.stage.volumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+    {{- end }}
   {{- end }}
   containers:
     - name: backup
@@ -228,6 +247,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.uid
+        - name: BACKUP_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
         {{- with $root.Values.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -277,10 +300,17 @@ spec:
       terminationMessagePolicy: FallbackToLogsOnError
       args:
         {{- toYaml .args | nindent 8 }}
-      {{- with $root.Values.extraEnv }}
       env:
+        {{- /* The node the pod was scheduled onto: a restore of a pinned or
+        local PersistentVolume proves it runs where the volume lives. The stage
+        initContainer enumerates static sources only and gets no node env. */}}
+        - name: BACKUP_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        {{- with $root.Values.extraEnv }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       securityContext:
         {{- toYaml $root.Values.restore.securityContext | nindent 8 }}
       resources:

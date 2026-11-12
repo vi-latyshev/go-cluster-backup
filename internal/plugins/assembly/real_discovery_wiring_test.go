@@ -93,9 +93,11 @@ func podRule(importance, rootTemplate string) map[string]any {
 		"covers_volumes": false,
 		"pipeline":       []string{"zstd"},
 		"min_matches":    1,
+		"rate_limit":     0,
 		"source": map[string]any{"type": "files", "config": map[string]any{
 			"root":            rootTemplate,
 			"ignore_vanished": false,
+			"on_change":       "record",
 		}},
 	}
 }
@@ -137,6 +139,7 @@ func wiringConfig(t *testing.T, opts kubeapi.Options, secretsPath, spoolDir, sto
 			"holder_namespace_env":      "",
 			"holder_pod_env":            "",
 			"holder_uid_env":            "",
+			"writer_identity":           "",
 			"retry":                     map[string]any{"attempts": attempts, "initial_delay": retryDelay, "max_delay": retryDelay, "jitter": 0},
 		},
 		"layout": map[string]any{
@@ -167,6 +170,9 @@ func wiringConfig(t *testing.T, opts kubeapi.Options, secretsPath, spoolDir, sto
 				"request_timeout":    "5s",
 				"secrets_path":       secretsPath,
 				"list_page_size":     50,
+				"node_env":           "",
+				"node_scope":         false,
+				"writer_nodes":       []string{},
 				"exclude":            map[string]any{"label": "backup.test/ignore", "value": "true"},
 				"pods":               pods,
 				"volumes":            volumes,
@@ -706,9 +712,9 @@ func wiringClaimRule(importance string) map[string]any {
 		"selector": "backup.test/engine=files", "phase": "Bound",
 		"artifact": map[string]any{"group": "volumes", "name": "{{ .Namespace }}/{{ .Name }}",
 			"importance": importance, "sensitivity": "plain"},
-		"pipeline": []string{"zstd"}, "min_matches": 0,
+		"pipeline": []string{"zstd"}, "min_matches": 0, "rate_limit": 0,
 		"source": map[string]any{"type": "files", "config": map[string]any{
-			"root": "{{ volumePath }}", "ignore_vanished": true,
+			"root": "{{ volumePath }}", "ignore_vanished": true, "on_change": "record",
 		}},
 	}
 }

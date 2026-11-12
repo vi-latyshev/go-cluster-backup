@@ -27,6 +27,10 @@ type Found struct {
 	// processor instance names, in encode order. The run resolves them against
 	// its own processors, and a name it does not have fails this one object.
 	Pipeline []string
+	// RateLimit is the raw bytes per second this source may produce, before
+	// anything in Pipeline runs: the rule's own configured limit, 0 when the
+	// rule sets none. It is part of the envelope, never a chain step.
+	RateLimit model.ByteSize
 	// Problem, when non-empty, says the object matched a rule but its source
 	// could not be rendered or resolved: Name and the artifact envelope are
 	// still set — the plugin falls back to an identity derived from the rule,
@@ -63,6 +67,11 @@ type Found struct {
 	// text an operator reads in the manifest and in the nightly message. It is
 	// required beside Excluded and meaningless without it.
 	ExcludedReason string
+	// ExcludedNode is the declared peer writer's node that owns an
+	// ExclusionElsewhere object. It is set only beside an elsewhere exclusion,
+	// and it is what turns the ledger's "not mine" into an accounted
+	// delegation: the run records the node in model.Exclusion.Node.
+	ExcludedNode string
 	// ProblemRetryable, when true, says the problem is a transient fault — a
 	// 5xx, a timeout — another attempt may not answer the same way. The
 	// planning layer re-runs Discover while the retry budget lasts, and when
@@ -78,6 +87,18 @@ type Found struct {
 // never a nil slice: "found nothing" and "was told to stop" must not look alike.
 type Discoverer interface {
 	Discover(ctx context.Context) ([]Found, error)
+}
+
+// NodeScoped is the optional capability of a discovery whose scope is one
+// writer's node: an object this node cannot prove it owns is never copied —
+// a declared peer's object is an elsewhere exclusion, anything else fails.
+// Such a run must carry a stable run.writer_identity, so another node's writer
+// can tell its objects from this one's; a deployment that scopes by node but
+// names no writer cannot account for a peer and is refused. The capability is
+// discovered by assertion, and its answer is the config's own decision, known
+// before any listing.
+type NodeScoped interface {
+	NodeScoped() bool
 }
 
 var Kind = instances.NewKind[Discoverer]("discovery")

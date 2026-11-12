@@ -22,6 +22,11 @@ const (
 	pinRedis      = "redis@sha256:896f241f438ab6a210cfb24f573b84bea721a4cbe67f1b4fd07eb638b3b02a7b"
 	pinSeaweedFS  = "chrislusf/seaweedfs@sha256:f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8"
 	pinEchoServer = "mendhak/http-https-echo@sha256:c4a81744e620ad3cfbffa97374c9c0e545bb3d132b07ebc7745cce6ddee745a1"
+	// The two PostgreSQL majors the bounded client-compatibility scenario runs:
+	// the same pinned index the image's vendor client is built from, and the
+	// next major a deployment may still run.
+	pinPostgres15 = "postgres@sha256:eab009ce9447a891d9482702d370bbf132c18563bb87cfdcc2b815c6d3b0372f"
+	pinPostgres17 = "postgres@sha256:e5d2edd28b1f8d40a0a6c0c9cdc545b19b56a0d5d88f94bc11a97d970d4700d0"
 )
 
 // pinnedTag is the tag a pin is loaded under: the repository plus the first 12
@@ -38,13 +43,15 @@ var (
 	imageRedis      = pinnedTag(pinRedis)
 	imageSeaweedFS  = pinnedTag(pinSeaweedFS)
 	imageEchoServer = pinnedTag(pinEchoServer)
+	imagePostgres15 = pinnedTag(pinPostgres15)
+	imagePostgres17 = pinnedTag(pinPostgres17)
 )
 
 // dependencyPins are the registry digests; dependencyImages are the tags the
 // cluster runs them under. The two are index-aligned.
 var (
-	dependencyPins   = []string{pinPostgres, pinRedis, pinSeaweedFS, pinEchoServer}
-	dependencyImages = []string{imagePostgres, imageRedis, imageSeaweedFS, imageEchoServer}
+	dependencyPins   = []string{pinPostgres, pinRedis, pinSeaweedFS, pinEchoServer, pinPostgres15, pinPostgres17}
+	dependencyImages = []string{imagePostgres, imageRedis, imageSeaweedFS, imageEchoServer, imagePostgres15, imagePostgres17}
 )
 
 const (
@@ -356,6 +363,8 @@ func TestPinnedTagDerivation(t *testing.T) {
 		pinRedis:      "redis:e2e-896f241f438a",
 		pinSeaweedFS:  "chrislusf/seaweedfs:e2e-f7a49e3f3972",
 		pinEchoServer: "mendhak/http-https-echo:e2e-c4a81744e620",
+		pinPostgres15: "postgres:e2e-eab009ce9447",
+		pinPostgres17: "postgres:e2e-e5d2edd28b1f",
 	}
 	for pin, tag := range want {
 		if got := pinnedTag(pin); got != tag {
@@ -617,6 +626,16 @@ func catalogName(fullname string) string { return fullname + "-catalog" }
 // coverage directory is configured — the hostPath volume and GOCOVERDIR the
 // instrumented image writes into.
 func (e *Env) baseValues(ns, fullname string, extraVolumes, extraMounts []string) string {
+	return e.baseValuesWithSecrets(ns, fullname, extraVolumes, extraMounts, nil)
+}
+
+// baseValuesWithSecrets is baseValues plus extra Secret mounts, one YAML list
+// entry each: a scenario that needs a private key or a second credential adds
+// it here instead of keeping a second copy of the deployment shape.
+func (e *Env) baseValuesWithSecrets(ns, fullname string, extraVolumes, extraMounts, extraSecretMounts []string) string {
+	secretMounts := append([]string{
+		fmt.Sprintf("  - {secretName: %s, mountPath: /run/secrets/s3}", secretS3),
+	}, extraSecretMounts...)
 	v := fmt.Sprintf(`fullnameOverride: %[1]s
 image:
   repository: %[2]q
@@ -630,11 +649,11 @@ suspend: true
 catalog:
   name: %[4]s
 secretMounts:
-  - {secretName: %[5]s, mountPath: /run/secrets/s3}
+%[5]s
 rbac:
-  secretNames: [%[5]s]
-  workloadNamespaces: [%[6]s]
-`, fullname, e.Repo, e.Tag, catalogName(fullname), secretS3, ns)
+  secretNames: [%[6]s]
+  workloadNamespaces: [%[7]s]
+`, fullname, e.Repo, e.Tag, catalogName(fullname), strings.Join(secretMounts, "\n"), secretS3, ns)
 
 	// The coverage volume and GOCOVERDIR go into the same lists the caller's
 	// entries do: a second `extraVolumes:` key would silently replace the first.
@@ -686,4 +705,158 @@ func writeFiles(t *testing.T, files map[string]string) map[string]string {
 		out[name] = p
 	}
 	return out
+}
+
+// --- PostgreSQL major-compatibility scenario fixtures ---------------------
+
+// pgMajorsConfig is the static-source configuration of the PostgreSQL major
+// scenario: one database artifact and one raw globals artifact of the same
+// server, both sealed or compressed exactly as a deployment would. The age
+// private key is mounted where the tool's restore path expects it, so the
+// globals artifact can be fetched back and applied by the operator procedure.
+func (e *Env) pgMajorsConfig(ns, catalog, recipient string) string {
+	return strings.NewReplacer(
+		"__NS__", ns,
+		"__S3__", "seaweedfs."+ns+".svc.cluster.local",
+		"__CATALOG__", catalog,
+		"__RECIPIENT__", recipient,
+	).Replace(pgMajorsConfigTemplate)
+}
+
+const pgMajorsConfigTemplate = `run:
+  spool_dir: /spool
+  spool_reserve_bytes: 1GiB
+  max_artifact_bytes: 1GiB
+  deadline: 5m
+  lease_hard_bound: 1800s
+
+restore:
+  spool_dir: /spool
+  spool_reserve_bytes: 1GiB
+  storage_order: [primary]
+  apply:
+    postgres: {jobs: 1, no_owner: false, no_acl: false, connect_attempts: 2, connect_interval: 1s}
+
+sources:
+  pg:
+    type: postgres
+    artifact: {group: databases, name: pg, importance: required, sensitivity: plain}
+    pipeline: [compress]
+    config:
+      address: pg-source.__NS__.svc.cluster.local:5432
+      database: app
+      username: app_admin
+      password: {file: /run/secrets/postgres/password}
+      format: custom
+      compression: none
+      connect_attempts: 2
+      connect_interval: 1s
+      all_databases: false
+      exclude_databases: []
+  globals:
+    type: postgres_globals
+    artifact: {group: databases, name: globals, importance: required, sensitivity: secret}
+    pipeline: [compress, seal]
+    config:
+      address: pg-source.__NS__.svc.cluster.local:5432
+      username: app_admin
+      password: {file: /run/secrets/postgres/password}
+      role_hashes: true
+      connect_attempts: 2
+      connect_interval: 1s
+
+processors:
+  compress:
+    type: zstd
+    config: {level: fastest, window_bytes: 1MiB, decode_window_bytes: 2MiB}
+  seal:
+    type: age
+    config:
+      recipients: ["__RECIPIENT__"]
+      identities: [{file: /run/secrets/age/identity}]
+
+storages:
+  primary:
+    type: s3
+    retention:
+      scheduled: {type: keep_last, config: {count: 3, count_incomplete: true}}
+      manual: {type: keep_last, config: {count: 3, count_incomplete: true}}
+    max_total_bytes: 5GiB
+    time_budget: 5m
+    config:
+      endpoint: http://__S3__:8333
+      region: us-east-1
+      bucket: ` + bucket + `
+      prefix: ` + prefix + `
+      access_key_id: {file: /run/secrets/s3/access-key-id}
+      secret_access_key: {file: /run/secrets/s3/secret-access-key}
+      addressing: path
+
+catalog:
+  type: kubernetes_configmap
+  config:
+    namespace: __NS__
+    name: __CATALOG__
+`
+
+// pgMajorValues is the release shape of the major scenario: the two extra
+// Secrets its sources and its sealed artifact need, mounted beside the S3 one.
+func (e *Env) pgMajorValues(ns, fullname string) string {
+	return e.baseValuesWithSecrets(ns, fullname, nil, nil, []string{
+		fmt.Sprintf("  - {secretName: %s, mountPath: /run/secrets/postgres}", secretPG),
+		fmt.Sprintf("  - {secretName: %s, mountPath: /run/secrets/age}", secretAge),
+	})
+}
+
+// secretAge holds the generated age identity the globals artifact is fetched
+// with.
+const secretAge = "gcb-age"
+
+// ageSecretManifest is the one private-key file the fetch path reads.
+func ageSecretManifest(ns, identity string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata: {name: %s, namespace: %s}
+stringData:
+  identity: %q
+`, secretAge, ns, identity)
+}
+
+// pgServerManifests is one PostgreSQL server Deployment and its Service: the
+// source and the throwaway restore target of the major scenario, named apart so
+// only one of them exists at a time.
+func pgServerManifests(ns, name, image, user string) string {
+	return fmt.Sprintf(`
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: %[2]s, namespace: %[1]s}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: %[2]s}}
+  template:
+    metadata: {labels: {app: %[2]s}}
+    spec:
+      containers:
+        - name: postgres
+          image: %[3]s
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 5432}]
+          env:
+            - {name: POSTGRES_DB, value: app}
+            - {name: POSTGRES_USER, value: %[4]s}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: %[5]s, key: password}}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "%[4]s"]}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata: {name: %[2]s, namespace: %[1]s}
+spec:
+  selector: {app: %[2]s}
+  ports: [{port: 5432, targetPort: 5432}]
+`, ns, name, image, user, secretPG)
 }

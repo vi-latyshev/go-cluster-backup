@@ -28,6 +28,8 @@ spec:
     catalog:
       name: go-cluster-backup-catalog
     secretMounts:
+      # Created by examples/flux/externalsecret.yaml; its target name must match
+      # this secretName and the rbac.secretNames entry below.
       - secretName: cluster-backup-s3
         mountPath: /run/secrets/s3
     rbac:

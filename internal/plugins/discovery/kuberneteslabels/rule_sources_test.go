@@ -109,3 +109,35 @@ func TestRuleSourcesThroughTheConfigurationSchema(t *testing.T) {
 		t.Fatalf("ExtractRules read %d rules, want 4: %+v", got, rules["workloads"])
 	}
 }
+
+// TestRuleSourcesCarryTheRuleRateLimit: the pure hook exposes a rule's
+// rate_limit beside its routing, so offline validation sees the same envelope
+// runtime renders.
+func TestRuleSourcesCarryTheRuleRateLimit(t *testing.T) {
+	raw := jsontext.Value(`{
+	  "api_host_env":"H","api_port_env":"P","token_file":"/t","ca_file":"/c",
+	  "request_timeout":"1s","secrets_path":"/s","list_page_size":10,
+	  "exclude":{"label":"l","value":"v"},
+	  "undeclared_volumes":{"name":"u","importance":"required"},
+	  "node_env":"","node_scope":false,"writer_nodes":[],
+	  "pods":[{"name":"r","selector":"","phase":"Running","artifact":{"group":"g","name":"n","importance":"required","sensitivity":"plain"},
+	    "pipeline":[],"source":{"type":"files","config":{"root":"/r"}},"covers_volumes":false,"min_matches":0,"rate_limit":1048576}],
+	  "volumes":[]
+	}`)
+	rules, err := kuberneteslabels.RuleSources(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("rules = %+v, want the pod rule and the accounting", rules)
+	}
+	if rules[0].RateLimit != 1<<20 {
+		t.Fatalf("rule rate limit = %d, want 1048576", rules[0].RateLimit)
+	}
+	if rules[1].RateLimit != 0 {
+		t.Fatalf("the accounting rule carries a rate limit: %+v", rules[1])
+	}
+	if !slices.Equal(rules[0].Pipeline, []string{}) {
+		t.Fatalf("pipeline = %v, want the empty list as written", rules[0].Pipeline)
+	}
+}

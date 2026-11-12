@@ -560,6 +560,77 @@ func TestOriginNamesTheDatastore(t *testing.T) {
 	}
 }
 
+// TestPlaintextStateIsAWarnedException is D1 in test form: the bytes carry the
+// server token whatever the sensitivity says, the source's own published
+// verdict is the non-fatal warning that keeps an existing plaintext
+// configuration working, and a sealed pipeline never asks for it.
+func TestPlaintextStateIsAWarnedException(t *testing.T) {
+	env := newStub(t)
+	s := build(t, env.config())
+	traits, err := s.Describe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !traits.Credentials {
+		t.Fatal("k3s_state did not report the server token as credential content")
+	}
+	policy, ok := s.(source.CredentialPolicy)
+	if !ok {
+		t.Fatal("k3s_state published no credential policy, so its plaintext configuration would be refused")
+	}
+	verdict, err := policy.CredentialPolicy(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verdict != source.CredentialWarn {
+		t.Fatalf("CredentialPolicy = %q, want %q", verdict, source.CredentialWarn)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := policy.CredentialPolicy(ctx); err == nil {
+		t.Fatal("CredentialPolicy accepted a cancelled context")
+	}
+}
+
+// TestArtifactModesAndDeterminism: the shared packer records the same modes
+// the archive always had, a fixed epoch, and two dumps of one unchanged
+// datastore are byte-identical.
+func TestArtifactModesAndDeterminism(t *testing.T) {
+	env := newStub(t)
+	s := build(t, env.config())
+	var first, second bytes.Buffer
+	if err := s.Dump(context.Background(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Dump(context.Background(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Bytes(), second.Bytes()) {
+		t.Fatal("two dumps of an unchanged datastore produced different archives")
+	}
+	tr := tar.NewReader(bytes.NewReader(first.Bytes()))
+	want := map[string]int64{"state.db": 0o644, "token": 0o600}
+	for i := 0; i < len(want); i++ {
+		hdr, err := tr.Next()
+		if err != nil {
+			t.Fatalf("entry %d: %v", i, err)
+		}
+		mode, ok := want[hdr.Name]
+		if !ok {
+			t.Fatalf("unexpected entry %q", hdr.Name)
+		}
+		if hdr.Mode != mode {
+			t.Errorf("%s mode = %o, want %o", hdr.Name, hdr.Mode, mode)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			t.Errorf("%s type = %d, want a regular file", hdr.Name, hdr.Typeflag)
+		}
+		if !hdr.ModTime.Equal(time.Unix(0, 0)) {
+			t.Errorf("%s modtime = %v, want the fixed epoch", hdr.Name, hdr.ModTime)
+		}
+	}
+}
+
 // TestErrorsNeverCarryTheToken: the token is the one secret this source reads,
 // and no failure path may put it into an error message or a log line.
 func TestErrorsNeverCarryTheToken(t *testing.T) {

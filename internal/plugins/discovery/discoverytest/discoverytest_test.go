@@ -92,6 +92,18 @@ func TestExcludedFoundNeedsNoSource(t *testing.T) {
 	Run(t, func(*testing.T) discovery.Discoverer { return finder{found: []discovery.Found{f}} })
 }
 
+// TestElsewhereExclusionNamesItsPeer: a peer delegation is accepted exactly
+// when it names the declared peer's node, and a positive rate limit passes the
+// suite unchanged.
+func TestElsewhereExclusionNamesItsPeer(t *testing.T) {
+	f := goodFind()
+	f.Excluded = model.ExclusionElsewhere
+	f.ExcludedReason = "the peer writer of node-b backs it up"
+	f.ExcludedNode = "node-b"
+	f.RateLimit = 1 << 20
+	Run(t, func(*testing.T) discovery.Discoverer { return finder{found: []discovery.Found{f}} })
+}
+
 // TestExcludedNamesCountForUniqueness: the instance name of an excluded object
 // is as real as any other — two objects of one result may not share it.
 func TestExcludedNamesCountForUniqueness(t *testing.T) {
@@ -129,6 +141,14 @@ func TestDiscoverCatchesEachMalformedField(t *testing.T) {
 		"exclusion beside a problem": func(f *discovery.Found) {
 			f.Excluded, f.ExcludedReason, f.Problem = model.ExclusionCovered, "why", "boom"
 		},
+		// An elsewhere exclusion is a delegation to a named peer, and a node on
+		// any other verdict is a claim the record cannot carry.
+		"elsewhere without a node": func(f *discovery.Found) {
+			f.Excluded, f.ExcludedReason = model.ExclusionElsewhere, "the peer writes it"
+		},
+		"node without elsewhere": func(f *discovery.Found) { f.ExcludedNode = "node-b" },
+		// A negative rate is not a limit: it would make every wait negative.
+		"negative rate limit": func(f *discovery.Found) { f.RateLimit = -1 },
 	}
 	for _, c := range Checks {
 		if c.Name != "discover returns well-formed sources" {

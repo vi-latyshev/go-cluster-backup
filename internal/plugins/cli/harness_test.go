@@ -49,6 +49,11 @@ type world struct {
 	// catalog is the in-memory writer-lease record the assembly builds, so a test
 	// can arrange a writer claim and its holder's liveness.
 	catalog *catalogtest.Leaser
+	// credentialBytes and credentialVerdicts script the synthetic source's
+	// credential facts per instance: whether its bytes carry credentials and the
+	// published verdict its policy answers.
+	credentialBytes    map[string]bool
+	credentialVerdicts map[string]source.CredentialVerdict
 }
 
 func newWorld() *world {
@@ -60,7 +65,9 @@ func newWorld() *world {
 		// ONE lease record across every call of a test: the assembly is built per
 		// command, and a claim a test arranges before the second call must still
 		// be there when the second call runs.
-		catalog: catalogtest.NewLeaser(),
+		catalog:            catalogtest.NewLeaser(),
+		credentialBytes:    map[string]bool{},
+		credentialVerdicts: map[string]source.CredentialVerdict{},
 	}
 }
 
@@ -100,7 +107,8 @@ func (w *world) registerDoubles(lr *loader.Registry, r *instances.Registry) erro
 				Stability: instances.Experimental,
 				Example:   []byte(`{"payload": "example", "dir": "", "origin": "test:example"}`),
 				New: func(_ context.Context, cfg syntheticConfig, deps instances.Deps) (source.Source, error) {
-					s := &syntheticSource{cfg: cfg, failCheck: w.checks[deps.Instance]}
+					s := &syntheticSource{cfg: cfg, failCheck: w.checks[deps.Instance],
+						credentials: w.credentialBytes[deps.Instance], verdict: w.credentialVerdicts[deps.Instance]}
 					w.sources[deps.Instance] = s
 					return s, nil
 				},
@@ -260,15 +268,27 @@ type syntheticConfig struct {
 type syntheticSource struct {
 	cfg       syntheticConfig
 	failCheck error
-	mu        sync.Mutex
-	checks    int
+	// credentials and verdict script the source's credential facts, the same
+	// ones a real source type reports.
+	credentials bool
+	verdict     source.CredentialVerdict
+	mu          sync.Mutex
+	checks      int
 }
 
 func (s *syntheticSource) Describe(ctx context.Context) (source.SourceTraits, error) {
 	if err := ctx.Err(); err != nil {
 		return source.SourceTraits{}, err
 	}
-	return source.SourceTraits{Ext: ".dat", Origin: s.cfg.Origin}, nil
+	return source.SourceTraits{Ext: ".dat", Origin: s.cfg.Origin, Credentials: s.credentials}, nil
+}
+
+// CredentialPolicy is the optional published verdict of this source type.
+func (s *syntheticSource) CredentialPolicy(ctx context.Context) (source.CredentialVerdict, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return s.verdict, nil
 }
 
 func (s *syntheticSource) Dump(ctx context.Context, dst io.Writer) error {
@@ -349,6 +369,7 @@ func configYAML(dir, body string) string {
   notifier_failure_is_fatal: false
   progress_interval: 15s
   lease_hard_bound: 8400s
+  writer_identity: ""
   retry: {attempts: 1, initial_delay: 1ms, max_delay: 1ms, jitter: 0}
 layout:
   run_prefix: "runs/{{ .Run.ID }}"

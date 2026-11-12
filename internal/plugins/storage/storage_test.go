@@ -202,3 +202,20 @@ func TestAddFactoryContributesTheStorageDescriptor(t *testing.T) {
 		t.Fatalf("the factory saw call_parallelism %d, want 1", seen.in.CallParallelism)
 	}
 }
+
+// TestPutRequestPurposeZeroIsPayload: every upload that does not say what it is
+// uploads data, so an unchanged caller keeps its meaning; metadata is a value a
+// caller states, and its spelling is part of the storage contract a class rule
+// reads.
+func TestPutRequestPurposeZeroIsPayload(t *testing.T) {
+	var req storage.PutRequest
+	if req.Purpose != storage.PurposePayload {
+		t.Fatalf("zero PutRequest.Purpose = %q, want the payload purpose", req.Purpose)
+	}
+	if storage.PurposeMetadata != "metadata" {
+		t.Fatalf("PurposeMetadata = %q, want \"metadata\"", storage.PurposeMetadata)
+	}
+	if storage.PurposePayload == storage.PurposeMetadata {
+		t.Fatal("the payload and metadata purposes are the same value")
+	}
+}

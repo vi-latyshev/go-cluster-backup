@@ -159,3 +159,34 @@ func TestSecretValueRejectsInvalidBase64(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+// TestGetNodeProvesTheReadableIdentity: the node read is the writer's ownership
+// proof, so a readable node answers by name, a missing one is not_found, and a
+// denied one is permanent — a missing RBAC grant, never evidence that the node
+// does not exist.
+func TestGetNodeProvesTheReadableIdentity(t *testing.T) {
+	srv := kubeapitest.New(t)
+	srv.AddNode(`{"metadata":{"name":"node-a"}}`)
+	c := client(t, srv)
+	ctx := context.Background()
+
+	n, err := c.GetNode(ctx, "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Metadata.Name != "node-a" {
+		t.Fatalf("node = %+v", n.Metadata)
+	}
+	if _, err := c.GetNode(ctx, "missing"); err == nil {
+		t.Fatal("a missing node was accepted")
+	} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassNotFound {
+		t.Fatalf("class = %q, want not_found", class)
+	}
+
+	srv.Deny("nodes")
+	if _, err := c.GetNode(ctx, "node-a"); err == nil {
+		t.Fatal("a denied node read was accepted")
+	} else if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+		t.Fatalf("class = %q, want permanent", class)
+	}
+}

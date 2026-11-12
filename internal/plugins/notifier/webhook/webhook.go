@@ -27,6 +27,7 @@ import (
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/notifier"
 )
@@ -48,9 +49,16 @@ const (
 // shape of its own receiver.
 type Config struct {
 	URL string `json:"url" required:"true" doc:"endpoint every delivered event is posted to, e.g. https://notify.example.com/backup"`
+	// EndpointTemplates makes URL and every header value an endpoint template:
+	// one function, secret PATH, reads an absolute-path mounted secret file
+	// where the value is rendered. It is opt-in because unconditional templating
+	// would silently rewrite an old literal that happens to carry {{ braces,
+	// which is a config break with no error. Default false keeps both fields
+	// literal, braces included.
+	EndpointTemplates bool `json:"endpoint_templates" doc:"render url and header values as templates with the endpoint-only function secret PATH, which reads an absolute-path mounted secret file of at most 4096 bytes; false keeps both fields literal, {{ braces included"`
 
 	Method     string            `json:"method" doc:"HTTP method: GET, POST, PUT or PATCH"`
-	Headers    map[string]string `json:"headers" doc:"request headers; a credential belongs in a mounted secret, not here, because every value of this file is plain config"`
+	Headers    map[string]string `json:"headers" doc:"request headers; a credential belongs in a mounted secret, not here, because every value of this file is plain config unless endpoint_templates is on"`
 	BodyFormat string            `json:"body_format" doc:"how a rendered payload becomes the request body: yaml drops the empty rendered lines, reads the rest as a YAML document and sends its JSON encoding; text sends the render as it is"`
 
 	// Timeout bounds one attempt, response body included.
@@ -169,6 +177,7 @@ func (c Config) Validate() error {
 			}
 		}
 	}
+	errs = append(errs, validateEndpoint(c)...)
 	return errors.Join(errs...)
 }
 
@@ -217,6 +226,7 @@ type Notifier struct {
 	cfg      Config
 	accepted map[int]bool
 	events   map[string]*eventMessage
+	endpoint *endpoint
 	client   *http.Client
 	log      *slog.Logger
 }
@@ -227,6 +237,47 @@ type Notifier struct {
 func (n *Notifier) AttemptTimeout() time.Duration { return n.cfg.Timeout.Std() }
 
 var _ notifier.Bounded = (*Notifier)(nil)
+
+var _ instances.Checker = (*Notifier)(nil)
+
+// Check is the instance's preflight. With endpoint templates on it renders the
+// url and every header value once, so a missing, oversized or unreadable secret
+// file fails this instance before the first event instead of costing the night
+// silently; a literal endpoint does no I/O here, exactly as before. Every
+// failure here is the deployment's — a secret file that is missing, unreadable,
+// oversized or not absolute, and a template that cannot render its data — so it
+// is permanent: a retry reads the same file again, and the retry ladder is for
+// the network.
+func (n *Notifier) Check(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if n.endpoint == nil {
+		return nil
+	}
+	if _, _, err := n.endpointFields(); err != nil {
+		return pluginerrors.Permanent(err)
+	}
+	return nil
+}
+
+// endpointFields is the endpoint one delivery uses: the literal config when
+// templating is off, the rendered url and headers when it is on. Rendering per
+// call is what makes a rotated secret visible without rebuilding the notifier.
+func (n *Notifier) endpointFields() (string, map[string]string, error) {
+	if n.endpoint == nil {
+		return n.cfg.URL, n.cfg.Headers, nil
+	}
+	epURL, err := n.endpoint.renderURL()
+	if err != nil {
+		return "", nil, err
+	}
+	headers, err := n.endpoint.renderHeaders()
+	if err != nil {
+		return "", nil, err
+	}
+	return epURL, headers, nil
+}
 
 // Close releases idle connections. It is idempotent and safe after a failed New.
 func (n *Notifier) Close() error {
@@ -251,6 +302,13 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 		n.log.Debug("event is not subscribed by this notifier", "event", ev.Name)
 		return notifier.ErrSkipped()
 	}
+	// The endpoint is rendered per delivery, so a secret rotated between two
+	// events is picked up; a render that cannot read its file is the deployment,
+	// and the error names the file, never a byte of what it holds.
+	epURL, headers, err := n.endpointFields()
+	if err != nil {
+		return pluginerrors.Permanent(fmt.Errorf("events/%s: %w", ev.Name, err))
+	}
 	// ONE cleaned copy, passed to both templates. Cleaning inside render alone
 	// left the payload's `.Event` unclean, so a payload that serializes the
 	// event — `event: {{ json .Event }}` — carried a byte the body's YAML
@@ -264,7 +322,7 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 	if err != nil {
 		return pluginerrors.Permanent(fmt.Errorf("events/%s: %w", ev.Name, err))
 	}
-	req, err := http.NewRequestWithContext(ctx, n.cfg.Method, n.cfg.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, n.cfg.Method, epURL, bytes.NewReader(body))
 	if err != nil {
 		// The cause is net/http's own text, and its *url.Error spells out the
 		// endpoint — a credential in the path or query for the receivers this
@@ -272,7 +330,7 @@ func (n *Notifier) Notify(ctx context.Context, ev model.Event) error {
 		// event, never a cause.
 		return pluginerrors.Permanent(fmt.Errorf("building the %s request: the configured endpoint cannot be used", ev.Name))
 	}
-	for name, value := range n.cfg.Headers {
+	for name, value := range headers {
 		req.Header.Set(name, value)
 	}
 	resp, err := n.client.Do(req)

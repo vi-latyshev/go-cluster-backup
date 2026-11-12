@@ -260,6 +260,15 @@ func TestDoctorSucceedsWhenEveryBinaryIsOnPath(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The PostgreSQL clients are a configured suite, not a metadata lookup:
+	// doctor proves them locally, so the stub carries all four of one major and
+	// each answers --version. redis-cli and sqlite3 are only looked up.
+	for _, bin := range []string{"pg_dump", "pg_dumpall", "pg_restore", "psql"} {
+		script := "#!/bin/sh\necho \"" + bin + " (PostgreSQL) 18.6\"\n"
+		if err := os.WriteFile(filepath.Join(dir, bin), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv("PATH", dir)
 	var stdout, stderr bytes.Buffer
 	code := Main(context.Background(),

@@ -36,26 +36,48 @@ type state struct {
 	rules      []preparedRule
 	log        *slog.Logger
 	object     *object
+	// nodeEnv, nodeScope and writerNodes are the node settings of this
+	// instance: the environment that names this pod's node, whether the proof
+	// scopes the discovery, and the declared set of writer nodes.
+	nodeEnv     string
+	nodeScope   bool
+	writerNodes []string
+	node        nodeState
+	nodes       map[string]nodeResult
+	// acct is the collect's own accounting while the claim rules run: the
+	// mounting pods an unpinned hostPath volume takes its node from.
+	acct *accounting
+	// placements is the node verdict claimPlacement reached for each claim of
+	// this collect, by namespace/name: volumePath answers from it, so the
+	// template and the claim's own verdict can never disagree.
+	placements map[string]placement
 	// volumes is each PersistentVolume as volumePath reads it, by name: the
-	// node path its data lives at ("") when it has none, and the claim it is
-	// bound to — read once per collect by volumePath. listed says
-	// whether that read was attempted and volumeErr what it answered: one
-	// attempt per plugin call, so the objects after a failure share the error
-	// and its class instead of hammering the API.
+	// node path its data lives at ("") when it has none, the claim it is
+	// bound to, and the node affinity that says where the data is. Read once
+	// per collect by volumePath. listed says whether that read was attempted
+	// and volumeErr what it answered: one attempt per plugin call, so the
+	// objects after a failure share the error and its class instead of
+	// hammering the API.
 	volumes      map[string]volume
 	volumeListed bool
 	volumeErr    error
 }
 
 // volume is one PersistentVolume as volumePath reads it: where its data lives
-// on a node, and the claim it is bound to. A volume bound to another claim —
-// including another incarnation of a claim of the same name — is never this
-// claim's volume, however stale spec.volumeName is.
+// on a node, the claim it is bound to, and the required node affinity that
+// pins it to a node. A volume bound to another claim — including another
+// incarnation of a claim of the same name — is never this claim's volume,
+// however stale spec.volumeName is.
 type volume struct {
 	path           string
+	local          bool
 	claimNamespace string
 	claimName      string
 	claimUID       string
+	// pinned is true when the volume carries a required node affinity with
+	// terms; affinity is those terms, ORed the way the API reads them.
+	pinned   bool
+	affinity []kubeapi.NodeSelectorTerm
 }
 
 // forgetVolumes drops the previous collect's listing: each collect reads the
@@ -125,6 +147,9 @@ type object struct {
 	// claims is a pod's own list: the claims its volumes mount, which its dump
 	// covers or its marker excludes.
 	claims []string
+	// nodeName is the node a pod is scheduled on: the proof of whose data it
+	// is, and of where an unpinned hostPath claim lives.
+	nodeName string
 	// volumeName is a claim's binding: the PersistentVolume its data lives on.
 	volumeName string
 }
@@ -197,10 +222,14 @@ func (s *state) fnPort(container, port int) (string, error) {
 }
 
 // fnVolumePath answers the path the object's volume lives at on the node: for a
-// claim, the directory the PersistentVolume it is bound to stores data in.
-// Every refusal names the object — a claim with no binding, a binding without a
-// volume, a volume that is not node-local, the function called on a pod — so the
-// Problem lands on the artifact that asked and on no other.
+// claim, the directory the PersistentVolume it is bound to stores data in, once
+// the volume is proven to be this writer's node's own. Every node check — a
+// Bound claim decided by claimFound, a claim a rule in another phase renders —
+// goes through the one placement resolver, so no phase and no rule can read a
+// path the placement never proved. Every refusal names the object — a claim
+// with no binding, a binding without a volume, a volume that is not node-local,
+// a peer's volume — so the Problem lands on the artifact that asked and on no
+// other.
 func (s *state) fnVolumePath() (string, error) {
 	o, err := s.current()
 	if err != nil {
@@ -209,27 +238,53 @@ func (s *state) fnVolumePath() (string, error) {
 	if o.resource != "persistentvolumeclaim" {
 		return "", fmt.Errorf("%s declares no volume path; volumePath reads the volume a persistentvolumeclaim is bound to", o.id())
 	}
+	var p placement
+	if s.nodeChecksOff() {
+		v, err := s.claimVolume(o)
+		if err != nil {
+			return "", err
+		}
+		p.path = v.path
+	} else {
+		p, err = s.claimPlacement(o)
+		if err != nil {
+			return "", err
+		}
+	}
+	if p.peer != "" {
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: its volume stores the data on node %q, a declared peer writer's node", o.id(), p.peer))
+	}
+	if p.path == "" {
+		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q holds no spec.local.path and no spec.hostPath.path, so it is not a volume on a node", o.id(), o.volumeName))
+	}
+	return p.path, nil
+}
+
+// claimVolume resolves the volume a claim is bound to and proves the binding:
+// the claim names a volume, the cluster has it, and that volume is bound to
+// this claim's own incarnation — never to a deleted claim of the same name. The
+// path may be empty when the volume is not one on a node; the caller that needs
+// a node path says so.
+func (s *state) claimVolume(o object) (volume, error) {
 	if o.volumeName == "" {
-		return "", fmt.Errorf("%s is bound to no volume (spec.volumeName is empty)", o.id())
+		return volume{}, fmt.Errorf("%s is bound to no volume (spec.volumeName is empty)", o.id())
 	}
 	paths, err := s.volumePaths()
 	if err != nil {
-		return "", err
+		return volume{}, err
 	}
 	path, known := paths[o.volumeName]
 	switch {
 	case !known:
-		return "", pluginerrors.Permanent(fmt.Errorf("%s: the cluster has no persistentvolume named %q", o.id(), o.volumeName))
+		return volume{}, pluginerrors.Permanent(fmt.Errorf("%s: the cluster has no persistentvolume named %q", o.id(), o.volumeName))
 	case path.claimNamespace == "" && path.claimName == "":
-		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to no claim, so it is not this claim's volume", o.id(), o.volumeName))
+		return volume{}, pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to no claim, so it is not this claim's volume", o.id(), o.volumeName))
 	case path.claimNamespace != o.namespace || path.claimName != o.name:
-		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s, not to this claim", o.id(), o.volumeName, path.claimNamespace, path.claimName))
+		return volume{}, pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s, not to this claim", o.id(), o.volumeName, path.claimNamespace, path.claimName))
 	case path.claimUID == "" || path.claimUID != o.uid:
-		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s with uid %q, not to this claim (uid %q): the name was reused by another claim", o.id(), o.volumeName, path.claimNamespace, path.claimName, path.claimUID, o.uid))
-	case path.path == "":
-		return "", pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q holds no spec.local.path and no spec.hostPath.path, so it is not a volume on a node", o.id(), o.volumeName))
+		return volume{}, pluginerrors.Permanent(fmt.Errorf("%s: persistentvolume %q is bound to claim %s/%s with uid %q, not to this claim (uid %q): the name was reused by another claim", o.id(), o.volumeName, path.claimNamespace, path.claimName, path.claimUID, o.uid))
 	}
-	return path.path, nil
+	return path, nil
 }
 
 // volumePaths lists the cluster's PersistentVolumes once per collect, mapping
@@ -255,9 +310,14 @@ func (s *state) volumePaths() (map[string]volume, error) {
 		}
 		switch {
 		case pv.Spec.Local != nil:
+			v.local = true
 			v.path = pv.Spec.Local.Path
 		case pv.Spec.HostPath != nil:
 			v.path = pv.Spec.HostPath.Path
+		}
+		if required := pv.Spec.NodeAffinity; required != nil && required.Required != nil && len(required.Required.NodeSelectorTerms) > 0 {
+			v.pinned = true
+			v.affinity = required.Required.NodeSelectorTerms
 		}
 		paths[pv.Metadata.Name] = v
 	}

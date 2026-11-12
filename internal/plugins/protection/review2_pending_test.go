@@ -7,7 +7,7 @@ func TestR2_C7_EveryPendingPrefixStaysProtected(t *testing.T) {
 	// holder into a nil map.
 	var zero retentionState
 	zero.markUncertain("fresh")
-	state := newRetentionState(nil)
+	state := newRetentionState(nil, "")
 	for _, id := range []string{"holder-a", "holder-b"} {
 		state.markUncertain(id)
 	}

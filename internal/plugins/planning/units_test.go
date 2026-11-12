@@ -337,3 +337,41 @@ func TestUnitNameRefusal(t *testing.T) {
 		}
 	}
 }
+
+// TestExpandAppliesTheCredentialDecisionToUnits: every built unit is judged by
+// the run's credential rule before its Check; a refusal fails that unit alone,
+// a warning rides beside it.
+func TestExpandAppliesTheCredentialDecisionToUnits(t *testing.T) {
+	parent := &unitSource{units: []source.Unit{
+		{Name: "warned", Config: jsontext.Value(`{}`)},
+		{Name: "refused", Config: jsontext.Value(`{}`)},
+	}}
+	child := &unitSource{unitsErr: errors.ErrUnsupported}
+	f := &fleet{children: map[string]source.Source{"vpn/warned": child, "vpn/refused": child}}
+	credential := func(_ context.Context, _ source.Source, artifact model.Artifact, pipeline []string) (model.Warning, error) {
+		if len(pipeline) != 1 || pipeline[0] != "zstd3" {
+			t.Fatalf("the unit's pipeline = %v, want the parent's", pipeline)
+		}
+		if strings.HasSuffix(artifact.Name, "/refused") {
+			return model.Warning{}, errors.New("carries credentials")
+		}
+		return model.Warning{Code: "source.credentials.unsealed", Message: "plaintext"}, nil
+	}
+	exp := f.expansion()
+	exp.Credential = credential
+	units := testPlanner(1).Expand(context.Background(), Unit{
+		Instance: "vpn", Type: "fake", Source: parent,
+		Artifact: model.Artifact{Group: "databases", Name: "cluster", Importance: model.ImportanceRequired, Sensitivity: model.SensitivityPlain},
+		Pipeline: []string{"zstd3"},
+	}, exp)
+	byName := map[string]Unit{}
+	for _, u := range units {
+		byName[u.Instance] = u
+	}
+	if u := byName["vpn/warned"]; u.Problem != nil || len(u.Warnings) != 1 || u.Warnings[0].Code != "source.credentials.unsealed" {
+		t.Fatalf("the warned unit = %+v", u)
+	}
+	if u := byName["vpn/refused"]; u.Problem == nil || !strings.Contains(u.Problem.Error(), "carries credentials") {
+		t.Fatalf("the refused unit = %+v", u)
+	}
+}

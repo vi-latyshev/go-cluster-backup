@@ -13,6 +13,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/gfs"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keeplast"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/retention/keepversions"
 )
 
 func TestGfsPassesTheSuite(t *testing.T) {
@@ -21,6 +22,10 @@ func TestGfsPassesTheSuite(t *testing.T) {
 
 func TestKeepLastPassesTheSuite(t *testing.T) {
 	Run(t, func() retention.Retention { return newPolicy(t, keeplast.Spec, keeplast.Apply) })
+}
+
+func TestKeepVersionsPassesTheSuite(t *testing.T) {
+	Run(t, func() retention.Retention { return newPolicy(t, keepversions.Spec, keepversions.Apply) })
 }
 
 // broken classifies runs in ways the suite must catch.

@@ -460,8 +460,8 @@ func TestSettleInheritedUncertainty(t *testing.T) {
 	if _, _, err := lf.Acquire(ctx, model.RunKindScheduled, "run-4"); err != nil {
 		t.Fatal(err)
 	}
-	if settled, err := lf.SettleInheritedUncertainty(ctx, model.RunKindScheduled, "run-4", storages, surveys("k2")); settled || err != nil {
-		t.Fatalf("a failed clear = (%v, %v)", settled, err)
+	if settled, err := lf.SettleInheritedUncertainty(ctx, model.RunKindScheduled, "run-4", storages, surveys("k2")); settled || err == nil {
+		t.Fatalf("a failed clear = (%v, %v), want the failure reported without a settlement", settled, err)
 	}
 	if failingClear.Uncertainty() == nil {
 		t.Fatal("a failed clear dropped the uncertainty")

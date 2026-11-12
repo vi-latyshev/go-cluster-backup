@@ -61,6 +61,11 @@ type Plan struct {
 	SourceType     string
 	Artifact       model.Artifact
 	Steps          []Step
+	// RateLimit is the most raw bytes per second the source may produce,
+	// applied before the first processor and before anything is recorded in the
+	// chain: 0 is unlimited. It is part of the source's envelope, never a
+	// processor and never a manifest entry, so a restore never needs it.
+	RateLimit model.ByteSize
 }
 
 // Resolved is what an artifact's facts say before the first byte: the extension
@@ -70,6 +75,10 @@ type Resolved struct {
 	Artifact model.Artifact
 	Chain    []model.ProcessorStep
 	Source   model.SourceRef
+	// Warnings are coded, non-fatal facts about these bytes: the source's own
+	// (a stage record carried forward) and the credential exception this
+	// resolution decided. The run records them beside the artifact.
+	Warnings []model.Warning
 }
 
 // Artifact is one artifact's bytes sitting in the spool.
@@ -84,7 +93,10 @@ type Artifact struct {
 	// Stats is what the source reported about the bytes beyond their validity:
 	// entries it left out, files it padded (see source.DumpStatsReporter).
 	Stats model.DumpStats
-	Took  time.Duration
+	// Warnings are coded, non-fatal facts about these bytes; the manifest
+	// records them beside the artifact.
+	Warnings []model.Warning
+	Took     time.Duration
 }
 
 // Resolve fills the artifact's extension, sealing flag and recorded chain, and
@@ -122,6 +134,29 @@ func (p *Producer) Resolve(ctx context.Context, plan Plan) (Resolved, error) {
 	if resolved.Artifact.Sensitivity == model.SensitivitySecret && !sealed {
 		return Resolved{}, pluginerrors.Permanent(fmt.Errorf("artifact %s is secret but its pipeline has no sealing processor: refusing before the first byte", resolved.Artifact.Name))
 	}
+	warnings := append([]model.Warning(nil), srcTr.Warnings...)
+	if srcTr.Credentials && !sealed {
+		verdict := source.CredentialRefuse
+		if cp, ok := plan.Source.(source.CredentialPolicy); ok {
+			v, err := execution.Attempt(ctx, p.o.Policy, "credential policy "+plan.SourceInstance, func(ctx context.Context, _ int) (source.CredentialVerdict, error) {
+				return execution.SafeValue(func() (source.CredentialVerdict, error) { return cp.CredentialPolicy(ctx) })
+			})
+			if err != nil && !errors.Is(err, errors.ErrUnsupported) {
+				return Resolved{}, fmt.Errorf("source %s credential policy: %w", plan.SourceInstance, err)
+			}
+			if err == nil {
+				verdict = v
+			}
+		}
+		decision := source.DecideCredentials(resolved.Artifact, srcTr, sealed, verdict)
+		if decision.Refused != "" {
+			return Resolved{}, pluginerrors.Permanent(errors.New(decision.Refused))
+		}
+		if decision.Warning.Code != "" {
+			warnings = append(warnings, decision.Warning)
+		}
+	}
+	resolved.Warnings = warnings
 	return resolved, nil
 }
 
@@ -215,7 +250,8 @@ func (p *Producer) Produce(ctx context.Context, sp *spool.Spool, plan Plan, res 
 			g.succeed()
 		}
 		return Artifact{Artifact: res.Artifact, Chain: res.Chain, Source: res.Source,
-			File: w.Name(), Bytes: w.Size(), Raw: raw, SHA256: w.SHA256(), Stats: stats}, nil
+			File: w.Name(), Bytes: w.Size(), Raw: raw, SHA256: w.SHA256(), Stats: stats,
+			Warnings: res.Warnings}, nil
 	})
 	if err != nil {
 		// Every terminal exit publishes the end of the first attempt: a failure
@@ -249,7 +285,7 @@ func (p *Producer) Dump(ctx context.Context, dst io.Writer, plan Plan, res Resol
 func (p *Producer) dump(ctx context.Context, dst io.Writer, plan Plan) (int64, error) {
 	raw := &countWriter{}
 	src := func(ctx context.Context, w io.Writer) error {
-		raw.w = w
+		raw.w = newRateWriter(ctx, w, plan.RateLimit)
 		return plan.Source.Dump(ctx, raw)
 	}
 	stop := p.watchProgress(ctx, plan, raw)

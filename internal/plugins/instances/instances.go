@@ -124,6 +124,19 @@ type (
 	// failed New. The instance may implement io.Closer too.
 )
 
+// CheckBinaries is an optional capability of an instance whose external
+// programs are a configured suite, not one PATH lookup — the PostgreSQL sources
+// resolve an exact-major client directory. It proves, locally and before any
+// run, that the suite this instance's config names is complete and internally
+// consistent (every binary present, one major), and answers
+// errors.ErrUnsupported when the instance carries no such suite. `doctor` and
+// planning call it when an instance implements it; schema shape and defaults
+// checks never do, because they run without the deployment's files. A failure
+// is scoped to the instance like Checker's.
+type CheckBinaries interface {
+	CheckBinaries(ctx context.Context) error
+}
+
 type entry struct {
 	desc  Descriptor
 	cfg   reflect.Type // C, for CheckShape: the type the config decodes into

@@ -19,8 +19,34 @@ run the same binary.
 - The `age` private key for any **sealed** artifact (an artifact whose pipeline
   includes `seal`). A restore decodes the chain the manifest records, so a sealed
   artifact needs the identity the `age` processor instance names.
-- `pg_restore` of the **same major** as the server for database restores; `zstd`
-  and `age` only for manual unpacking.
+- `pg_restore` of the **same major** as the server for database restores — the
+  image ships suites for 15–18 and the tool selects the server's exact major —
+  and a `psql` of a matching major for the raw globals procedure; `zstd` and
+  `age` only for manual unpacking.
+
+## Restore without the original cluster
+
+The original cluster is not required: restore reads storage objects and the
+manifests beside them, and the restore path takes no writer lease.
+
+- `restore list`, `fetch` and `verify --depth stored|decoded` work from any
+  machine that holds the storage credentials. `verify --depth probed` needs the
+  source's own prober — e.g. `pg_restore` — but still no server.
+- `restore apply --target discovered` needs a live cluster and the config's
+  discovery rules: on a new cluster, label the target workload as the old one was
+  labelled, because `discovered` resolves against the live enumeration, never a
+  stored one.
+- A PVC file tree is extracted on the node by hand
+  ([PVC file tree](#pvc-file-tree)); a restore pod mounts no node path.
+- A k3s control plane and every vendor snapshot are operator procedures
+  ([k3s control plane](#k3s-control-plane), [vendor snapshots](#vendor-snapshots)).
+- A run with no manifest is fetchable only by explicit storage and key, as
+  stored and unverified.
+
+A manifest written by 2.2.0 or later records optional members an older strict
+reader refuses (`changed_files`, coded warnings, `writer_identity`, `elsewhere`
+exclusions). Listing, fetching, verifying and applying those runs needs a 2.2.0
+or newer binary; a downgrade does not read them.
 
 ## List runs
 
@@ -51,7 +77,9 @@ part of it, and a name may itself contain `/`. `--out -` streams the artifact on
 stdout (reports go to stderr). Stored bytes are **decoded** by default — the
 processor chain is recorded in the manifest; `--raw` writes them as stored. A
 decoded `secret` artifact goes to a file only with `--plaintext-to-file` — prefer
-`--out -` and a pipe.
+`--out -` and a pipe. A payload stored in a cold class (`ICE`, `COLD`, …) must be
+retrieved by the provider first: a fetch is a plain `Get` and does not trigger or
+wait for a provider-side restore.
 
 Everything a fetch can refuse without the object — the run, the name, the
 storage, the plaintext rule — is settled before a byte moves. The request is
@@ -161,7 +189,84 @@ the dump holds that database's schema and data, and the object owners and
 grants it references, but no roles, role memberships or other cluster globals
 (`pg_dumpall` territory). A restore reproduces the database only, and every role
 an object names must already exist on the target server; a role created by hand
-on the source and never recreated by bootstrap is not in the backup.
+on the source and never recreated by bootstrap is not in the backup. The cluster
+half is a separate fetch-only artifact: [PostgreSQL globals](#postgresql-globals).
+
+## PostgreSQL globals
+
+The `postgres_globals` source stores the source cluster's complete
+`pg_dumpall --globals-only` output as one artifact that must be sealed: roles,
+memberships, role settings and tablespaces. The tool never applies it — no
+`restore apply`, no SQL rewriting, no regex substitution, and the probed check
+proves only the artifact's completeness, never its SQL. **Treat the archive as
+arbitrary SQL from a superuser-capable source.**
+
+The procedure needs an isolated, empty target of the same PostgreSQL major. Roles
+and memberships come first, then the per-database restores, then owners, ACLs
+and logins:
+
+1. **Fetch and decode** the archive. `--out` decodes the recorded chain; a
+   sealed artifact needs the `age` identity. An artifact the config marks
+   `sensitivity: secret` — the reference config marks the globals artifact so —
+   cannot be written decoded to a file without `--plaintext-to-file`; that flag
+   writes the decoded SQL as a 0600 file. `--raw` writes the stored
+   (compressed/sealed) bytes for manual unpacking.
+
+   ```console
+   go-cluster-backup restore fetch --config backup.yaml \
+     --run newest-ok --artifact cluster/globals \
+     --out globals.sql --plaintext-to-file
+   ```
+
+   To keep the plaintext off the disk, fetch to stdout instead:
+   `--out - | psql …` (the recipe below reviews the SQL first, so a file is the
+   usual choice for that step).
+
+2. **Review the SQL before running it.** The archive contains `CREATE ROLE` and
+   `ALTER ROLE … PASSWORD '<hash>'` for every role, including the role you may
+   be connected as; `ALTER ROLE … SET` statements that can hold secrets; and
+   `CREATE TABLESPACE` with the source's paths. Pre-create every tablespace
+   directory on the target host: `CREATE TABLESPACE` cannot run inside a
+   transaction block, so this archive is never wrapped in `--single-transaction`.
+
+3. **Restore with a distinct bootstrap admin** — a role that is not the role the
+   archive alters, typically a fresh superuser created for the restore. Running
+   the archive as the account whose password it rewrites can lock the operator
+   out of the target.
+
+   ```console
+   psql -X -v ON_ERROR_STOP=1 -h "$TARGET" -U "$BOOTSTRAP_ADMIN" -d postgres \
+     -f globals.sql
+   ```
+
+   `ON_ERROR_STOP=1` makes `psql` exit non-zero at the first error. Never read
+   past an error and never label a run with an ignored error a complete restore.
+
+4. **Resolve expected bootstrap conflicts explicitly.** A role the target's own
+   bootstrap already created (the administrative role, for example) makes its
+   `CREATE ROLE` fail. Review that block and either remove it by hand or create
+   the roles beforehand and review the resulting `ALTER`s; never rewrite the
+   archive with a regex, and never skip an ACL because it fails.
+
+5. **Preserve or explicitly reassign the grantor.** A membership's historical
+   grantor must still exist and hold `ADMIN OPTION` on the role (or be the
+   bootstrap superuser), otherwise `GRANTED BY` fails. Keep the historical
+   grantor where the deployment still has it; otherwise reassign the grant
+   deliberately after review and record that decision. A silently skipped
+   grant is not a restored ACL.
+
+6. **Check the result.** Compare owners and ACLs on a sample of relations,
+   functions and schemas against the source (`\dt+`, `\df+`, `\dn+`, or a query
+   over `pg_class`/`pg_proc`/`pg_namespace`), then log in as each application
+   role and run its normal query. With `role_hashes: false` the archive carries
+   no password hashes: set the passwords through the deployment's own rotation
+   and verify a login; the roles are otherwise unable to authenticate.
+
+The archive is only as trustworthy as its source: restore a copy you reviewed,
+on a target you isolated, and keep the source cluster reachable only for
+comparison, never for a rewrite. The tool never runs this procedure and cannot
+vouch for its result; the operator's checked output — exit status, owner/ACL
+comparison and login checks — is the restore's receipt.
 
 ## PVC file tree
 
@@ -199,9 +304,15 @@ instance is configured:
 
 ## k3s control plane
 
-The `k3s_state` source snapshots the k3s sqlite datastore and the server token as
-one tar stream. It is a **sqlite/kine** datastore: a cluster running embedded
-etcd is not covered.
+Two sources cover the two k3s datastores. Restore the one that matches the
+cluster, and stop k3s while its datastore is replaced: a copy of a live
+datastore is not a snapshot.
+
+### k3s_state (sqlite/kine)
+
+`k3s_state` packs the k3s sqlite datastore and the server token as one tar
+stream. It is a **sqlite/kine** datastore: a cluster running embedded etcd needs
+the next recipe.
 
 1. Stop the writers you care about, and stop k3s (or restore the datastore while
    the service is down).
@@ -217,6 +328,102 @@ etcd is not covered.
 3. Replace the datastore and the token from the extracted `state.db` and `token`,
    preserving ownership and mode, then start k3s.
 4. Verify the cluster answers (`kubectl get nodes`) before restarting workloads.
+
+### k3s_etcd (embedded etcd)
+
+`k3s_etcd` packs the newest finished **uncompressed** etcd snapshot exactly as
+k3s saved it (`snapshot.db`, including etcd's trailing SHA256) and the server
+token as one tar stream. A compressed snapshot, a short or corrupt one, or one
+changed under the read fails the artifact; there is no fallback to an older
+snapshot.
+
+1. Stop the workloads you care about and stop k3s on the target server(s).
+2. Fetch and unpack to a scratch directory — a sealed artifact needs the `age`
+   identity:
+
+   ```console
+   go-cluster-backup restore fetch --config backup.yaml \
+     --run newest-ok --artifact k3s-etcd --out - \
+     | tar -x -C /tmp/restore-etcd
+   ```
+
+3. **Restore the server token first.** The embedded-etcd snapshot's bootstrap
+   data is encrypted with the server token, so the reset that restores it needs
+   the original token already in place — or the same value passed with
+   `--token` on the reset command. A server restored with a different token
+   cannot decrypt the bootstrap data.
+
+   ```console
+   install -o root -g root -m 0600 /tmp/restore-etcd/token \
+     /var/lib/rancher/k3s/server/token
+   ```
+
+4. Restore the snapshot through k3s's own embedded-etcd procedure — never copy
+   files over a live etcd data directory:
+   - **Single server:** place the extracted snapshot under
+     `/var/lib/rancher/k3s/server/db/snapshots/` (owner `root`, mode 0600) and
+     run k3s once with
+     `--cluster-reset --cluster-reset-restore-path=<absolute snapshot path>`.
+     That run resets the datastore and exits; start k3s normally afterwards.
+   - **Multiple servers:** run the cluster reset on one server, then follow
+     k3s's embedded-etcd documentation to remove the other servers' member data
+     and rejoin them. The vendor owns that ordering; a half-reset cluster must
+     not be started as if it were whole.
+5. Verify `kubectl get nodes` and the API before restarting workloads. If the
+   target ships `etcdutl`, its `snapshot status` is an additional check of the
+   extracted snapshot.
+
+A control-plane restore is the vendor's procedure, not an automated `apply`;
+this repository's gates do not execute it. Rehearse it on an isolated cluster
+before relying on it.
+
+## Vendor snapshots
+
+`collected` ingests a raw file a vendor collector published after its own
+semantic check, with the data file's digest in `<path>.sha256`. The source
+proves byte identity and freshness only; the vendor tool owns both the
+consistency and the restore. Fetch the artifact, decode the recorded chain, and
+restore with the vendor's own tool on an isolated target.
+
+- **Vault Raft.** The collector runs `vault operator raft snapshot save` and
+  `vault operator raft snapshot inspect` (the inspect must pass) before it
+  publishes the data and the marker. Restore on an isolated Vault of the same
+  version with `vault operator raft snapshot restore -force <snapshot>`, then
+  unseal and check auth methods, policies, mounts and a sample of secrets.
+- **ClickHouse.** The vendor `BACKUP` command produces the archive; its own
+  prepare/`RESTORE` owns schema and dependency ordering. Restore into an
+  isolated server of the recorded version and check table counts and schema.
+- **NATS JetStream, natscli v0.5.1.** Pin that CLI version: `nats backup stream
+  NAME DIR` snapshots one stream into a directory (consumer snapshots default to
+  on), `nats backup validate DIR` checks it, and the collector tars the whole
+  **validated directory** into the single `collected` file before publishing the
+  marker. Restore: fetch and decode the artifact, untar it, and run `nats backup
+  restore stream DIR` into a target stream that does not exist. Do not use an
+  assumed older "stream backup" syntax. An account backup can warn and skip
+  memory streams: enforce the deployment's declared required stream set, and
+  withhold the marker — fail the artifact — if any required stream is missing;
+  never publish a silently incomplete account snapshot.
+
+A digest mismatch is a collector publishing its data and then its marker: the run
+treats it as transient, retries and reads the finished pair. The collector must
+publish the data file completely first and the marker afterwards, never the
+reverse; a stale marker (older than `max_age`) is permanent and fails the
+artifact — a stopped collector is a stopped backup.
+
+These are operator procedures with vendor-owned semantics. This repository's
+automated gates do not execute them; rehearse each on scratch data with the
+deployment's pinned vendor versions before relying on it.
+
+A collector runs as an init container of the writer pod (the chart's
+`writer.initContainers`): it sees the pod's auto-mounted ServiceAccount token and
+the pod's RBAC, because Kubernetes offers no per-container opt-out, so run no
+untrusted tool there. The chart merges `terminationMessagePolicy:
+FallbackToLogsOnError` into every writer init container, which is what puts a
+failed collector's last log lines into `.Run.Previous` and the notifications —
+a collector must never print credentials or argv tokens, and a vendor CLI that
+does must be wrapped so it does not. Mount collector data through the writer's
+own `writer.volumes`; `extraVolumes` reaches every pod, the config-gate hook
+included.
 
 ## Unreachable storage
 
