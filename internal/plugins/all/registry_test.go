@@ -242,9 +242,10 @@ func TestSchemaDescribesEveryRegisteredType(t *testing.T) {
 
 // TestDoctorNamesEveryMissingBinary: a stub PATH proves the check can fail; the
 // stub binaries then prove it can pass. The PostgreSQL clients are a configured
-// suite, not a PATH metadata list: doctor proves them through the instance's own
-// CheckBinaries capability, so the empty-PATH answer names the suite failure and
-// the stub supplies all four programs of one major.
+// suite, not a PATH metadata list, so an empty PATH says nothing about them —
+// the assertion is the PATH binaries only. The stub then supplies all four
+// programs of one major, which doctor proves through the instance's own
+// CheckBinaries capability.
 func TestDoctorNamesEveryMissingBinary(t *testing.T) {
 	empty := t.TempDir()
 	t.Setenv("PATH", empty)
@@ -264,10 +265,6 @@ func TestDoctorNamesEveryMissingBinary(t *testing.T) {
 			t.Errorf("the failure does not name %s:\n%s", missing, stderr.String())
 		}
 	}
-	if !strings.Contains(stderr.String(), "configured binary suite does not hold up") {
-		t.Errorf("the failure does not name the PostgreSQL client suite:\n%s", stderr.String())
-	}
-
 	stub := t.TempDir()
 	// One complete PostgreSQL suite of one major on PATH: every program answers
 	// --version with the major it is.

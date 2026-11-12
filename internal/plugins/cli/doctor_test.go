@@ -14,6 +14,7 @@ import (
 	"github.com/vi-latyshev/go-cluster-backup/internal/loader"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration/defaults"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/source"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/storage/storagetest"
 )
@@ -238,6 +239,72 @@ func TestDoctorReportsAStorageItCannotClose(t *testing.T) {
 	for _, want := range []string{"storage/close_fails", "closing its example"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("the close failure does not carry %q: %s", want, stderr.String())
+		}
+	}
+}
+
+// TestDoctorNamesEveryMissingBinary: on a PATH that holds nothing, doctor
+// names every declared PATH binary missing and exits non-zero — whatever the
+// host has installed.
+func TestDoctorNamesEveryMissingBinary(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	w := newWorld()
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(),
+		Options{Program: "backup", Factories: w.factories(), Defaults: [][]byte{defaults.Defaults, []byte(defaultsYAML)}},
+		[]string{"doctor"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit %d, want %d\n%s", code, exitFailure, stdout.String())
+	}
+	for _, bin := range []string{"redis-cli", "sqlite3"} {
+		if !strings.Contains(stdout.String(), bin+": missing") {
+			t.Errorf("doctor does not name %s missing:\n%s", bin, stdout.String())
+		}
+	}
+	if !strings.Contains(stderr.String(), "missing binaries: ") {
+		t.Errorf("the failure does not name the missing binaries:\n%s", stderr.String())
+	}
+}
+
+// brokenSuiteSource is the synthetic source with a binary-suite check that
+// always fails: the absence of a configured suite is the fixture's fact, never
+// the host's PATH or the contents of its client directories.
+type brokenSuiteSource struct{ *syntheticSource }
+
+func (brokenSuiteSource) CheckBinaries(context.Context) error {
+	return errors.New("no PostgreSQL client suite is usable: this fixture holds none")
+}
+
+// TestDoctorNamesABrokenBinarySuite: a registered type whose own binary-suite
+// check fails stops the build check and names the factory, independently of
+// what the host has installed.
+func TestDoctorNamesABrokenBinarySuite(t *testing.T) {
+	w := newWorld()
+	r := instances.NewRegistry()
+	if err := w.register(r); err != nil {
+		panic(err)
+	}
+	if err := instances.Register(r, source.Kind, instances.FactorySpec[syntheticConfig, source.Source]{
+		Type:      "broken_suite",
+		Summary:   "a source whose configured binary suite never holds up",
+		Stability: instances.Experimental,
+		Example:   []byte(`{"payload": "example", "dir": "", "origin": "test:broken_suite"}`),
+		New: func(_ context.Context, cfg syntheticConfig, _ instances.Deps) (source.Source, error) {
+			return brokenSuiteSource{&syntheticSource{cfg: cfg}}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(),
+		Options{Program: "backup", Factories: r, Defaults: [][]byte{defaults.Defaults, []byte(defaultsYAML)}},
+		[]string{"doctor"}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit %d, want %d\n%s", code, exitFailure, stdout.String())
+	}
+	for _, want := range []string{"source/broken_suite: its configured binary suite does not hold up", "no PostgreSQL client suite is usable"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("the failure does not carry %q:\n%s", want, stderr.String())
 		}
 	}
 }
