@@ -48,7 +48,7 @@ func TestArchiveEntryVanishedFile(t *testing.T) {
 
 	var buf []byte
 	tw := tar.NewWriter(writeTo(&buf))
-	if err := s.archiveEntry(t.Context(), tw, r, filepath.Join(root, "gone.txt"), vanished, map[fileKey]string{}); err != nil {
+	if err := s.archiveEntry(t.Context(), tw, r, filepath.Join(root, "gone.txt"), vanished, map[fileKey]string{}, make([]byte, copyBufSize)); err != nil {
 		t.Fatalf("a vanished file failed an ignore_vanished archive: %v", err)
 	}
 	if len(buf) != 0 {
@@ -61,7 +61,7 @@ func TestArchiveEntryVanishedFile(t *testing.T) {
 	}
 
 	s.cfg.IgnoreVanished = false
-	if err := s.archiveEntry(t.Context(), tw, r, filepath.Join(root, "gone.txt"), vanished, map[fileKey]string{}); err == nil {
+	if err := s.archiveEntry(t.Context(), tw, r, filepath.Join(root, "gone.txt"), vanished, map[fileKey]string{}, make([]byte, copyBufSize)); err == nil {
 		t.Fatal("a vanished file passed an archive that does not tolerate it")
 	}
 	if s.stats.SkippedEntries != 1 {
@@ -70,7 +70,7 @@ func TestArchiveEntryVanishedFile(t *testing.T) {
 
 	denied := fakeEntry{name: "locked.txt", err: &fs.PathError{Op: "lstat", Path: filepath.Join(root, "locked.txt"), Err: fs.ErrPermission}}
 	s.cfg.IgnoreVanished = true
-	err = s.archiveEntry(t.Context(), tw, r, filepath.Join(root, "locked.txt"), denied, map[fileKey]string{})
+	err = s.archiveEntry(t.Context(), tw, r, filepath.Join(root, "locked.txt"), denied, map[fileKey]string{}, make([]byte, copyBufSize))
 	if err == nil {
 		t.Fatal("a permission failure was treated as the tolerated delete race")
 	}
@@ -1026,13 +1026,13 @@ func TestFileKeyAndLinksFallBackWithoutUnixStat(t *testing.T) {
 func TestCopyNStopsOnCancellationWriteErrorAndReadError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := copyN(ctx, io.Discard, strings.NewReader("x"), 1); !errors.Is(err, context.Canceled) {
+	if _, err := copyN(ctx, io.Discard, strings.NewReader("x"), 1, make([]byte, copyBufSize)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled copyN = %v, want context.Canceled", err)
 	}
-	if _, err := copyN(context.Background(), failWriter{}, strings.NewReader("x"), 1); err == nil {
+	if _, err := copyN(context.Background(), failWriter{}, strings.NewReader("x"), 1, make([]byte, copyBufSize)); err == nil {
 		t.Fatal("copyN reported success into a failing writer")
 	}
-	if _, err := copyN(context.Background(), io.Discard, errorReader{}, 1); err == nil {
+	if _, err := copyN(context.Background(), io.Discard, errorReader{}, 1, make([]byte, copyBufSize)); err == nil {
 		t.Fatal("copyN reported success over a failing reader")
 	}
 }

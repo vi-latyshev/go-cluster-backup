@@ -184,10 +184,24 @@ each level and compare size and CPU — before changing a level.
 - **`concurrency`** — above 1 it overlaps encoding with reading and writing;
   the match search inside a frame stays serial, so on one CPU it buys little
   and costs memory. Keep it no higher than the CPU the pod really gets (the
-  chart's limit is one CPU). The writer is CPU-bound — its dump and its
-  compression share the container's CPU limit — so on a busy node raise
-  `resources.requests.cpu` toward the limit, and raise the limit itself to
-  finish a run sooner.
+  chart's limit is one CPU).
+- **CPU and waits** — where a run spends its time is measured, not assumed.
+  One measured shape spent 70–80 CPU-seconds across a 6–10 minute run at a
+  one-CPU limit; the rest waited on the source read — a database `COPY`, file
+  reads — and the node's disk latency, then storage API round trips: the
+  survey's listings and manifest reads, and uploads. The table above shows the
+  opposite extreme: one producing test spent 13.46 CPU-seconds in a 14.37
+  second wall. Measure CPU, source/disk and storage waits separately before
+  changing CPU. CPU seconds or a processor's wall time do not say what the run
+  waited on: a producer and its compressor overlap, so the wall includes the
+  source read and the write. Disk latency backpressures the producer through
+  its spool writes; a slow upload does not, because the spool keeps the
+  artifact while storages read it. Raise `resources.requests.cpu` or the limit
+  on measured CPU starvation, such as CFS throttling or sustained saturation
+  of the limit. When storage API round trips dominate, raise that envelope's
+  `call_parallelism` ([run knobs](#run-knobs-and-budgeting)); past what the
+  service tolerates it turns into 429s and retries, so watch those before
+  raising it further.
 - **Native `pg_dump` compression** — the `postgres` source passes
   `compression` to `pg_dump --compress`, and it defaults to `none` because the
   pipeline compresses. A PostgreSQL 15 client takes only a numeric level, so
@@ -201,12 +215,16 @@ each level and compare size and CPU — before changing a level.
   the synthetic and the 161 MiB dumps and lost badly on the 2.1 GiB one, and
   `zstd:6` stayed larger than `better` everywhere — so it is a choice, not a
   default.
-- **Upload fan-out** — after the producers, uploads bound a run: they are
-  network-bound, so `run.storage_parallelism` (4 by default) sends objects to
-  several storages at once. With two storages across an emulated 400 Mbit/s
-  link per storage, uploading one at a time left the second storage's time on
-  the wall; running them together cut measured wall time by 34–39% on the
-  synthetic dump and 8–13% on the 2.1 GiB one.
+- **Upload fan-out** — uploads are network-bound. A storage that uploads the
+  finished file adds its time after production; a multipart storage sends
+  parts as the spool grows, so only what outlasts production shows.
+  `run.storage_parallelism` (4 by default) sends objects to several storages
+  at once, so one slow destination does not hold up the others. With two
+  storages across an emulated 400 Mbit/s link per storage, uploading one at a
+  time left the second storage's time on the wall; running them together cut
+  measured wall time by 34–39% on the synthetic dump and 8–13% on the 2.1 GiB
+  one. This is not a default explanation for a slow run: with one storage, or
+  when the time goes to the source read, it changes nothing.
 - **Storage scheme** — point an `s3` endpoint at `https://`. The plugin accepts
   `http://`, so nothing refuses it, but the credentials and every artifact byte
   then cross the network in clear text. `pg_dump` speaks TLS through libpq's
