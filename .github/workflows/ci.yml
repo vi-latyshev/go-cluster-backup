@@ -359,12 +359,26 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          set -eu
+          set -euo pipefail
           helm="$RUNNER_TEMP/bin/helm"
           chmod +x "$helm"
           "$helm" package charts/go-cluster-backup \
             --version "${VERSION}" --app-version "${VERSION}" --destination dist
-          "$helm" push "dist/go-cluster-backup-${VERSION}.tgz" "oci://${CHART%/*}" | tee push.txt
+          # GHCR can 404 a manifest it has just accepted ("Tag ... not found"). The
+          # archive is not repackaged, so every attempt pushes the same digest.
+          for attempt in 1 2 3; do
+            status=0
+            "$helm" push "dist/go-cluster-backup-${VERSION}.tgz" "oci://${CHART%/*}" | tee push.txt || status=$?
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::helm push failed $attempt times (exit $status)"
+              exit "$status"
+            fi
+            echo "::warning::helm push attempt $attempt failed (exit $status); retrying"
+            sleep $((attempt * 10))
+          done
           digest="$(awk '$1 == "Digest:" { print $2 }' push.txt)"
           if [ -z "$digest" ]; then
             echo "::error::helm push printed no digest"
