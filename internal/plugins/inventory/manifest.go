@@ -123,14 +123,13 @@ func manifestSemantics(rep *model.RunReport) []error {
 	var errs []error
 	for i, ar := range rep.Artifacts {
 		at := fmt.Sprintf("/artifacts/%d", i)
-		switch ar.Outcome {
-		case model.ArtifactOK:
-			if ar.Key == "" || !canonicalSHA256(ar.SHA256) {
-				errs = append(errs, fmt.Errorf("%s: an ok artifact must record its object key and a canonical sha256", at))
-			}
-		case model.ArtifactFailed:
-		default:
-			errs = append(errs, fmt.Errorf("%s: outcome %q is not %q or %q", at, ar.Outcome, model.ArtifactOK, model.ArtifactFailed))
+		// The outcome lists are the one closed set the manifest validator,
+		// the template checker and the producers read.
+		if !model.Listed(model.ArtifactOutcomeValues, ar.Outcome) {
+			errs = append(errs, fmt.Errorf("%s: outcome %q is not one this build knows", at, ar.Outcome))
+		}
+		if ar.Outcome == model.ArtifactOK && (ar.Key == "" || !canonicalSHA256(ar.SHA256)) {
+			errs = append(errs, fmt.Errorf("%s: an ok artifact must record its object key and a canonical sha256", at))
 		}
 		for j, step := range ar.Chain {
 			if step.Instance == "" || step.Type == "" {
@@ -139,9 +138,7 @@ func manifestSemantics(rep *model.RunReport) []error {
 		}
 	}
 	for i, s := range rep.Storages {
-		switch s.Outcome {
-		case model.StorageVerified, model.StorageFailed, model.StorageSkipped:
-		default:
+		if !model.Listed(model.StorageOutcomeValues, s.Outcome) {
 			errs = append(errs, fmt.Errorf("/storages/%d: outcome %q is not one this build knows", i, s.Outcome))
 		}
 	}

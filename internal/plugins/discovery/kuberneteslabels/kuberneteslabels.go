@@ -42,6 +42,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -1076,6 +1077,17 @@ func (c *Config) prepareRule(r rule, path string, seen map[string]bool, funcs te
 	}
 	if r.Artifact.Name.Text() == "" {
 		errs = append(errs, fmt.Errorf("%s/artifact/name is empty", path))
+	}
+	for _, key := range []struct {
+		path string
+		tmpl configuration.Template
+	}{
+		{path + "/artifact/group", r.Artifact.Group},
+		{path + "/artifact/name", r.Artifact.Name},
+	} {
+		if err := key.tmpl.Check(reflect.TypeFor[objectData]()); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", key.path, err))
+		}
 	}
 	if r.Artifact.Importance != model.ImportanceRequired && r.Artifact.Importance != model.ImportanceBestEffort {
 		errs = append(errs, fmt.Errorf("%s/artifact/importance must be \"required\" or \"best_effort\", got %q", path, r.Artifact.Importance))

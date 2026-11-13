@@ -407,3 +407,52 @@ func TestFailingRenderInsideAnArrayStopsTheArray(t *testing.T) {
 		t.Fatalf("Problem = %q, want only the first failure", found[0].Problem)
 	}
 }
+
+// buildRule checks one rule config without a cluster: Validate is the offline
+// half, and a template's names are judged there.
+func buildRule(t *testing.T, rule ruleFixture) (discovery.Discoverer, error) {
+	t.Helper()
+	cfg := configFor("GCB_TEST_RULE_HOST", "GCB_TEST_RULE_PORT", "/run/token", "/run/ca", t.TempDir(), rule)
+	return instances.Build(t.Context(), registry(t), discovery.Kind, "kubernetes_labels",
+		jsontext.Value(mustJSON(cfg)), instances.Deps{Instance: "workloads"})
+}
+
+// TestRuleTemplatesAreTypeChecked: every rule template — the artifact envelope
+// and every string of the nested source config — is type-checked against the
+// matched object in every branch and definition, with the rule's functions.
+func TestRuleTemplatesAreTypeChecked(t *testing.T) {
+	base := simpleRule("volumes", "persistentvolumeclaims", "backup.example/engine=files", "Bound")
+	refused := map[string]func(*ruleFixture){
+		"a group typo":         func(r *ruleFixture) { r.Artifact.Group = "{{ .Namespac }}" },
+		"a name typo":          func(r *ruleFixture) { r.Artifact.Name = "{{ .Namespac }}/{{ .Name }}" },
+		"a nested config typo": func(r *ruleFixture) { r.Source.Config = map[string]any{"root": "{{ .Namespac }}"} },
+		"a dead-branch nested typo": func(r *ruleFixture) {
+			r.Source.Config = map[string]any{"root": `{{ if .Phase }}{{ .Namespac }}{{ end }}`}
+		},
+	}
+	for name, mutate := range refused {
+		t.Run(name, func(t *testing.T) {
+			rule := base
+			mutate(&rule)
+			_, err := buildRule(t, rule)
+			if err == nil || !strings.Contains(err.Error(), "Namespac") {
+				t.Fatalf("Build = %v, want the typo refused by name", err)
+			}
+		})
+	}
+	t.Run("the working forms pass", func(t *testing.T) {
+		rule := base
+		rule.Artifact.Group = "{{ .Namespace }}"
+		rule.Artifact.Name = "{{ .Name }}"
+		rule.Source.Config = map[string]any{
+			"root":  "{{ volumePath }}",
+			"name":  "{{ .Name }}",
+			"label": "{{ .Labels.app }}",
+			"env":   `{{ envValue 0 "NAME" }}`,
+			"port":  "{{ port 0 8080 }}",
+		}
+		if _, err := buildRule(t, rule); err != nil {
+			t.Fatalf("a working rule was refused: %v", err)
+		}
+	})
+}

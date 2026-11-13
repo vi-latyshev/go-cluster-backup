@@ -958,3 +958,22 @@ func TestCheckCommandFailureIsReported(t *testing.T) {
 		t.Fatalf("class = %q, want transient (%v)", class, err)
 	}
 }
+
+// TestCheckApplyOptionsMatchesApply: the offline check runs the same strict
+// decode Apply does, the required members and Validate included.
+func TestCheckApplyOptionsMatchesApply(t *testing.T) {
+	var cfg sqlite.Config
+	if err := cfg.CheckApplyOptions(jsontext.Value(`{"file_mode": "0640", "keep_previous": false}`), "20260102T030405Z"); err != nil {
+		t.Fatalf("a usable apply block was refused: %v", err)
+	}
+	for raw, want := range map[string]string{
+		`{"file_mode": "9", "keep_previous": false}`:  "file_mode",
+		`{"keep_previous": false}`:                    "file_mode",
+		`{"file_mode": "0640", "keep_previous": "x"}`: "keep_previous",
+	} {
+		err := cfg.CheckApplyOptions(jsontext.Value(raw), "20260102T030405Z")
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s = %v, want a refusal naming %q", raw, err, want)
+		}
+	}
+}

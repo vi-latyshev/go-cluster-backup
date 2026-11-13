@@ -115,7 +115,10 @@ func TestTemplateModelTypesAreAllPinned(t *testing.T) {
 }
 
 // collectModelTypes records every struct type of the model package reachable
-// through exported fields, following pointers, slices, arrays and maps.
+// through exported fields, following pointers, slices, arrays and maps. The
+// webhook's fill gate (internal/plugins/notifier/webhook/sample_test.go) walks
+// the same graph from the run values: a shape one walker cannot measure has to
+// be taught to both.
 func collectModelTypes(t reflect.Type, out map[string]reflect.Type) {
 	for {
 		switch t.Kind() {

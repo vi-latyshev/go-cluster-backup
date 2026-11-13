@@ -257,7 +257,10 @@ func TestDelayHoldsTheResponse(t *testing.T) {
 // TestDelayReleasesOnCancellation: the delay must never outlive the request it
 // holds. A client that gives up is the whole reason the handler watches the
 // context; Close waits for outstanding handlers, so a handler still sleeping on
-// its own timer makes this fail.
+// its own timer makes this fail. The request is known to be inside the delay
+// before the cancellation lands; the client's own answer is deliberately not
+// asserted — whether Do reports the cancellation or a late empty response is a
+// race inside net/http, while the released handler is the invariant here.
 func TestDelayReleasesOnCancellation(t *testing.T) {
 	// The branch itself, without a socket in the way: a request whose context is
 	// already done must leave the delay at once and never reach the handler.
@@ -274,17 +277,30 @@ func TestDelayReleasesOnCancellation(t *testing.T) {
 	}
 
 	s := New(t)
+	entered := make(chan struct{}, 1)
+	s.mu.Lock()
 	s.Delay = time.Hour
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	s.delayEntered = entered
+	s.mu.Unlock()
+	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
 	req2, err := http.NewRequestWithContext(ctx2, http.MethodGet, s.srv.URL+"/api/v1/pods", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp, err := s.srv.Client().Do(req2); err == nil {
-		_ = resp.Body.Close()
-		t.Fatal("a request cancelled inside the delay answered")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if resp, err := s.srv.Client().Do(req2); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request never reached the delay")
 	}
+	cancel2()
 	closed := make(chan struct{})
 	go func() { s.srv.Close(); close(closed) }()
 	select {
@@ -292,6 +308,7 @@ func TestDelayReleasesOnCancellation(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the handler is still delayed after its client gave up")
 	}
+	<-done
 }
 
 func TestUnknownRouteIs404(t *testing.T) {

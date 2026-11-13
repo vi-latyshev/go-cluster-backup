@@ -11,6 +11,7 @@ import (
 	"encoding/json/jsontext"
 
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
+	pluginerrors "github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/human"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/instances"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi/kubeapitest"
@@ -1094,6 +1095,79 @@ func TestVolumePathRefusesANonNodeVolumeUnderNodeChecks(t *testing.T) {
 	if len(found) != 1 || !strings.Contains(found[0].Problem, "holds no spec.local.path") {
 		t.Fatalf("found = %+v, want the non-node volume refused by the template", found)
 	}
+}
+
+// TestTransientNodeReadKeepsItsClass: a node read the API answers with a
+// transient failure — a timeout, 409/429 or 5xx — keeps that class, so the
+// planning retry pass reads the node again instead of a blip failing the whole
+// night permanently. A refused read (403) stays permanent and keeps its
+// remedy; 404 keeps not-found.
+func TestTransientNodeReadKeepsItsClass(t *testing.T) {
+	files := map[string]string{"backup.example/engine": "files"}
+	rule := simpleRule("volumes", "persistentvolumeclaims", "backup.example/engine=files", "Bound")
+	rule.Source.Config = map[string]any{"root": "{{ volumePath }}", "ignore_vanished": true}
+
+	t.Run("without node_scope the affected artifact asks for another pass", func(t *testing.T) {
+		t.Setenv(testNodeEnv, "node-a")
+		srv := kubeapitest.New(t)
+		srv.AddNode(nodeJSON("node-a", hostnameLabels("node-a")))
+		srv.FailNth("nodes/node-a", 503, 1)
+		srv.AddPVC(boundPVC("ns", "media", files, "Bound", "pv-media"))
+		srv.AddPV(pinnedPV("pv-media", "ns", "media", "/var/lib/rancher/k3s/storage/media", "node-a"))
+		d := buildNodeAware(t, srv, rule)
+
+		found := discover(t, d)
+		if len(found) != 1 || !found[0].ProblemRetryable || !strings.Contains(found[0].Problem, "503") {
+			t.Fatalf("claim = %+v, want a retryable problem naming the 503", found)
+		}
+	})
+
+	t.Run("under node_scope the discovery error is transient", func(t *testing.T) {
+		t.Setenv(testNodeEnv, "node-a")
+		srv := kubeapitest.New(t)
+		srv.AddNode(nodeJSON("node-a", hostnameLabels("node-a")))
+		srv.FailNth("nodes/node-a", 503, 1)
+		d := buildNodeScoped(t, srv, []string{"node-a"}, rule)
+
+		_, err := d.Discover(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "503") {
+			t.Fatalf("Discover = %v, want the API's 503 named", err)
+		}
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassTransient {
+			t.Fatalf("class = %q, want transient so planning reads the node again", class)
+		}
+	})
+
+	t.Run("a peer node read failure asks for another pass", func(t *testing.T) {
+		t.Setenv(testNodeEnv, "node-a")
+		srv := kubeapitest.New(t)
+		srv.AddNode(nodeJSON("node-a", hostnameLabels("node-a")))
+		srv.AddNode(nodeJSON("node-b", hostnameLabels("node-b")))
+		srv.FailNth("nodes/node-b", 503, 1)
+		srv.AddPVC(boundPVC("ns", "media", files, "Bound", "pv-media"))
+		srv.AddPV(pinnedPV("pv-media", "ns", "media", "/var/lib/rancher/k3s/storage/media", "node-b"))
+		d := buildNodeScoped(t, srv, []string{"node-a", "node-b"}, rule)
+
+		found := discover(t, d)
+		if len(found) != 1 || !found[0].ProblemRetryable || !strings.Contains(found[0].Problem, "503") {
+			t.Fatalf("claim = %+v, want a retryable problem naming the 503", found)
+		}
+	})
+
+	t.Run("a denied node stays permanent with the remedy", func(t *testing.T) {
+		t.Setenv(testNodeEnv, "node-a")
+		srv := kubeapitest.New(t)
+		srv.Deny("nodes")
+		d := buildNodeScoped(t, srv, []string{"node-a"}, rule)
+
+		_, err := d.Discover(t.Context())
+		if err == nil || !strings.Contains(err.Error(), "grant get on nodes") {
+			t.Fatalf("Discover = %v, want the remedy named", err)
+		}
+		if class, _ := pluginerrors.ClassOf(err); class != pluginerrors.ClassPermanent {
+			t.Fatalf("class = %q, want permanent", class)
+		}
+	})
 }
 
 // TestPeerPodCoversItsClaims: a covering pod on a peer's node delegates the

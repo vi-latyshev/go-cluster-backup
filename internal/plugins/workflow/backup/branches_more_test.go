@@ -258,7 +258,10 @@ func TestRunDryRunReportsProblemsAndTraitErrors(t *testing.T) {
 func TestRunRefusesAManifestKeyThatDoesNotRender(t *testing.T) {
 	w := newWorld(t)
 	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
-	cfg["layout"].(map[string]any)["manifest_key"] = "../escape"
+	// A template keyed on the sample run ids renders a safe key offline and a
+	// traversal at run time: validate cannot prove what every run id renders,
+	// so the run's own refusal is the one tested here.
+	cfg["layout"].(map[string]any)["manifest_key"] = `{{ if or (eq .Run.ID "20260102T030405Z") (eq .Run.ID "20260102T030405Z-manual") }}manifest.json{{ else }}../escape{{ end }}`
 	e := serviceCheck(t, w, cfg)
 	if _, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled}); err != nil {
 		t.Fatal(err)

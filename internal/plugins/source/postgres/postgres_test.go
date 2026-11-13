@@ -1533,3 +1533,24 @@ func TestApplyJobsReportsAClosedArtifact(t *testing.T) {
 		t.Fatal("jobs > 1 accepted a closed artifact handle")
 	}
 }
+
+// TestCheckApplyOptionsMatchesApply: the offline check runs the same strict
+// decode Apply does, required members and Validate included — a mode-dependent
+// combination stays in Apply, where the mode is known.
+func TestCheckApplyOptionsMatchesApply(t *testing.T) {
+	var cfg postgres.Config
+	if err := cfg.CheckApplyOptions(jsontext.Value(restoreOptions), "20260102T030405Z"); err != nil {
+		t.Fatalf("the reference apply block was refused: %v", err)
+	}
+	for raw, want := range map[string]string{
+		`{"jobs": 0, "no_owner": false, "no_acl": false, "connect_attempts": 2, "connect_interval": "20ms"}`: "jobs",
+		`{"jobs": 1, "no_owner": false, "no_acl": false, "connect_attempts": 0, "connect_interval": "20ms"}`: "connect_attempts",
+		`{"jobs": 1, "no_owner": false, "no_acl": false, "connect_attempts": 2, "connect_interval": "0s"}`:   "connect_interval",
+		`{"jbos": 1, "no_owner": false, "no_acl": false, "connect_attempts": 2, "connect_interval": "20ms"}`: "jbos",
+	} {
+		err := cfg.CheckApplyOptions(jsontext.Value(raw), "20260102T030405Z")
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s = %v, want a refusal naming %q", raw, err, want)
+		}
+	}
+}

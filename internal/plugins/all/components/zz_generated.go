@@ -81,7 +81,7 @@ func Compose(r *loader.Registry, factories *instances.Registry) error {
 		"instances":                    {"configuration"},
 		"inventory":                    {"configuration", "errors", "execution", "human", "layout", "model", "storage"},
 		"kubeapi":                      {"errors"},
-		"layout":                       {"configuration", "model"},
+		"layout":                       {"configuration", "model", "must"},
 		"lifecycle":                    {"instances", "model"},
 		"notifier":                     {"errors", "instances", "model"},
 		"notifier/webhook":             {"configuration", "errors", "extcmd", "instances", "model", "must", "notifier"},

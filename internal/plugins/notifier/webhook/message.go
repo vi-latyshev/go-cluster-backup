@@ -227,8 +227,26 @@ func lineEnd(src string, at int) int {
 // as plain text, and every following line is split into its text and its code
 // part.
 func (m *eventMessage) render(ev model.Event) (Message, error) {
+	return m.renderWith(m.tmpl, ev)
+}
+
+// renderJudged renders with validate's pick judge on a clone: an enum value
+// every deployment produces and no pair names fails the sample instead of the
+// night. The template a run executes is untouched.
+func (m *eventMessage) renderJudged(ev model.Event) (Message, error) {
+	// The validation copy renames field-site picks and judges the rest by
+	// runtime type; the template a run executes is untouched.
+	tmpl, err := configuration.JudgeTemplate(m.tmpl, reflect.TypeFor[model.Event](), messageFuncs())
+	if err != nil {
+		return Message{}, fmt.Errorf("events/%s: %w", m.event, err)
+	}
+	return m.renderWith(tmpl, ev)
+}
+
+// renderWith renders one prepared template into the message model.
+func (m *eventMessage) renderWith(tmpl *template.Template, ev model.Event) (Message, error) {
 	var b strings.Builder
-	if err := m.tmpl.Execute(&b, ev); err != nil {
+	if err := tmpl.Execute(&b, ev); err != nil {
 		return Message{}, fmt.Errorf("events/%s: rendering the message: %w", m.event, err)
 	}
 	kept := nonEmptyLines(b.String())

@@ -4,7 +4,8 @@
 and `restore` share it. Every present section must validate, even when the
 command does not use it. Runtime **checks** are scoped: `run` checks everything
 except `stage.sources`, `stage` its sources and their processors, and `restore`
-resolves storages and apply options on use. The chart mounts the file at
+resolves storages on use; every `restore.apply` block is decoded at validation,
+before any fetch. The chart mounts the file at
 `/etc/go-cluster-backup/config.yaml`.
 
 Reference configurations:
@@ -269,12 +270,15 @@ the deployment states:
 - a nonempty `run.writer_identity` (see [Writer identity](#writer-identity)):
   with two writers, both would otherwise treat the other's runs as their own.
 
-The own node is proven once per collect with a read-only `Node` GET; an API
-answer that cannot be read under `node_scope` refuses the discovery — fail
-closed, never a wider cluster scope. Without `node_scope`, an unreadable node
-warns once per collect and fails only the affected node-local artifacts. The
-remedy is an RBAC grant of `nodes` `get` (the chart's ClusterRole carries it) or
-the explicit `node_env: ""` opt-out.
+The own node is proven once per collect with a read-only `Node` GET. A refused
+read (403) or a node the API does not have (404) refuses under `node_scope` at
+once — fail closed, never a wider cluster scope — and the refusal names the
+remedy: an RBAC grant of `nodes` `get` (the chart's ClusterRole carries it) or
+the explicit `node_env: ""` opt-out. A transient answer — a timeout, 409/429, a
+5xx, a transport failure — keeps its class and the discovery is read again
+within the run's retry budget, so an API blip costs a pass, not the night.
+Without `node_scope`, an unreadable node warns once per collect and fails only
+the affected node-local artifacts, retried the same way.
 
 Under the scope, every object gets exactly one verdict:
 
@@ -341,6 +345,17 @@ renaming either orphans every run already written. A manual run's id is the
 scheduled one plus `layout.manual_id_suffix` (default `-manual`), so a survey
 tells a run's kind from its key alone, and a manifest whose `kind` disagrees
 with it is a problem run the protection ledger never deletes.
+
+`validate` checks every key template before a run starts or a restore surveys.
+`layout.run_prefix` must be a literal survey prefix followed by exactly
+`{{ .Run.ID }}`; the run prefix, `layout.manifest_key` and `layout.artifact_key`
+are checked against the key data: a field or method they do not have is
+refused, in a branch as the dead-branch case. A key whose every render is
+unsafe is refused too: one starting with a literal `/`, one whose unconditional
+text contains `..`, or one that is empty. A `/` after an action is a separator
+and is not judged, nor is a literal inside `if`, `range`, `with` or `define`;
+the key a render actually produces is still checked at run time, so a value
+that supplies `..` fails then. A failure names `/layout/<field>`.
 
 ### Manifest
 
@@ -486,13 +501,77 @@ rounded SI reading.
 `.Lines` (each `.Text` and `.Code`), `.Text` (the whole message) and `.Event`;
 its keys are the receiver's own. `body_format: yaml` drops the empty rendered
 lines, reads the rest as a YAML document and sends its JSON encoding; `text`
-sends the render as it is. `validate` renders every event and the payload
-against a matrix of built-in sample runs — started and finished, each with a
-previous Job failure, failed earlier attempts and an unreadable cluster status;
-delivered, degraded and failed; with and without the storage half; exclusions,
-artifacts and storages; both run kinds; a manual run refused by a cap and one
-refused the writer lease — so a template that only fits one night is refused
-offline.
+sends the render as it is. `validate` inspects every template surface against
+what it reads: messages against the event's report, the payload against the
+payload data, layout keys against the key data, `restore.apply` files'
+`side_by_side_dir` against its label, discovery rule templates against the
+matched object, and the endpoint against no data. It refuses offline, because
+the template fails whenever that part runs:
+
+- a field or method name the value at that position can never have, in every
+  branch, and in a definition where its caller's value is known;
+- any field reference in an endpoint template, which has no data;
+- a `pick`/`pickdef` with the wrong number of pairs.
+
+It also refuses, by declared rule though the template may run:
+
+- the same name or pair defect in a branch or definition that may never run
+  (`policy P1`: the defect is real, it just does not fail yet);
+- a constant `pick`/`pickdef` key on a directly read run-report enum field
+  that no value of the field (or `""`) can equal (`policy P2`): the pair can
+  never match. That dead key is the one refusal of a template whose every node
+  the executor would run successfully; every other refused node fails whenever
+  it is evaluated.
+
+A position whose type is not known is skipped, never refused: after `and`,
+`or`, `index`, `slice` or `call`, through a reassigned variable, or in the dot
+of a definition nothing calls. The endpoint is the exception: it has no data,
+so every selector is refused in every definition (see
+[Endpoint templates](#endpoint-templates)). A layout key that always starts
+with a literal `/`, always contains `..`, or is empty is refused too (see
+[Layout](#layout)).
+
+Messages and the payload are also rendered against the built-in sample runs as
+in 2.2.0 — started and finished, each with a previous Job failure, failed
+earlier attempts and an unreadable cluster status; delivered, degraded and
+failed; with and without the storage half; exclusions, artifacts and storages;
+both run kinds; a manual run refused by a cap and one refused the writer lease.
+That render catches function and comparison errors in the branches the samples
+enter, empty titles and body-format defects, and a `pick` that leaves out a
+value every deployment produces: all run outcomes, `scheduled`, artifact
+`ok`/`failed`, storage `verified`/`failed`/`skipped` and the `ignored` verdict.
+A `pick` is judged by the field it reads at execution: a selector pick — a
+value expression ending in a field name — receives its receiver and the field
+name, and the receiver may be any expression: the dot, a field chain, a
+variable, `(or …)`, `(index …)` or a method call. The receiver is evaluated
+once, as the run would; the judge resolves the field on that value and uses
+that field's list, so one shared definition is judged as the field each call
+passes. A field with no list falls back to the value's named enum type; a
+non-enum value is never demanded, and a deployment-dependent value is never
+demanded whichever receiver produced it. A value that is not a selector pick
+keeps its report type through a variable, `with`, `range`, `and`/`or`, `index`
+or `slice`, and a named report enum is judged by that type. Only a function
+that builds a new string — `printf`, `print`, `println`, `json`, `html`, `js`,
+`urlquery`, `clip` — erases the type. A `pickdef` never demands completeness:
+it takes its default. `run_started` carries the run's identity — schema, run
+id, kind, start time, writer identity — its exclusions and the cluster half of
+`.Run.Previous`, with the outcome still `running`; the exit code, duration,
+artifacts, storages, lease and run warnings exist only on `run_finished`.
+
+Not checked offline: a function or comparison error in a branch the samples
+never enter; a name read from a value whose type is not known; a `pick` on a
+string-building function's result, whose report type is gone; and a `pick` that
+leaves out a value only some deployments produce — a manual run, a covered or
+elsewhere exclusion, `required`/`best_effort`, `plain`/`secret`, a lease
+holder's kind, any name. Use `pickdef`, and pass the field itself to `pick`,
+so a value a deployment does not produce never costs the message.
+
+Together the tiers do not guarantee that everything the executor accepts
+passes `validate`: the checker accepts a position the sample render can still
+refuse, exactly as 2.2.0 did. 2.2.1 refuses only what is wrong in every
+deployment, and stops demanding values some deployments never produce. A fix,
+not a configuration break: `run` and every `restore` command build the same
+assembly, so a refusal stops them before their first cluster or storage call.
 
 `.Run.Previous` has two halves. The cluster half — `Failure` (the previous Job,
 with `Consecutive`: how many Jobs of the CronJob failed in a row, as far as the
@@ -519,9 +598,11 @@ its later failure is reported by the next run.
 A storage's `CapExceeded`, `CapLimitBytes` and
 `CapUsedBytes` and a lease refusal (`.Run.Lease`) reach a template too.
 `CapEvicted`, `CapOverflowBytes`, `RetentionError` and `OccupancyUnknown` do as
-well, and the run's coded warnings are `.Run.Warnings` with `.Code` and
-`.Message` (`catalog.uncertainty.settle.failed` names a settlement failure that
-leaves occupancy unknown; a stage record can carry `source.credentials.unsealed`).
+well. Coded warnings are `.Code` and `.Message` in two places: the run's
+`.Run.Warnings` carries `catalog.uncertainty.settle.failed`, a settlement
+failure that leaves occupancy unknown, and an artifact's `.Warnings` carries
+`source.credentials.unsealed`, the plaintext credentials a source's published
+exception warns about.
 
 ### Endpoint templates
 
@@ -544,6 +625,14 @@ never receive `secret`, so a receiver's body cannot read a secret file. No
 rendered secret or endpoint appears in argv, `config effective`, template/build
 errors or request-failure text (an error names the stage, event and file path,
 never a byte of the value).
+
+Endpoint templates render with no data — the endpoint set is the secret reader
+alone. `validate` checks every definition, called or not, and refuses every
+field or method reference: `.Field`, `$.Field`, a field off a call such as
+`(secret "/run/token").Missing`, and `{{ define "d" }}{{ .X }}{{ end }}` even
+when nothing invokes it. `{{ . }}` and `{{ $ }}` print the empty value and stay
+accepted; what a template can carry is literal text and the result of `secret`
+calls.
 
 The URL's scheme and authority stay literal: they must be complete before the
 first action and terminated by `/`, `?` or `#`, userinfo is forbidden, and the
@@ -1065,7 +1154,8 @@ go-cluster-backup restore verify --config FILE (--run ID | --run newest-ok) [--a
   pods: such a directory holds the previous pair, which the stage refuses, and a
   directory shared between pods lets another pod's stage republish the pair
   between this pod's stage and its run.
-- **validate** — offline: structure, types, templates, every reference between
+- **validate** — offline: structure, types, templates, layout keys, every
+  `restore.apply` block, every reference between
   instances, every error at once with its path. It succeeds on a config whose
   secret files do not exist: a secret is a reference, and only a plugin's `Check`
   reads it. Coded non-fatal warnings — a plaintext `k3s_state` artifact, a stage
@@ -1100,10 +1190,11 @@ surface is a SemVer API for this project: a deployment's configuration spells
 those names, so a rename is a breaking change. It is pinned by tests
 (`internal/plugins/configuration/template_surface_test.go`, `internal/plugins/layout/layout_surface_test.go`).
 
-- **Fields:** `RunReport`, `ArtifactResult`, `Artifact`, `StorageResult`,
-  `DumpStats`, `Warning`, `Exclusion`, `PreviousRun`, `PreviousFailure`,
-  `AttemptFailure`, `FailedPod`, `ContainerFailure`, `ContainerTermination`,
-  `LeaseState`, `Event`; and the layout data
+- **Fields:** `RunReport`, `ArtifactResult`, `Artifact`, `SourceRef`,
+  `ProcessorStep`, `DumpStats`, `StorageResult`, `Warning`, `Exclusion`,
+  `PreviousRun`, `PreviousFailure`, `AttemptFailure`, `FailedPod`,
+  `ContainerFailure`, `ContainerTermination`, `EventFailure`, `LeaseState`,
+  `Event`; and the layout data
   (`Run.ID`, `Run.StartedAt`, `Artifact.Group`, `Artifact.Name`, `Artifact.Ext`).
   Newer members a template may read: `.Run.WriterIdentity`, `.Run.Warnings`,
   `.Artifact.Warnings`, `.Stats.ChangedFiles`, `.Excluded[].Node`, and

@@ -1180,3 +1180,235 @@ func TestTheBodySurvivesEveryCharacterClass(t *testing.T) {
 		})
 	}
 }
+
+// checkMessage validates one run_finished message through the registry,
+// answering the refusal or nil.
+func checkMessage(t *testing.T, message string) error {
+	t.Helper()
+	cfg := baseConfig("http://127.0.0.1:1/x")
+	cfg["events"] = map[string]string{model.EventFinished: message}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testRegistry(t).Check("notifier", "webhook", jsontext.Value(raw))
+}
+
+// TestValidateTypeChecksEveryBranch: a name that names no field is refused in
+// every branch and every called definition, including a branch no sample
+// reaches — the original RED typos.
+func TestValidateTypeChecksEveryBranch(t *testing.T) {
+	refused := map[string]string{
+		"a run warning code":   `Backup {{ range .Run.Warnings }}{{ .Cod }}{{ end }}`,
+		"an artifact warning":  `Backup {{ range .Run.Artifacts }}{{ range .Warnings }}{{ .Cod }}{{ end }}{{ end }}`,
+		"a retention error":    `Backup {{ range .Run.Storages }}{{ if .RetentionError }}{{ .RetentionErr }}{{ end }}{{ end }}`,
+		"a writer identity":    `Backup {{ with .Run.WriterIdentity }}{{ $.Run.WriterIdentiy }}{{ end }}`,
+		"a lease error":        `Backup {{ with .Run.Lease }}{{ if .Error }}{{ .Eror }}{{ end }}{{ end }}`,
+		"a lease holder error": `Backup {{ with .Run.Lease }}{{ if .HolderKind }}{{ .Eror }}{{ end }}{{ end }}`,
+		"an exclusion node":    `Backup {{ range .Run.Excluded }}{{ if .Node }}{{ .Nod }}{{ end }}{{ end }}`,
+		"a dead branch":        `Backup {{ if false }}{{ .Run.NoSuchField }}{{ end }}`,
+		"a called define":      `{{ define "d" }}{{ .Run.Outcom }}{{ end }}{{ template "d" . }}`,
+		"a payload field":      `Backup`,
+	}
+	for name, message := range refused {
+		t.Run(name, func(t *testing.T) {
+			if name == "a payload field" {
+				cfg := baseConfig("http://127.0.0.1:1/x")
+				cfg["payload"] = "{{ .NoSuch }}"
+				raw, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = testRegistry(t).Check("notifier", "webhook", jsontext.Value(raw))
+				if err == nil || !strings.Contains(err.Error(), "NoSuch") {
+					t.Fatalf("a payload naming nothing = %v, want the name", err)
+				}
+				return
+			}
+			err := checkMessage(t, message)
+			if err == nil {
+				t.Fatalf("%s passed validate", message)
+			}
+		})
+	}
+}
+
+// TestValidateTypeChecksDefinitions: every definition is walked. An uncalled
+// helper for the report is accepted with an unknown dot, while its function
+// calls, argument counts and pick pairs are still checked.
+func TestValidateTypeChecksDefinitions(t *testing.T) {
+	accepted := map[string]string{
+		"an uncalled helper":     `Backup {{ define "artifact" }}{{ .Artifact.Name }}{{ end }}`,
+		"a called helper":        `Backup {{ define "artifact" }}{{ .Artifact.Name }}{{ end }}{{ range .Run.Artifacts }}{{ template "artifact" . }}{{ end }}`,
+		"an uncalled argument":   `Backup {{ define "d" }}{{ bytes "s" }}{{ end }}`,
+		"an uncalled comparison": `Backup {{ define "d" }}{{ lt "a" 1 }}{{ end }}`,
+	}
+	for name, message := range accepted {
+		t.Run(name, func(t *testing.T) {
+			if err := checkMessage(t, message); err != nil {
+				t.Fatalf("%s was refused: %v", message, err)
+			}
+		})
+	}
+	refused := map[string]string{
+		"an uncalled pair count": `Backup {{ define "d" }}{{ pick "x" "x" }}{{ end }}`,
+	}
+	for name, message := range refused {
+		t.Run(name, func(t *testing.T) {
+			if err := checkMessage(t, message); err == nil {
+				t.Fatalf("%s passed validate", message)
+			}
+		})
+	}
+}
+
+// TestValidateJudgesOnlyProducedValues: the sample render refuses a pick that
+// leaves out a value every deployment produces, and accepts one that leaves out
+// a value only some do — or a value a function erased to plain text.
+func TestValidateJudgesOnlyProducedValues(t *testing.T) {
+	refused := map[string]string{
+		"a missing outcome": `Backup {{ pick .Run.Outcome "delivered" "✅" "degraded" "⚠️" }}`,
+		"a missing ok":      `Backup {{ range .Run.Artifacts }}{{ pick .Outcome "failed" "✗" }}{{ end }}`,
+	}
+	for name, message := range refused {
+		t.Run(name, func(t *testing.T) {
+			if err := checkMessage(t, message); err == nil {
+				t.Fatalf("%s passed validate", message)
+			}
+		})
+	}
+	accepted := map[string]string{
+		"a guarded pick":              `Backup {{ if eq .Run.Outcome "failed" }}{{ pick .Run.Outcome "failed" "x" }}{{ end }}`,
+		"a pick leaving out manual":   `Backup {{ pick .Run.Kind "scheduled" "🌙" }}`,
+		"a pick leaving out covered":  `Backup {{ range .Run.Excluded }}{{ pick .Kind "ignored" "🚫" }}{{ end }}`,
+		"a pick leaving out best":     `Backup {{ range .Run.Artifacts }}{{ pick .Artifact.Importance "required" "❗" }}{{ end }}`,
+		"a pick leaving out secret":   `Backup {{ range .Run.Artifacts }}{{ pick .Artifact.Sensitivity "plain" "◻" }}{{ end }}`,
+		"a pick leaving out a holder": `Backup {{ with .Run.Lease }}{{ pick .HolderKind "manual" "✋" }}{{ end }}`,
+		"an erased outcome":           `Backup {{ pick (printf "%s" .Run.Outcome) "delivered" "x" }}`,
+		"a singleton pick":            `Backup {{ pick "x" "x" "✅" }}`,
+	}
+	for name, message := range accepted {
+		t.Run(name, func(t *testing.T) {
+			if err := checkMessage(t, message); err != nil {
+				t.Fatalf("%s was refused: %v", message, err)
+			}
+		})
+	}
+}
+
+// TestReviewMatrixOnlyProductionShapes: a branch production can reach is not
+// refused because the old samples never filled it — no maximal render runs in
+// validate, and the 9e6dbe8 samples carry no WriterIdentity.
+func TestReviewMatrixOnlyProductionShapes(t *testing.T) {
+	if err := checkMessage(t, `Backup {{ if .Run.WriterIdentity }}{{ .Run.Lease.Holder }}{{ end }}`); err != nil {
+		t.Fatalf("a production-shaped branch was refused: %v", err)
+	}
+}
+
+// TestReviewDeploymentSpecificValuesRemainValid: a pick that omits manual,
+// covered, best_effort, secret and holder-kind values keeps validating — 2.2.1
+// demands only the values every deployment produces.
+func TestReviewDeploymentSpecificValuesRemainValid(t *testing.T) {
+	for _, message := range []string{
+		`Backup {{ pick .Run.Kind "scheduled" "🌙" }}`,
+		`Backup {{ range .Run.Excluded }}{{ pick .Kind "ignored" "🚫" "covered" "♻️" }}{{ end }}`,
+		`Backup {{ range .Run.Artifacts }}{{ pick .Artifact.Importance "required" "❗" }}{{ end }}`,
+		`Backup {{ range .Run.Artifacts }}{{ pick .Artifact.Sensitivity "plain" "◻" }}{{ end }}`,
+		`Backup {{ with .Run.Lease }}{{ pick .HolderKind "scheduled" "📅" }}{{ end }}`,
+	} {
+		if err := checkMessage(t, message); err != nil {
+			t.Errorf("%s was refused: %v", message, err)
+		}
+	}
+}
+
+// TestValidateRefusesBadFunctionCalls: argument types and arity are checked
+// statically, and the produced-everywhere pick rule is judged against the
+// sample render.
+func TestValidateRefusesBadFunctionCalls(t *testing.T) {
+	refused := map[string]string{
+		"argv of a string":   `Backup {{ bytes .Run.RunID }}`,
+		"date without argv":  `Backup {{ date }}`,
+		"an enum key typo":   `Backup {{ pick .Run.Outcome "degarded" "x" }}`,
+		"a piped enum key":   `Backup {{ "text" | pick .Run.Kind "typo" }}`,
+		"a pair count":       `Backup {{ if false }}{{ pick "x" "x" }}{{ end }}`,
+		"an unknown outcome": `Backup {{ pick .Run.Outcome "delivered" "✅" }}`,
+	}
+	for name, message := range refused {
+		t.Run(name, func(t *testing.T) {
+			if err := checkMessage(t, message); err == nil {
+				t.Fatalf("%s passed validate", message)
+			}
+		})
+	}
+}
+
+// TestValidatePrintfOutcome: the 2.2.0 plain-string outcome fields reach printf
+// unchanged; validate accepts both, at the checker and at the sample render.
+func TestValidatePrintfOutcome(t *testing.T) {
+	message := `Backup {{ range .Run.Artifacts }}{{ printf .Outcome }}{{ end }} {{ range .Run.Storages }}{{ printf .Outcome }}{{ end }}`
+	if err := checkMessage(t, message); err != nil {
+		t.Fatalf("printf .Outcome was refused: %v", err)
+	}
+}
+
+// TestValidateFieldSiteJudge: a direct outcome field is judged by its field
+// list, a plain-string variable by the runtime judge, and a string-building
+// function erases the judge.
+func TestValidateFieldSiteJudge(t *testing.T) {
+	cases := map[string]struct {
+		message string
+		want    bool
+	}{
+		"a direct artifact outcome omits failed": {
+			message: `Backup {{ range .Run.Artifacts }}{{ pick .Outcome "ok" "x" }}{{ end }}`,
+			want:    true,
+		},
+		"a variable from the plain string outcome is unjudged": {
+			message: `Backup {{ range .Run.Artifacts }}{{ $o := .Outcome }}{{ pick $o "ok" "x" }}{{ end }}`,
+		},
+		"a typed run outcome variable is judged": {
+			message: `Backup {{ $v := .Run.Outcome }}{{ pick $v "delivered" "x" }}`,
+			want:    true,
+		},
+		"printf erases the runtime type": {
+			message: `Backup {{ pick (printf "%s" .Run.Outcome) "delivered" "x" }}`,
+		},
+		"a definition shared by two outcome owners keeps the strict pick": {
+			message: `Backup {{ define "d" }}{{ pick .Outcome (print "running") "R" (print "delivered") "D" (print "degraded") "W" (print "failed") "F" }}{{ end }}{{ range .Run.Artifacts }}{{ template "d" . }}{{ end }}{{ template "d" .Run }}`,
+			want:    true,
+		},
+		"an unknown field context keeps the runtime enum judge": {
+			message: `Backup {{ define "d" }}{{ pick .Outcome (print "ok") "O" (print "failed") "F" }}{{ end }}{{ range .Run.Artifacts }}{{ template "d" . }}{{ end }}{{ template "d" (or .Run .Run) }}`,
+			want:    true,
+		},
+		"deployment-dependent values stay optional": {
+			message: `Backup {{ define "d" }}{{ pick .Kind (print "scheduled") "S" (print "ignored") "I" }}{{ end }}{{ template "d" .Run }}{{ range .Run.Excluded }}{{ template "d" . }}{{ end }}`,
+		},
+		"parentheses around a selector keep the field judge": {
+			message: `Backup {{ range .Run.Artifacts }}{{ pick (.Outcome) "failed" "F" }}{{ end }}`,
+			want:    true,
+		},
+		"an effectful receiver keeps its single evaluation": {
+			message: `Backup {{ $r := . }}{{ pick ($r = $r.Run).Outcome "running" "R" "delivered" "D" "degraded" "G" "failed" "F" }}`,
+		},
+		"a computed receiver keeps the runtime enum judge": {
+			message: `Backup {{ pick (or .Run .Run).Outcome "running" "R" "failed" "F" }}`,
+			want:    true,
+		},
+		"a computed receiver keeps deployment-dependent values optional": {
+			message: `Backup {{ pick (or .Run .Run).Kind "scheduled" "S" }}`,
+		},
+		"a pointer method keeps its own receiver": {
+			message: `Backup {{ pickdef .At.Local.Location.String "" "UTC" "Backup" }}`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := checkMessage(t, tc.message)
+			if (err != nil) != tc.want {
+				t.Fatalf("%s = %v, want refusal %t", tc.message, err, tc.want)
+			}
+		})
+	}
+}

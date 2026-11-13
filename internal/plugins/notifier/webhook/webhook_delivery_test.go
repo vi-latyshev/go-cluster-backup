@@ -140,11 +140,11 @@ func TestARedirectIsNotFollowed(t *testing.T) {
 func TestASpanThatDoesNotPairUpInTheRenderIsPermanent(t *testing.T) {
 	cfg := baseConfig("http://127.0.0.1:1/never")
 	cfg["events"] = map[string]string{
-		"run_finished": "{{ if .Run.Previous.RunID }}`{{ end }}Backup`",
+		"run_finished": "{{ if .Run.Kind }}`{{ end }}Backup`",
 	}
 	n := build(t, cfg)
-	// Every sample the configuration is validated against has a previous run,
-	// so the span pairs up offline and only the first-ever night breaks it.
+	// Every sample the configuration is validated against carries a run kind,
+	// so the span pairs up offline and only an event without one breaks it.
 	err := n.Notify(context.Background(), notifiertest.Event())
 	if err == nil {
 		t.Fatal("Notify delivered a message whose code span never opened")
@@ -163,7 +163,7 @@ func TestASpanThatDoesNotPairUpInTheRenderIsPermanent(t *testing.T) {
 func TestTextAfterACodeSpanIsPermanent(t *testing.T) {
 	cfg := baseConfig("http://127.0.0.1:1/never")
 	cfg["events"] = map[string]string{
-		"run_finished": "Backup finished\n`{{ .Run.RunID }}`\n{{- if not .Run.Previous.RunID }}first run{{ end }}",
+		"run_finished": "Backup finished\n`{{ .Run.RunID }}`\n{{- if not .Run.Kind }}first run{{ end }}",
 	}
 	err := build(t, cfg).Notify(context.Background(), notifiertest.Event())
 	if err == nil {

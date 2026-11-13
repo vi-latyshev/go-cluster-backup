@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/configuration"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/errors"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/kubeapi"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/must"
@@ -584,6 +586,11 @@ func parseNode(raw jsontext.Value, path string, funcs template.FuncMap) (*node, 
 		tmpl, err := template.New(path).Option("missingkey=error").Funcs(funcs).Parse(text)
 		if err != nil {
 			return nil, err
+		}
+		// Every definition is checked, called or not: the rule's data is the
+		// matched object, and a name it does not have is refused offline.
+		if err := configuration.CheckTemplate(tmpl, reflect.TypeFor[objectData](), funcs); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		return &node{tmpl: tmpl}, nil
 	default:

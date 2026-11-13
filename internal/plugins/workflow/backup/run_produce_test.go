@@ -3,11 +3,14 @@ package backup_test
 import (
 	"context"
 	"errors"
-	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/workflow/backup"
 	"strings"
 	"testing"
 
+	"encoding/json/jsontext"
+
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/discovery"
 	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/model"
+	"github.com/vi-latyshev/go-cluster-backup/internal/plugins/workflow/backup"
 )
 
 // TestSourceDescribeFailureFailsTheArtifact: a source that cannot describe
@@ -91,32 +94,51 @@ func TestProgressIntervalZeroStillRuns(t *testing.T) {
 // --- processArtifact: the artifact key can fail after the bytes --------------
 
 // TestArtifactKeyFailureFailsTheArtifact: the object was produced but its key
-// cannot be rendered, so nothing is uploaded and the artifact fails.
+// cannot be rendered, so nothing is uploaded and the artifact fails. Validate
+// samples fixed artifact names, so a name a discovery renders for itself is the
+// run's own refusal: a traversal is refused before the upload, never cleaned
+// into a key outside the layout.
 func TestArtifactKeyFailureFailsTheArtifact(t *testing.T) {
 	w := newWorld(t)
 	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
-	cfg["layout"].(map[string]any)["artifact_key"] = "{{ .Nope }}"
+	cfg["discoveries"] = map[string]any{"workloads": instance("fake")}
+	w.Discoveries["workloads"] = &fakeDiscovery{Found: []discovery.Found{{
+		Name: "escape", Type: "fake", Config: jsontext.Value(`{}`),
+		Artifact: model.Artifact{
+			Name: "..", Group: "vpn",
+			Importance: model.ImportanceRequired, Sensitivity: model.SensitivityPlain,
+		},
+	}}}
 	e := w.newAssembly(t, cfg)
 
 	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := artifactByName(rep, "wireguard")
-	if got.Outcome != model.ArtifactFailed || !strings.Contains(got.Error, "layout.artifact_key") {
-		t.Fatalf("artifact %+v", got)
+	var got model.ArtifactResult
+	for _, a := range rep.Artifacts {
+		if strings.Contains(a.Error, "layout.artifact_key") {
+			got = a
+		}
 	}
-	if keys := w.storage(t, "primary").Keys(); len(keys) != 0 {
-		t.Fatalf("a keyless artifact was uploaded: %v", keys)
+	if got.Outcome != model.ArtifactFailed {
+		t.Fatalf("no artifact failed on its key: %+v", rep.Artifacts)
+	}
+	// The refusal names no key: nothing was uploaded for this artifact.
+	if got.Key != "" {
+		t.Fatalf("a refused artifact carries key %q", got.Key)
 	}
 }
 
 // TestManifestKeyFailureFailsTheStorage: the objects are there but the record of
-// them cannot be named, so the copy is incomplete and the run fails.
+// them cannot be named, so the copy is incomplete and the run fails. A template
+// keyed on the sample run ids renders a safe key offline and an empty one at
+// run time — validate cannot prove what every run id renders — so this is the
+// run's own defense.
 func TestManifestKeyFailureFailsTheStorage(t *testing.T) {
 	w := newWorld(t)
 	cfg := baseConfig(t, map[string]any{"primary": storageInstance("fake", "keep_last")})
-	cfg["layout"].(map[string]any)["manifest_key"] = "{{ .Nope }}"
+	cfg["layout"].(map[string]any)["manifest_key"] = `{{ if or (eq .Run.ID "20260102T030405Z") (eq .Run.ID "20260102T030405Z-manual") }}manifest.json{{ end }}`
 	e := w.newAssembly(t, cfg)
 
 	rep, err := e.Run(context.Background(), backup.RunRequest{Kind: model.RunKindScheduled})
