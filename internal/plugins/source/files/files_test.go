@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -183,6 +184,43 @@ func TestDumpCarriesTheTree(t *testing.T) {
 	}
 	if h := byName["top.txt"]; h.Uid != os.Getuid() {
 		t.Fatalf("top.txt uid = %d, want %d", h.Uid, os.Getuid())
+	}
+}
+
+// TestDumpReusesOneCopyBuffer: a Dump copies every regular file through one
+// buffer of its own, not a fresh 256 KiB one per entry. A live volume holding
+// many small files is the shape this source archives, and a per-file buffer
+// spent 64 MiB of allocation on a tree of 256 32-byte files alone.
+func TestDumpReusesOneCopyBuffer(t *testing.T) {
+	const files = 256
+	root := t.TempDir()
+	body := bytes.Repeat([]byte("x"), 32)
+	for i := range files {
+		name := filepath.Join(root, fmt.Sprintf("file-%03d.txt", i))
+		if err := os.WriteFile(name, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := build(t, config(root, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first Dump leaves the package's lazy state and the walk's own
+	// allocations behind; the measured call is a second Dump of the same tree,
+	// which must be no more expensive than the first.
+	if err := s.Dump(context.Background(), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if err := s.Dump(context.Background(), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	const bound = 8 << 20
+	if allocated > bound {
+		t.Fatalf("one Dump of %d files allocated %d bytes, want at most %d: the copy buffer is per file again", files, allocated, bound)
 	}
 }
 

@@ -120,6 +120,10 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 	s.stats = model.DumpStats{}
 	tw := tar.NewWriter(dst)
 	seen := map[fileKey]string{}
+	// Every regular file of this Dump is copied through this one buffer: a
+	// fresh 256 KiB per entry spends a tree's whole allocation budget on the
+	// shape this source archives most — many small files.
+	buf := make([]byte, copyBufSize)
 	err = filepath.WalkDir(s.cfg.Root, func(path string, d fs.DirEntry, walkErr error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -133,7 +137,7 @@ func (s *Source) Dump(ctx context.Context, dst io.Writer) error {
 		if path == s.cfg.Root {
 			return nil // the root itself is the stream, not an entry in it
 		}
-		return s.archiveEntry(ctx, tw, root, path, d, seen)
+		return s.archiveEntry(ctx, tw, root, path, d, seen, buf)
 	})
 	if err != nil {
 		return err
@@ -206,7 +210,7 @@ var errChanged = errors.New("the entry changed under the walk")
 // An entry this package cannot restore never enters the stream: it is left out
 // and counted, because an artifact that validates and cannot be applied is
 // worse than a counted gap.
-func (s *Source) archiveEntry(ctx context.Context, tw *tar.Writer, root *os.Root, path string, d fs.DirEntry, seen map[fileKey]string) error {
+func (s *Source) archiveEntry(ctx context.Context, tw *tar.Writer, root *os.Root, path string, d fs.DirEntry, seen map[fileKey]string, buf []byte) error {
 	// Both paths are absolute and under the same root, so a relative one always
 	// exists: the error is impossible by construction.
 	rel := filepath.ToSlash(must.Do(filepath.Rel(s.cfg.Root, path)))
@@ -288,7 +292,7 @@ func (s *Source) archiveEntry(ctx context.Context, tw *tar.Writer, root *os.Root
 	}
 	// The entry's size was fixed by the walk; the copy stops there, so bytes
 	// appended to a live file cannot overflow the entry.
-	n, err := copyN(ctx, tw, f, hdr.Size)
+	n, err := copyN(ctx, tw, f, hdr.Size, buf)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
@@ -410,10 +414,10 @@ func hasLinks(info fs.FileInfo) bool {
 
 const copyBufSize = 256 << 10
 
-// copyN copies at most n bytes of src into dst. An EOF before n is not an
+// copyN copies at most n bytes of src into dst through the caller's buffer,
+// which one Dump shares across all of its entries. An EOF before n is not an
 // error: the caller sees the short count and pads the entry.
-func copyN(ctx context.Context, dst io.Writer, src io.Reader, n int64) (int64, error) {
-	buf := make([]byte, copyBufSize)
+func copyN(ctx context.Context, dst io.Writer, src io.Reader, n int64, buf []byte) (int64, error) {
 	var total int64
 	for total < n {
 		if err := ctx.Err(); err != nil {
